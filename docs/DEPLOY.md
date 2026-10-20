@@ -1,8 +1,26 @@
 # 部署到 GitHub Pages（逐字步骤）
 
-站点是纯静态文件，仓库根目录就是站点根目录。全程只需要浏览器 + 本机的 git（本机已装 `C:\Program Files\Git`）。
+站点是纯静态文件，仓库根目录就是站点根目录。
 
-## 1. 建仓库并推送
+> **当前状态：已部署上线**
+> - 站点：https://obiectstudy.github.io/hms/
+> - 仓库：https://github.com/Obiectstudy/hms （公开）
+> - 首次部署：2026-10-20，完成后 24 个文件与本地逐字节一致
+> - 发布方式：Settings → Pages → `Deploy from a branch` → `main` / `(root)`，每次 `git push` 自动重建
+> - 本机 remote 已配成 SSH，并指向专用密钥 `~/.ssh/id_ed25519_hms`（见 `git config core.sshCommand`）
+> - 曾经的 `Actions` 自动启用方案已移除：`configure-pages` 的 `enablement` 需要管理员级权限，`GITHUB_TOKEN` 拿不到，工作流必然红
+
+## 0. 本次已完成的提交
+
+```powershell
+git -C C:\Users\Administrator\Desktop\hms log --oneline
+# b62470a ci: 移除自动启用 Pages 的工作流
+# b0d250a ci: 用 Actions 发布 Pages 并在首次运行时自动启用
+# d74b8ad chore: 加一键部署脚本（PS 5.1 兼容，Token 不落盘）
+# 920c074 feat: HMS 家庭健康管理 PWA
+```
+
+## 1. 重新部署（首次部署已做过，这里是通用流程）
 
 在 PowerShell 里执行（把 `你的GitHub用户名` 换成真实用户名）：
 
