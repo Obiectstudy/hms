@@ -1,0 +1,43 @@
+name: Deploy Pages
+
+# 用 Actions 发布静态站点：首次运行会自动启用 Pages（configure-pages 的 enablement），
+# 因此不需要在网页上点 Settings → Pages，也不需要 API Token。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 组装站点（排除仓库元数据、测试与文档）
+        run: |
+          mkdir -p _site
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'tests' --exclude 'docs' \
+            --exclude 'deploy.ps1' --exclude 'README.md' --exclude '_site' ./ _site/
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
