@@ -235,6 +235,57 @@ export function weightStats(weights) {
   };
 }
 
+// ---------- 体重单位换算 ----------
+// 存储永远是 kg（weights.weightKg / daySummary().weight / weightStats() 都不变），
+// 斤只是「显示与输入」单位；导出 CSV/JSON 同样保持 kg，跨单位备份才一致。
+
+/** 'jin' = 斤（1 斤 = 0.5 kg）。数组顺序即界面里的切换顺序。 */
+export const WEIGHT_UNITS = Object.freeze(['kg', 'jin']);
+
+const UNIT_LABELS = { kg: 'kg', jin: '斤' };
+const UNIT_STEPS = { kg: 0.1, jin: 0.2 };
+const UNIT_RANGES = { kg: { min: 20, max: 300 }, jin: { min: 40, max: 600 } };
+
+/** 未知单位（旧数据、手改数据）一律按 kg 处理，绝不抛异常。 */
+function unitKey(unit) {
+  return unit === 'jin' ? 'jin' : 'kg';
+}
+
+/** 保留 2 位小数；用途同 round1，把 90.60000000000001 这类浮点尾巴收口。 */
+function round2(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  const r = Math.round(v * 100) / 100;
+  return Object.is(r, -0) ? 0 : r;
+}
+
+export function weightUnitLabel(unit) {
+  return UNIT_LABELS[unitKey(unit)];
+}
+
+/** kg -> 显示单位，1 位小数。 */
+export function kgToUnit(kg, unit) {
+  const v = num(kg);
+  return unitKey(unit) === 'jin' ? round1(v * 2) : round1(v);
+}
+
+/** 显示单位 -> kg（入库前必须过这一步），2 位小数。 */
+export function unitToKg(value, unit) {
+  const v = num(value);
+  return unitKey(unit) === 'jin' ? round2(v / 2) : round2(v);
+}
+
+/** 刻度步长：斤的步长取 0.2，换算后仍落在 0.1kg 网格上。 */
+export function weightStep(unit) {
+  return UNIT_STEPS[unitKey(unit)];
+}
+
+/** 滑动刻度的边界（返回新对象，调用方改不坏配置）。 */
+export function weightRange(unit) {
+  const r = UNIT_RANGES[unitKey(unit)];
+  return { min: r.min, max: r.max };
+}
+
 /** 按 date 分组，保持组内原始顺序。缺 date 的记录归到 '' 组，不静默丢弃。 */
 export function groupByDate(records) {
   const out = new Map();

@@ -4,6 +4,7 @@ import {
   DEFAULT_BASE_URL,
   DEFAULT_MODEL,
   MODEL_CANDIDATES,
+  STANDARD_DISHES,
   buildRequestBody,
   buildPrompt,
   fileToDataUrl,
@@ -487,6 +488,164 @@ test('findFood：精确 / 别名 / 带后缀 / 括号写法', () => {
   eq(findFood('米饭 1 碗')?.id, 'rice', '带份量后缀');
   eq(findFood('红烧肉（小份）')?.id, 'braised-pork', '带括号后缀');
   eq(findFood('完全不存在的食物')?.id, undefined, '未命中返回 null');
+});
+
+// ---------------------------------------------------------------- 复合菜：数据 / 检索 / 校准
+
+test('食物库规模：总数 ≥450、成品菜 ≥250、原料 ≥150', () => {
+  const dishes = FOODS.filter((f) => f.kind === 'dish');
+  const ingredients = FOODS.filter((f) => f.kind === 'ingredient');
+  assert(FOODS.length >= 450, `总数不足：${FOODS.length}`);
+  assert(dishes.length >= 250, `成品菜不足：${dishes.length}`);
+  assert(ingredients.length >= 150, `原料不足：${ingredients.length}`);
+  eq(dishes.length + ingredients.length, FOODS.length, '每条都必须打上 kind');
+});
+
+test('食物库结构自洽：字段齐全、id/name 唯一、kcal 与 4/4/9 相符、宏量合计 ≤100g、成品菜都有 unit', () => {
+  const ids = new Set();
+  const names = new Set();
+  const bad = [];
+  for (const food of FOODS) {
+    const where = `${food?.id ?? '(无 id)'}/${food?.name ?? '(无名称)'}`;
+    assert(typeof food.id === 'string' && food.id.trim(), `${where} 缺 id`);
+    assert(typeof food.name === 'string' && food.name.trim(), `${where} 缺名称`);
+    assert(!ids.has(food.id), `id 重复：${food.id}`);
+    assert(!names.has(food.name), `名称重复：${food.name}`);
+    ids.add(food.id);
+    names.add(food.name);
+    assert(food.kind === 'dish' || food.kind === 'ingredient', `${where} kind 非法：${food.kind}`);
+    assert(Array.isArray(food.aliases || []), `${where} aliases 必须是数组`);
+    for (const alias of food.aliases || []) assert(typeof alias === 'string' && alias.trim(), `${where} 别名非法`);
+    const p = food.per100g;
+    assert(p && typeof p === 'object', `${where} 缺 per100g`);
+    for (const key of ['kcal', 'carb', 'protein', 'fat']) {
+      const v = p[key];
+      assert(typeof v === 'number' && Number.isFinite(v), `${where}.${key} 必须是有限数字（实际 ${v}）`);
+      assert(v >= 0, `${where}.${key} 不能为负`);
+    }
+    assert(Number.isInteger(p.kcal), `${where}.kcal 必须是整数`);
+    assert(p.kcal <= 920, `${where}.kcal 超出纯油上限：${p.kcal}`);
+    const calc = p.carb * 4 + p.protein * 4 + p.fat * 9;
+    const tol = Math.max(30, p.kcal * 0.3);
+    if (Math.abs(calc - p.kcal) > tol) bad.push(`${food.name}(标${p.kcal}/算${Math.round(calc)})`);
+    const macroSum = p.carb + p.protein + p.fat;
+    if (macroSum > 100.5) bad.push(`${food.name}(宏量合计 ${macroSum.toFixed(1)})`);
+    for (const key of ['fiber', 'sodium']) {
+      if (key in p) assert(Number.isFinite(p[key]) && p[key] >= 0, `${where}.${key} 非法`);
+    }
+    if (food.kind === 'dish') {
+      assert(food.unit && typeof food.unit.name === 'string' && food.unit.name, `${where} 成品菜缺 unit`);
+      assert(Number.isFinite(food.unit.grams) && food.unit.grams >= 5 && food.unit.grams <= 1000, `${where}.unit.grams 越界`);
+    }
+  }
+  eq(bad, [], 'kcal/宏量不自洽的条目');
+});
+
+test('食物库覆盖常见分类与用户点名的必含菜', () => {
+  const names = new Set(FOODS.map((f) => f.name));
+  const required = [
+    '菠菜炒鸡蛋', '番茄炒蛋', '青椒炒肉', '青椒土豆丝', '宫保鸡丁', '鱼香肉丝', '麻婆豆腐',
+    '红烧肉', '红烧茄子', '地三鲜', '蒜蓉油麦菜', '清炒西兰花', '西红柿鸡蛋汤', '紫菜蛋花汤',
+    '冬瓜排骨汤', '蛋炒饭', '西红柿鸡蛋面', '馄饨', '猪肉白菜包子', '小米粥', '皮蛋瘦肉粥',
+    '酸辣土豆丝', '回锅肉', '糖醋里脊', '可乐鸡翅', '咖喱鸡', '麻辣烫', '兰州拉面',
+    '黄焖鸡米饭', '螺蛳粉', '煎饼果子',
+  ];
+  for (const name of required) assert(names.has(name), `库内缺少必含菜：${name}`);
+});
+
+test('findFood：同一道菜的多种写法命中同一条', () => {
+  const canonical = findFood('菠菜炒鸡蛋');
+  eq(canonical?.name, '菠菜炒鸡蛋', '标准菜名命中');
+  eq(canonical?.kind, 'dish', '成品菜 kind');
+  const alt = findFood('菠菜炒蛋');
+  assert(alt && alt.id === canonical.id, `「菠菜炒蛋」应命中同一道菜（实际 ${alt?.name}）`);
+  const tomato = findFood('西红柿炒鸡蛋');
+  assert(tomato && tomato.id === findFood('番茄炒蛋').id, `「西红柿炒鸡蛋」应命中番茄炒蛋（实际 ${tomato?.name}）`);
+  assert(!/[蛋]$/.test(tomato.name.replace('炒蛋', '')), '不能退化成原料');
+});
+
+test('findFood：带修饰词也能命中菜名（宫保鸡丁（小份）/ 一份红烧茄子）', () => {
+  eq(findFood('宫保鸡丁（小份）')?.id, 'kung-pao-chicken', '括号修饰');
+  eq(findFood('一份红烧茄子')?.id, findFood('红烧茄子')?.id, '前缀「一份」');
+  eq(findFood('家常红烧茄子')?.id, findFood('红烧茄子')?.id, '前缀「家常」');
+  eq(findFood('清炒西兰花（小份）')?.id, 'stir-broccoli', '库内既有菜名');
+});
+
+test('findFood：能命中菜名时不退化成原料', () => {
+  eq(findFood('土豆丝')?.kind, 'dish', '土豆丝应命中菜品');
+  assert(/土豆丝/.test(findFood('土豆丝').name), `实际命中 ${findFood('土豆丝')?.name}`);
+  eq(findFood('土豆')?.kind, 'ingredient', '单说土豆仍是原料');
+  eq(findFood('菠菜')?.kind, 'ingredient', '单说菠菜仍是原料');
+  eq(findFood('鸡蛋')?.kind, 'ingredient', '单说鸡蛋仍是原料');
+});
+
+test('findFood：kind 提示参与名称校准', () => {
+  eq(findFood('土豆丝', { kind: 'dish' })?.kind, 'dish', 'dish 期望命中菜');
+  eq(findFood('菠菜炒', { kind: 'dish' })?.name, '菠菜炒鸡蛋', 'kind=dish 时优先菜名');
+  eq(findFood('菠菜炒', { kind: 'ingredient' })?.name, '菠菜', 'kind=ingredient 时优先原料');
+  eq(findFood('黄瓜炒', { kind: 'ingredient' })?.name, '黄瓜', 'kind=ingredient 时优先原料（黄瓜）');
+  // 精确命中（名称/别名完全一致）始终优先于 kind 提示，避免把「土豆丝」这种别名猜错
+  eq(findFood('土豆丝', { kind: 'ingredient' })?.name, '青椒土豆丝', '精确别名不被 kind 覆盖');
+  eq(findFood('宫保鸡丁', { kind: 'dish' })?.id, 'kung-pao-chicken', '精确命中不受提示影响');
+});
+
+test('searchFoods：菜品优先（dish 排在 ingredient 之前）', () => {
+  const out = searchFoods('炒', 30);
+  assert(out.length > 0, '「炒」应有结果');
+  const firstIngredient = out.findIndex((f) => f.kind === 'ingredient');
+  const lastDish = out.map((f) => f.kind === 'dish').lastIndexOf(true);
+  assert(firstIngredient === -1 || lastDish < firstIngredient, '菜品必须排在原料前面');
+  eq(out[0].kind, 'dish', '首条应是菜品');
+});
+
+test('searchFoods：空查询的热门里既有主食也有家常菜', () => {
+  const hot = searchFoods('');
+  eq(hot.length, 10, '热门条数');
+  assert(hot.some((f) => f.name === '米饭'), '热门缺米饭');
+  assert(hot.some((f) => f.kind === 'dish' && /炒/.test(f.name)), '热门缺家常菜');
+});
+
+test('calibrateItems：整份成品菜用库值覆盖，不是鸡蛋+菠菜的相加', () => {
+  const dish = findFood('菠菜炒鸡蛋');
+  const [item] = calibrateItems([{ name: '菠菜炒鸡蛋', grams: 300, kcal: 999, carb: 0, protein: 0, fat: 0, confidence: 'high' }]);
+  eq(item.foodId, dish.id, 'foodId 指向整道菜');
+  eq(item.kind, 'dish', 'kind 透出成品菜');
+  eq(item.kcal, Math.round(dish.per100g.kcal * 3), 'kcal 用库值 ×3');
+  close(item.fat, Math.round(dish.per100g.fat * 3 * 10) / 10, '脂肪用库值 ×3');
+  const rawFat = (findFood('鸡蛋').per100g.fat + findFood('菠菜').per100g.fat) / 2;
+  assert(dish.per100g.fat > rawFat * 1.5, `含油成品菜的脂肪应明显高于生料（${dish.per100g.fat} vs ${rawFat.toFixed(1)}）`);
+  const rawKcal300 = Math.round(((findFood('鸡蛋').per100g.kcal + findFood('菠菜').per100g.kcal) / 2) * 3);
+  assert(item.kcal > rawKcal300, `成品菜热量应高于同重量生料相加（${item.kcal} vs ${rawKcal300}）`);
+});
+
+test('calibrateItems：模型给了 kind 时按它校准名称匹配', () => {
+  const [asDish] = calibrateItems([{ name: '宫保鸡丁', grams: 250, kind: 'dish', kcal: 1, carb: 1, protein: 1, fat: 1 }]);
+  eq(asDish.foodId, 'kung-pao-chicken', 'dish 命中');
+  eq(asDish.kind, 'dish', 'kind 透出');
+  const [unknown] = calibrateItems([{ name: '神秘拼盘', grams: 100, kind: 'dish', kcal: 200 }]);
+  eq(unknown.kind, 'dish', '未命中时保留模型给的 kind');
+});
+
+test('buildPrompt：明确「一道菜就返回菜名」的规则并附标准菜名参考', () => {
+  const prompt = buildPrompt();
+  for (const token of ['菜名', 'kind', 'dish', 'ingredient', 'unit', '烹调油', '禁止']) {
+    assert(prompt.includes(token), `提示词缺少关键词：${token}`);
+  }
+  assert(/不要解释文字/.test(prompt) && /只输出/.test(prompt), '仍要求只输出 JSON');
+  const listed = STANDARD_DISHES.filter((name) => prompt.includes(name));
+  assert(STANDARD_DISHES.length >= 50 && STANDARD_DISHES.length <= 60, `标准菜名条数应在 50–60（实际 ${STANDARD_DISHES.length}）`);
+  assert(listed.length >= 30, `提示词里至少要出现 30 个标准菜名（实际 ${listed.length}）`);
+  const names = new Set(FOODS.map((f) => f.name));
+  for (const name of STANDARD_DISHES) assert(names.has(name), `标准菜名必须在库内：${name}`);
+});
+
+test('parseModelJson：解析模型新增的 kind 与 unit 提示', () => {
+  const out = parseModelJson('{"items":[{"name":"菠菜炒鸡蛋","kind":"dish","unit":"1 盘","grams":250,"kcal":265,"carb":6.5,"protein":13.5,"fat":20.5}]}');
+  eq(out.items[0].kind, 'dish', 'kind');
+  eq(out.items[0].grams, 250, 'grams');
+  const fromUnit = parseModelJson('{"items":[{"name":"红烧茄子","kind":"菜品","unit":{"name":"1 盘","grams":250},"kcal":330}]}');
+  eq(fromUnit.items[0].kind, 'dish', '中文 kind');
+  eq(fromUnit.items[0].grams, 250, '缺 grams 时用 unit.grams');
 });
 
 // ---------------------------------------------------------------- 环境边界

@@ -303,6 +303,214 @@ export function emptyState(text, actionText, onAction) {
   );
 }
 
+/* ---------- 体重刻度尺（SPEC §7 体重：左右滑动录入） ---------- */
+
+// 刻度网格以 0 为原点：step=0.1 时 68.4 落在网格上，step=0.2 时 181.2 也落在网格上，
+// 所以 kg ⇄ 斤 切换后同一物理重量仍然是刻度点。
+const RULER_MAX_TICKS = 20000;
+
+function stepDecimals(step) {
+  const text = String(step);
+  const dot = text.indexOf('.');
+  return dot === -1 ? 0 : Math.min(6, text.length - dot - 1);
+}
+
+function roundToDecimals(value, decimals) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  const r = Number(n.toFixed(Math.min(6, Math.max(0, decimals))));
+  return Object.is(r, -0) ? 0 : r;
+}
+
+function bounds(min, max) {
+  const lo = Number(min);
+  const hi = Number(max);
+  return { lo: Number.isFinite(lo) ? lo : -Infinity, hi: Number.isFinite(hi) ? hi : Infinity };
+}
+
+function gridIndex(value, step) {
+  return Math.round(Number(value) / Number(step));
+}
+
+/** 就近吸附到 step 的整数倍，再 clamp 到 [min, max]；非法输入回落到 min，绝不抛异常。 */
+export function snapToStep(value, step, min, max) {
+  const { lo, hi } = bounds(min, max);
+  const raw = Number(value);
+  const start = Number.isFinite(raw) ? raw : (Number.isFinite(lo) ? lo : 0);
+  const s = Number(step);
+  if (!Number.isFinite(s) || s <= 0) return Math.min(hi, Math.max(lo, start));
+  const snapped = roundToDecimals(Math.round(start / s) * s, stepDecimals(step));
+  // 边界优先：min/max 本身可能不在网格上，clamp 后不再二次吸附，避免越界。
+  return Math.min(hi, Math.max(lo, snapped));
+}
+
+/**
+ * 拖动位移 → 吸附后的显示值。
+ * deltaPx > 0 表示手指向右拖（刻度条右移，指针指到更小的刻度），
+ * 因此 显示值 = startValue − deltaPx / pxPerStep × step。
+ */
+export function valueFromDrag({ startValue = 0, deltaPx = 0, pxPerStep = 8, step = 1, min = -Infinity, max = Infinity } = {}) {
+  const { lo, hi } = bounds(min, max);
+  const s = Number(step);
+  const perStep = Number(pxPerStep);
+  const start = Number(startValue);
+  const safeStart = Number.isFinite(start) ? start : (Number.isFinite(lo) ? lo : 0);
+  if (!Number.isFinite(s) || s <= 0 || !Number.isFinite(perStep) || perStep <= 0) {
+    return snapToStep(safeStart, step, lo, hi);
+  }
+  const delta = Number(deltaPx);
+  const steps = Number.isFinite(delta) ? delta / perStep : 0;
+  return snapToStep(safeStart - steps * s, s, lo, hi);
+}
+
+/** 刻度清单：kind 依次为 label（带数字，一定也是 major）> major > minor。 */
+export function rulerTicks({ min = 0, max = 100, step = 1, majorEvery = 10, labelEvery = 50 } = {}) {
+  const s = Number(step);
+  const lo = Number(min);
+  const hi = Number(max);
+  if (!Number.isFinite(s) || s <= 0 || !Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) return [];
+  const major = Number.isFinite(Number(majorEvery)) && Number(majorEvery) > 0 ? Math.round(Number(majorEvery)) : 0;
+  const label = Number.isFinite(Number(labelEvery)) && Number(labelEvery) > 0 ? Math.round(Number(labelEvery)) : 0;
+  const decimals = stepDecimals(s);
+  // 1e-9 抵消 20/0.1=199.99999… 这类除法尾巴，否则首尾刻度会少一根。
+  const first = Math.ceil(lo / s - 1e-9);
+  const last = Math.floor(hi / s + 1e-9);
+  const ticks = [];
+  for (let i = first; i <= last && ticks.length < RULER_MAX_TICKS; i += 1) {
+    const kind = label > 0 && i % label === 0 ? 'label' : major > 0 && i % major === 0 ? 'major' : 'minor';
+    ticks.push({ value: roundToDecimals(i * s, decimals), kind });
+  }
+  return ticks;
+}
+
+/** 刻度上的数字：整数不带小数尾巴，其余保留 1 位。 */
+function tickLabel(value) {
+  const v = Number(value);
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
+/**
+ * 刻度尺选择器：中心固定指针 + 随拖动位移的刻度条。
+ * 手势走 pointerdown/move/up（触摸与鼠标同一套），松手直接吸附到 step 网格，没有惯性动画。
+ * 返回的节点额外挂 setValue(v) / getValue()，供视图做单位切换与测试断言。
+ */
+export function rulerPicker({
+  min = 0,
+  max = 100,
+  step = 1,
+  value = 0,
+  unitLabel = '',
+  majorEvery = 10,
+  labelEvery = 50,
+  pxPerStep = 8,
+  label = '滑动选值',
+  onChange,
+} = {}) {
+  const { lo, hi } = bounds(min, max);
+  const s = Number.isFinite(Number(step)) && Number(step) > 0 ? Number(step) : 1;
+  const perStep = Number.isFinite(Number(pxPerStep)) && Number(pxPerStep) > 0 ? Number(pxPerStep) : 8;
+  const decimals = Math.max(stepDecimals(s), 1);
+  let current = snapToStep(value, s, lo, hi);
+
+  // 位置一律取到 0.001px：20/0.1 这类除法会留下 199.99999999999997 的长尾巴。
+  const offsetOf = (v) => Math.round(((v - lo) / s) * perStep * 1000) / 1000;
+
+  const strip = el('div', { className: 'ruler__strip' });
+  for (const tick of rulerTicks({ min: lo, max: hi, step: s, majorEvery, labelEvery })) {
+    const x = offsetOf(tick.value);
+    const modifier = tick.kind === 'label' ? ' ruler__tick--major ruler__tick--label' : tick.kind === 'major' ? ' ruler__tick--major' : '';
+    strip.appendChild(el('div', {
+      className: `ruler__tick${modifier}`,
+      style: { left: `${x}px` },
+      attr: { 'aria-hidden': 'true' },
+    }));
+    if (tick.kind === 'label') {
+      strip.appendChild(el('div', { className: 'ruler__label', style: { left: `${x}px` }, attr: { 'aria-hidden': 'true' }, text: tickLabel(tick.value) }));
+    }
+  }
+
+  const root = el('div', {
+    className: 'ruler',
+    attr: {
+      role: 'slider',
+      tabindex: '0',
+      'aria-label': label,
+      'aria-valuemin': lo,
+      'aria-valuemax': hi,
+    },
+  },
+    el('div', { className: 'ruler__pointer', attr: { 'aria-hidden': 'true' } }),
+    strip,
+  );
+
+  const shown = () => roundToDecimals(current, decimals);
+
+  function paint() {
+    strip.style.transform = `translate3d(${-offsetOf(current)}px, 0, 0)`;
+    root.setAttribute('aria-valuenow', String(shown()));
+    root.setAttribute('aria-valuetext', `${shown()}${unitLabel ? ` ${unitLabel}` : ''}`);
+  }
+
+  function emit() {
+    if (typeof onChange === 'function') onChange(shown());
+  }
+
+  function setValue(next, silent = false) {
+    current = snapToStep(next, s, lo, hi);
+    paint();
+    if (!silent) emit();
+    return shown();
+  }
+
+  let drag = null;
+  root.addEventListener('pointerdown', (event) => {
+    if (event && event.button != null && event.button !== 0) return;
+    drag = { startX: Number(event && event.clientX), startValue: current, pointerId: event && event.pointerId };
+    if (typeof root.setPointerCapture === 'function' && drag.pointerId != null) {
+      try { root.setPointerCapture(drag.pointerId); } catch { /* 老浏览器没有指针捕获，退化为容器内拖动 */ }
+    }
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    // 拖动后仍可用键盘微调：部分浏览器不会自动把焦点给到 tabindex 容器。
+    if (typeof root.focus === 'function') {
+      try { root.focus({ preventScroll: true }); } catch { root.focus(); }
+    }
+    root.classList.add('ruler--dragging');
+  });
+  root.addEventListener('pointermove', (event) => {
+    if (!drag) return;
+    const x = Number(event && event.clientX);
+    if (!Number.isFinite(x)) return;
+    if (typeof event.preventDefault === 'function') event.preventDefault();
+    setValue(valueFromDrag({ startValue: drag.startValue, deltaPx: x - drag.startX, pxPerStep: perStep, step: s, min: lo, max: hi }));
+  });
+  const endDrag = () => {
+    if (!drag) return;
+    drag = null;
+    root.classList.remove('ruler--dragging');
+    // 拖动中已逐帧吸附，这里再对齐一次，保证松手值与屏幕上指针所指刻度一致。
+    setValue(current);
+  };
+  root.addEventListener('pointerup', endDrag);
+  root.addEventListener('pointercancel', endDrag);
+
+  root.addEventListener('keydown', (event) => {
+    const key = event && event.key;
+    let next = null;
+    if (key === 'ArrowLeft' || key === 'ArrowDown') next = current - s;
+    else if (key === 'ArrowRight' || key === 'ArrowUp') next = current + s;
+    else if (key === 'Home') next = lo;
+    else if (key === 'End') next = hi;
+    if (next == null) return;
+    if (typeof event.preventDefault === 'function') event.preventDefault();
+    setValue(next);
+  });
+
+  root.getValue = shown;
+  root.setValue = (next) => setValue(next, true);
+  paint();
+  return root;
+}
+
 export function field({ label = '', type = 'text', value = '', placeholder = '', onInput } = {}) {
   const input = el('input', {
     className: 'input',

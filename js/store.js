@@ -13,6 +13,7 @@ import {
   tdee,
   weightStats,
   round1,
+  WEIGHT_UNITS,
 } from './nutrition.js';
 import {
   normalizeItems,
@@ -31,6 +32,8 @@ const DEFAULT_SETTINGS = {
   apiKey: '',
   model: 'qwen3-vl-plus',
   baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  // 只影响显示与输入：落库的体重永远是 kg
+  weightUnit: 'kg',
 };
 
 const SAFE_GOALS = {
@@ -153,6 +156,10 @@ export async function saveGoals(g) {
   await db.setMeta('goals', normalizeGoals(g));
 }
 
+function normalizeWeightUnit(unit, fallback = DEFAULT_SETTINGS.weightUnit) {
+  return WEIGHT_UNITS.includes(unit) ? unit : fallback;
+}
+
 export async function getSettings() {
   const saved = await db.getMeta('settings', null);
   const src = saved && typeof saved === 'object' ? saved : {};
@@ -160,9 +167,12 @@ export async function getSettings() {
     apiKey: text(src.apiKey),
     model: text(src.model) || DEFAULT_SETTINGS.model,
     baseUrl: text(src.baseUrl) || DEFAULT_SETTINGS.baseUrl,
+    // 旧数据没有这个键 -> 'kg'，视图层拿到的永远不是 undefined
+    weightUnit: normalizeWeightUnit(src.weightUnit),
   };
 }
 
+/** 部分更新：只传 apiKey 时不能把 weightUnit / model / baseUrl 冲掉。 */
 export async function saveSettings(s) {
   const cur = await getSettings();
   const src = s && typeof s === 'object' ? s : {};
@@ -170,6 +180,7 @@ export async function saveSettings(s) {
     apiKey: src.apiKey === undefined ? cur.apiKey : text(src.apiKey),
     model: text(src.model) || cur.model || DEFAULT_SETTINGS.model,
     baseUrl: text(src.baseUrl) || cur.baseUrl || DEFAULT_SETTINGS.baseUrl,
+    weightUnit: src.weightUnit === undefined ? cur.weightUnit : normalizeWeightUnit(src.weightUnit),
   };
   await db.setMeta('settings', next);
 }

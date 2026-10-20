@@ -79,6 +79,41 @@ function fireInput(node) {
   for (const fn of node.listeners.input || []) fn({ target: node, preventDefault() {}, stopPropagation() {} });
 }
 
+/** 指针事件：rulerPicker 用 pointerdown/move/up 覆盖触摸与鼠标，这里按同一形状投递。 */
+function firePointer(node, type, extra = {}) {
+  const event = {
+    type,
+    clientX: 0,
+    clientY: 0,
+    button: 0,
+    pointerId: 1,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+    stopPropagation() {},
+    target: node,
+    ...extra,
+  };
+  for (const fn of node.listeners[type] || []) fn(event);
+  return event;
+}
+
+function fireKey(node, key) {
+  const event = {
+    key,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+    stopPropagation() {},
+    target: node,
+  };
+  for (const fn of node.listeners.keydown || []) fn(event);
+  return event;
+}
+
+/** 按 className 精确取节点（刻度尺里 .ruler__strip 也含 "ruler" 前缀，不能用 includes）。 */
+function byClass(root, className) {
+  return root.walk().filter((n) => String(n.className).split(/\s+/).includes(className));
+}
+
 /** 文本里不能漏出 undefined / NaN——这是模板拼接最常见的线上事故。 */
 function assertNoLeak(text, label) {
   assert.ok(text.length > 0, `${label} 渲染出空文本`);
@@ -480,6 +515,141 @@ export async function run() {
       }
     });
 
+    // ---- 1.5 体重刻度尺：纯函数 / 拖动改值 / 单位切换 ----
+    await checkAsync('刻度尺纯函数：snapToStep / valueFromDrag / rulerTicks', async () => {
+      const ui = await import('../js/ui.js');
+
+      // 吸附：非整倍数就近取整、边界 clamp、非法输入不抛异常、浮点尾巴不漏到显示
+      assert.equal(ui.snapToStep(68.44, 0.1, 20, 300), 68.4);
+      assert.equal(ui.snapToStep(181.28, 0.1, 20, 300), 181.3);
+      assert.equal(ui.snapToStep(0, 0.1, 20, 300), 20, '低于下限应 clamp 到 min');
+      assert.equal(ui.snapToStep(9999, 0.1, 20, 300), 300, '高于上限应 clamp 到 max');
+      assert.equal(ui.snapToStep(-5, 0.2, 40, 600), 40);
+      assert.equal(ui.snapToStep(Number.NaN, 0.2, 40, 600), 40, 'NaN 应回落到下限');
+      assert.equal(String(ui.snapToStep(181.2, 0.2, 40, 600)), '181.2', '0.2 网格上不应出现浮点尾巴');
+
+      // 拖动换算：向右拖（deltaPx > 0）数值变小，向左拖变大，拖过头 clamp 到边界
+      const pull = (deltaPx, startValue = 181.2) => ui.valueFromDrag({ startValue, deltaPx, pxPerStep: 8, step: 0.2, min: 40, max: 600 });
+      assert.equal(pull(0), 181.2);
+      assert.equal(pull(80), 179.2, '右拖 10 格应减 2 斤');
+      assert.equal(pull(-80), 183.2, '左拖 10 格应加 2 斤');
+      assert.equal(pull(8000), 40, '右拖过头应 clamp 到 min');
+      assert.equal(pull(-24000), 600, '左拖过头应 clamp 到 max');
+
+      // 刻度分层：label 一定也是 major，首尾都在，网格值不带浮点尾巴
+      const ticks = ui.rulerTicks({ min: 0, max: 10, step: 0.5, majorEvery: 2, labelEvery: 4 });
+      assert.equal(ticks.length, 21);
+      assert.deepEqual(ticks[0], { value: 0, kind: 'label' });
+      assert.equal(ticks[1].kind, 'minor');
+      assert.equal(ticks[2].kind, 'major');
+      assert.equal(ticks[4].kind, 'label');
+      assert.deepEqual(ticks[ticks.length - 1], { value: 10, kind: 'label' });
+      const jinTicks = ui.rulerTicks({ min: 40, max: 42, step: 0.2, majorEvery: 10, labelEvery: 25 });
+      assert.equal(jinTicks.length, 11);
+      assert.equal(jinTicks[0].value, 40);
+      assert.equal(jinTicks[0].kind, 'label');
+      assert.equal(jinTicks[10].value, 42);
+      assert.equal(jinTicks[10].kind, 'major');
+    });
+
+    await checkAsync('weight 刻度尺拖动改值，保存后库里是 kg', async () => {
+      const root = await renderView('weight');
+      const ruler = root.walk().find((n) => String(n.className).split(/\s+/).includes('ruler') && n.getAttribute('role') === 'slider');
+      assert.ok(ruler, '体重录入没有渲染刻度尺（role=slider）');
+      assert.ok(byClass(ruler, 'ruler__pointer').length === 1, '刻度尺缺少中心固定指针');
+      assert.ok(byClass(ruler, 'ruler__label').length > 3, '刻度尺缺少数字标签');
+      assert.ok(byClass(ruler, 'ruler__tick--major').length > 10, '刻度尺缺少 major 刻度线');
+
+      const valueNode = () => root.walk().find((n) => String(n.className).split(/\s+/).includes('weight-value'));
+      assert.ok(valueNode(), '没有大号体重数字');
+      const before = Number(valueNode().textOf());
+      assert.equal(before, SEED.weightKg, '大号数字没按最近一次体重初始化');
+
+      // 刻度条位移必须与数值同步（kg：20 起、0.1/格、8px/格 → 68.4 = 3872px）
+      const strip = byClass(ruler, 'ruler__strip')[0];
+      assert.ok(strip, '刻度尺缺少刻度条容器');
+      assert.equal(strip.style.transform, 'translate3d(-3872px, 0, 0)', '刻度条初始位移不对');
+      const labelTexts = byClass(ruler, 'ruler__label').map((n) => n.textOf());
+      assert.ok(labelTexts.includes('25') && labelTexts.includes('30'), `刻度数字标签不对：${labelTexts.slice(0, 6)}`);
+
+      // 默认 kg：step 0.1、8px/格。左拖 80px = +1.0kg，再左拖到 -200（累计 400px）= +5.0kg
+      firePointer(ruler, 'pointerdown', { clientX: 200 });
+      firePointer(ruler, 'pointermove', { clientX: 120 });
+      const mid = Number(valueNode().textOf());
+      assert.ok(mid > before, `拖动中数字没有实时变大：${before} → ${mid}`);
+      assert.equal(mid, 69.4, `拖动中数字应吸附到网格：${mid}`);
+      firePointer(ruler, 'pointermove', { clientX: -200 });
+      firePointer(ruler, 'pointerup', { clientX: -200 });
+      assert.equal(Number(valueNode().textOf()), 73.4, '左拖 400px 应加 5.0kg');
+      assert.equal(strip.style.transform, 'translate3d(-4272px, 0, 0)', '松手后刻度条位置没跟上数值');
+      assert.equal(ruler.getAttribute('aria-valuenow'), '73.4', 'aria-valuenow 没跟上拖动');
+
+      // 键盘可达：← 减一格
+      fireKey(ruler, 'ArrowLeft');
+      assert.equal(Number(valueNode().textOf()), 73.3, '← 应减一个 step');
+
+      fireClick(findButton(root, '保存体重'));
+      await tick(140);
+      const summary = await store.daySummary(today);
+      assert.ok(summary.weight, '保存后当日没有体重记录');
+      assert.equal(summary.weight.weightKg, 73.3, '落库值应等于大号数字（kg）');
+      assertNoLeak(nodeText(root), 'weight(拖动后)');
+    });
+
+    await checkAsync('体重单位切换往返不漂移，键盘输入按当前单位换算入库', async () => {
+      const root = await renderView('weight');
+      const valueNode = () => root.walk().find((n) => String(n.className).split(/\s+/).includes('weight-value'));
+      const chip = byClass(root, 'unit-chip')[0];
+      assert.ok(chip, '没有单位 chip');
+      assert.equal(chip.textOf(), 'kg', '默认单位应是 kg');
+
+      const kgBefore = Number(valueNode().textOf());
+      assert.equal(kgBefore, 73.3, '应沿用上一条用例存的体重');
+
+      fireClick(chip);
+      await tick(160);
+      assert.equal(chip.textOf(), '斤', '点一下应切到斤');
+      assert.equal(Number(valueNode().textOf()), 146.6, '切到斤应按换算显示（73.3kg → 146.6斤）');
+      assert.equal((await store.getSettings()).weightUnit, 'jin', '单位选择没有写进设置');
+
+      fireClick(chip);
+      await tick(160);
+      assert.equal(chip.textOf(), 'kg', '再点一下应切回 kg');
+      const kgAfter = Number(valueNode().textOf());
+      assert.ok(Math.abs(kgAfter - kgBefore) <= 0.05, `kg→斤→kg 出现漂移：${kgBefore} → ${kgAfter}`);
+      assert.equal((await store.getSettings()).weightUnit, 'kg', '切回后设置没同步');
+
+      // 切到键盘输入，按「斤」录入 181.2 → 库里必须是 90.6 kg
+      fireClick(chip);
+      await tick(160);
+      const toggle = byClass(root, 'keypad-toggle')[0];
+      assert.ok(toggle, '没有切键盘输入的按钮');
+      fireClick(toggle);
+      await tick(60);
+      const numberInput = root.walk().find((n) => n.tagName === 'input'
+        && String(n.className).split(/\s+/).includes('weight-input'));
+      assert.ok(numberInput, '切到键盘模式后没有数字输入框');
+      assert.equal(Number(numberInput.value), 146.6, '键盘框没有按当前单位预填');
+
+      numberInput.value = '181.2';
+      fireInput(numberInput);
+      assert.equal(Number(valueNode().textOf()), 181.2, '键盘输入没有同步到大号数字');
+
+      fireClick(findButton(root, '保存体重'));
+      await tick(140);
+      const summary = await store.daySummary(today);
+      assert.equal(summary.weight.weightKg, 90.6, '181.2 斤应存成 90.6 kg');
+
+      // 今日页体重卡也要按设置单位显示（差值同样换算：21.4kg → 42.8斤）
+      const dash = await renderView('dashboard');
+      const dashText = nodeText(dash);
+      assert.ok(dashText.includes('181.2'), `dashboard 没有按斤显示最近体重：${dashText.slice(0, 160)}`);
+      assert.ok(dashText.includes('42.8'), `dashboard 的 7 天差值没有换算：${dashText.slice(0, 160)}`);
+      assert.ok(dashText.includes('斤'), 'dashboard 缺少单位文案');
+
+      await store.saveSettings({ weightUnit: 'kg' }); // 复原，别把单位状态漏给后续用例
+    });
+
     // ---- 2. 手动添加整链：搜索 → 定克数 → 加入清单 → 落库 ----
     await checkAsync('food 手动添加链路', async () => {
       let root = roots.get('food');
@@ -531,6 +701,188 @@ export async function run() {
       assert.ok(after.intake.kcal > before.intake.kcal, '保存后当日摄入没有增加');
       assert.ok(!dom.body.childNodes.some((n) => n.className === 'sheet-backdrop'), '保存后弹层没有关闭');
       assert.equal(fetchCalls, 0, '手动添加不应发出网络请求');
+    });
+
+    // ---- 2.5 「整份是一道菜」：识别把一道菜拆成原料时一键还原 ----
+    await checkAsync('food 整份是一道菜：2 项清单合并成 1 项', async () => {
+      const foodView = await import('../views/food.js');
+      const foodsMod = await import('../js/foods.js');
+      // 数据侧还在补 kind，测试不能绑死某一条：优先真菜，退化为任意已知条目。
+      const target = foodsMod.FOODS.find((f) => f.kind === 'dish') || foodsMod.FOODS.find((f) => f.name === '米饭');
+      assert.ok(target, '食物库里找不到可用于合并的条目');
+
+      const two = [
+        { name: '鸡蛋', grams: 50, kcal: 72, carb: 0.8, protein: 6.7, fat: 4.4, confidence: 'high' },
+        { name: '菠菜', grams: 100, kcal: 28, carb: 4.5, protein: 2.6, fat: 0.3 },
+      ];
+      const done = foodView.openDraftSheet(two, { date: today, source: 'ai', slot: 'lunch' });
+      await tick(60);
+
+      const draft = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop' && n.textOf().includes('识别结果'));
+      assert.ok(draft, '没有弹出识别结果清单');
+      const rows = () => draft.walk().filter((n) => n.className === 'list__item item-row');
+      assert.equal(rows().length, 2, '识别清单应有 2 项');
+
+      const mergeButton = findButton(draft, '整份是一道菜');
+      assert.ok(mergeButton, '识别清单里没有「整份是一道菜」入口');
+      fireClick(mergeButton);
+      await tick(160);
+
+      const pickSheet = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop' && n.textOf().includes('选一道菜'));
+      assert.ok(pickSheet, '点击合并入口后没有打开选菜弹层');
+
+      const search = pickSheet.walk().find((n) => n.tagName === 'input' && (n.type === 'search' || n.attributes.type === 'search'));
+      assert.ok(search, '选菜弹层没有搜索框');
+      search.value = target.name;
+      fireInput(search);
+      await tick(280);
+
+      const hit = pickSheet.walk()
+        .filter((n) => n.className === 'list__item pick-item')
+        .find((n) => n.textOf().startsWith(target.name));
+      assert.ok(hit, `搜索「${target.name}」没有命中`);
+      fireClick(hit);
+      await tick(60);
+
+      const gramsInput = pickSheet.walk().find((n) => n.tagName === 'input' && (n.type === 'number' || n.attributes.type === 'number'));
+      assert.ok(gramsInput, '选中食物后没有份量输入框');
+      const grams = Number(gramsInput.value);
+      assert.ok(grams > 0, '份量默认值不是正数');
+
+      const useButton = findButton(pickSheet, '就用这道菜');
+      assert.ok(useButton, '选菜弹层没有确认按钮');
+      fireClick(useButton);
+      await tick(120);
+
+      const modal = dom.body.childNodes.find((n) => n.className === 'modal-backdrop');
+      assert.ok(modal, '合并前没有二次确认');
+      assert.ok(modal.textOf().includes(`当前 2 项将被替换成「${target.name}」`), `二次确认文案不对：${modal.textOf()}`);
+      fireClick(findButton(modal, '替换'));
+      await tick(120);
+
+      assert.equal(rows().length, 1, '合并后清单应只剩 1 项');
+      const expected = nutrition.scaleFood(target.per100g, grams);
+      const mergedText = rows()[0].textOf();
+      assert.ok(mergedText.includes(target.name), `合并后名称不是菜名：${mergedText}`);
+      assert.ok(mergedText.includes(String(expected.kcal)), `合并后 kcal 不等于 scaleFood 结果 ${expected.kcal}：${mergedText}`);
+
+      fireClick(findButton(draft, '保存到当日'));
+      assert.equal(await done, 'saved', '保存后没有返回 saved');
+      await tick(80);
+
+      const summary = await store.daySummary(today);
+      // 同一天可能已有别的同 foodId 记录（前一个用例刚存过米饭），只认最后写入的那条。
+      const saved = summary.meals.filter((meal) => (meal.items || []).some((it) => it.foodId === target.id)).pop();
+      assert.ok(saved, '落库后找不到合并出来的那一条');
+      const item = saved.items.find((it) => it.foodId === target.id);
+      assert.equal(item.name, target.name, '落库名称不是菜名');
+      assert.equal(item.grams, grams, '落库克数不是选中的默认份量');
+      assert.equal(item.kcal, expected.kcal, '落库 kcal 不等于 scaleFood 结果');
+    });
+
+    await checkAsync('food 手动清单同样能整份合并', async () => {
+      const root = await renderView('food');
+      fireClick(findButton(root, '手动添加'));
+      await tick(140);
+
+      const pickSheet = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop');
+      assert.ok(pickSheet, '没有弹出手动添加层');
+      const search = pickSheet.walk().find((n) => n.tagName === 'input' && (n.type === 'search' || n.attributes.type === 'search'));
+      search.value = '鸡蛋';
+      fireInput(search);
+      await tick(280);
+      const hit = pickSheet.walk().filter((n) => n.className === 'list__item pick-item')
+        .find((n) => n.textOf().startsWith('鸡蛋'));
+      assert.ok(hit, '搜索「鸡蛋」没有命中');
+      fireClick(hit);
+      await tick(60);
+      fireClick(findButton(pickSheet, '加入清单'));
+      await tick(160);
+
+      const draft = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop' && n.textOf().includes('确认食物'));
+      assert.ok(draft, '没有进入手动清单');
+      const mergeButton = findButton(draft, '整份是一道菜');
+      assert.ok(mergeButton, '手动清单里没有「整份是一道菜」入口');
+      fireClick(mergeButton);
+      await tick(160);
+
+      const dishSheet = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop' && n.textOf().includes('选一道菜'));
+      assert.ok(dishSheet, '手动清单点合并后没有打开选菜弹层');
+
+      const dishSearch = dishSheet.walk().find((n) => n.tagName === 'input' && (n.type === 'search' || n.attributes.type === 'search'));
+      dishSearch.value = '米饭';
+      fireInput(dishSearch);
+      await tick(280);
+      const dishHit = dishSheet.walk().filter((n) => n.className === 'list__item pick-item')
+        .find((n) => n.textOf().startsWith('米饭'));
+      assert.ok(dishHit, '选菜弹层搜索「米饭」没有命中');
+      fireClick(dishHit);
+      await tick(60);
+      fireClick(findButton(dishSheet, '就用这道菜'));
+      await tick(120);
+      const modal = dom.body.childNodes.find((n) => n.className === 'modal-backdrop');
+      assert.ok(modal, '手动清单合并前没有二次确认');
+      assert.ok(modal.textOf().includes('当前 1 项将被替换成「米饭」'), `二次确认文案不对：${modal.textOf()}`);
+      fireClick(findButton(modal, '替换'));
+      await tick(120);
+
+      const rows = draft.walk().filter((n) => n.className === 'list__item item-row');
+      assert.equal(rows.length, 1, '手动清单合并后应只剩 1 项');
+      assert.ok(rows[0].textOf().includes('米饭'), `手动清单合并后名称不对：${rows[0].textOf()}`);
+
+      // 收尾：关掉清单，不留残留弹层影响后续用例
+      fireClick(findButton(draft, '×'));
+      await tick(60);
+      assert.ok(!dom.body.childNodes.some((n) => n.className === 'sheet-backdrop'), '关闭后仍有残留弹层');
+    });
+
+    await checkAsync('菜品优先展示并渲染「菜」徽标', async () => {
+      const foodView = await import('../views/food.js');
+      const dish = { id: 'test-dish', name: '菠菜炒鸡蛋', kind: 'dish', per100g: { kcal: 90, carb: 3, protein: 7, fat: 6 }, unit: { name: '1 盘', grams: 300 } };
+      const ingredient = { id: 'test-egg', name: '鸡蛋', per100g: { kcal: 144, carb: 1.5, protein: 13.3, fat: 8.8 }, unit: { name: '1 个', grams: 50 } };
+
+      const ordered = foodView.orderFoodsForPick([ingredient, dish]);
+      assert.deepEqual(ordered.map((f) => f.id), ['test-dish', 'test-egg'], '菜品没有排到搜索结果前面');
+
+      const row = foodView.renderPickRow(dish, () => {});
+      const badge = row.walk().find((n) => String(n.className).includes('pill--dish'));
+      assert.ok(badge, '菜品行没有「菜」徽标');
+      assert.equal(badge.textOf(), '菜', '徽标文字不是「菜」');
+      const plain = foodView.renderPickRow(ingredient, () => {});
+      assert.ok(!plain.walk().some((n) => String(n.className).includes('pill--dish')), '原料行不该有「菜」徽标');
+
+      assert.equal(foodView.pickDefaultGrams(dish), 300, '选中菜品时份量默认值应取 unit.grams');
+      const detailText = row.textOf();
+      assert.ok(detailText.includes('1 盘'), `搜索行没有显示单位名：${detailText}`);
+
+      const merged = foodView.mergeToDish([ingredient, { name: '菠菜', grams: 100, kcal: 28 }], dish);
+      const expected = nutrition.scaleFood(dish.per100g, 300);
+      assert.equal(merged.length, 1, '合并后应只有 1 项');
+      assert.equal(merged[0].name, '菠菜炒鸡蛋');
+      assert.equal(merged[0].grams, 300);
+      assert.equal(merged[0].foodId, 'test-dish');
+      assert.equal(merged[0].kcal, expected.kcal, '合并数值没有走 nutrition.scaleFood');
+      assert.equal(merged[0].carb, expected.carb);
+    });
+
+    await checkAsync('food.kind 缺失时按原料处理不抛异常', async () => {
+      const foodView = await import('../views/food.js');
+      const legacy = { id: 'legacy-food', name: '老数据食物', per100g: { kcal: 100, carb: 10, protein: 5, fat: 2 } };
+      assert.equal(foodView.isDish(legacy), false, '缺 kind 应判定为原料');
+      assert.equal(foodView.isDish(null), false);
+      assert.doesNotThrow(() => foodView.renderPickRow(legacy, () => {}), '缺 kind 的行渲染抛异常');
+      assert.equal(foodView.pickDefaultGrams(legacy), 100, '无单位的原料默认 100g');
+      assert.equal(foodView.defaultDishGrams({ name: '无单位菜', kind: 'dish', per100g: {} }), 200, '菜无单位时默认 200g');
+
+      const ordered = foodView.orderFoodsForPick([legacy, { id: 'd', name: '某菜', kind: 'dish', per100g: {} }]);
+      assert.equal(ordered.length, 2);
+      assert.equal(ordered[0].id, 'd');
+
+      const merged = foodView.mergeToDish([{ name: '鸡蛋', grams: 50, kcal: 72 }], legacy);
+      assert.equal(merged.length, 1, '旧数据也能合并');
+      assert.equal(merged[0].name, '老数据食物');
+      assert.equal(merged[0].grams, 200, '旧数据无 unit 时默认 200g');
+      assert.equal(merged[0].kcal, nutrition.scaleFood(legacy.per100g, 200).kcal);
     });
 
     // ---- 3. 无 API Key：走「去设置」引导，绝不发请求 ----

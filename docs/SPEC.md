@@ -92,6 +92,14 @@ export function weightStats(weights): { latest, latestDate, delta7, delta30, ser
 //   series: [{ date, weightKg }] 按日期升序；delta7/delta30 为与"该日期前 N 天最近一条"之差，无则 null
 export function groupByDate(records): Map<string, records[]>
 export function round1(n): number
+
+// v1.3 起：体重单位换算（存储永远是 kg，只有显示与输入换算；'jin' = 斤 = 0.5kg）
+export const WEIGHT_UNITS = ['kg', 'jin']
+export function weightUnitLabel(unit): string        // 'kg' | '斤'，未知单位回退 'kg'
+export function kgToUnit(kg, unit): number           // jin: kg*2，保留 1 位
+export function unitToKg(value, unit): number        // jin: value/2，保留 2 位
+export function weightStep(unit): number             // kg: 0.1 | jin: 0.2
+export function weightRange(unit): { min, max }      // kg: 20–300 | jin: 40–600
 ```
 
 ### 5.2 `js/db.js` —— 只做存储，不含业务规则
@@ -155,14 +163,16 @@ export async function clearAllData(): Promise<void>    // 业务数据 + photos�
 
 ```js
 export const FOODS: Food[]
-//  Food = { id, name, aliases?: string[], per100g: { kcal, carb, protein, fat, fiber?, sodium? },
+//  Food = { id, name, kind?: 'ingredient'|'dish', aliases?: string[], per100g: { kcal, carb, protein, fat, fiber?, sodium? },
 //           unit?: { name: string, grams: number } }
-export function searchFoods(query, limit = 20): Food[]   // 空 query 返回热门前 limit 条；按名称/别名包含匹配，短词优先前缀命中
-export function findFood(name): Food|null                // 精确/别名/包含匹配，取最相似
+export function searchFoods(query, limit = 20): Food[]   // 空 query 返回热门前 limit 条；菜品（kind==='dish'）排在原料之前
+export function findFood(name): Food|null                // 精确 → 去修饰词 → 别名 → 包含匹配，取最相似
 export function calibrateItems(items): MealItem[]         // 见 8.3
 ```
 
-食物库要求：不少于 **100** 条常见中式/西式食物，覆盖主食、肉禽、水产、蛋奶、豆制品、蔬菜、水果、坚果、油、饮料、常见外卖/菜品（如宫保鸡丁、麻辣烫按份）；数据取常见公开营养值，误差不追求实验室级。`unit` 用于克数换算（如米饭 `1 碗 = 200g`、鸡蛋 `1 个 = 50g`）。
+食物库要求：**总量 ≥ 450 条，其中 `kind: 'dish'` 的成品菜 ≥ 250 条**（v1.2 起，实际 513 / 351）。覆盖主食、肉禽、水产、蛋奶、豆制品、蔬菜、水果、坚果、油、饮料，以及家常炒菜、炖烧焖、汤羹、蛋类菜、豆制品菜、凉菜、硬菜、米面盖饭、早餐、外卖快餐、卤味烧烤。
+成品菜的营养值口径为**含油烹饪后的成品**（家常炒菜每 100g 约含 5–10g 油），不是生料相加；必须带 `unit`（如 `1 盘 = 250g`）。数据取常见公开值，误差不追求实验室级。
+自洽性由 `tests/foods.data.test.mjs` 强制：`kcal` 与 `4/4/9` 偏差 ≤ ±30%（或 ±30 kcal）、宏量合计 ≤ 100g/100g、份量克数 5–1000g、id/name 唯一。
 
 ### 5.5 `js/vision.js` —— 拍照识别
 
@@ -293,9 +303,12 @@ body：
 
 ### 8.2 提示词要求（`buildPrompt()`）
 
-要求模型：识别全部食物；对中式菜品按常见一份估算克数与营养素；每项输出
-`{ name, grams, kcal, carb, protein, fat, fiber?, sodium?, confidence }`；
-无法确定克数时给合理估计并把 `confidence` 设为 `low`；只输出 `{"items":[…]}`，不要解释文字。
+要求模型（v1.2 起）：
+- **画面是一道做好的菜 → 返回这道菜的菜名，一项**；只有画面明显是分开的多种食物（如一碗饭 + 一盘菜 + 一碗汤）才拆成多项。明确禁止把一道炒菜拆成「鸡蛋」「菠菜」两个原料项。
+- 每项输出 `{ name, grams, kcal, carb, protein, fat, fiber?, sodium?, confidence, kind, unit? }`，其中 `kind ∈ 'dish'|'ingredient'`、`unit` 为份量提示（如 `"1 盘"`）。
+- 成品菜按整份估算克数；无法确定时给合理估计并把 `confidence` 设为 `low`。
+- 提示词内置 **56 个高频标准菜名**（`STANDARD_DISHES`，全部取自库内），引导模型使用与本库一致的叫法，提高校准命中率。
+- 只输出 `{"items":[…]}`，不要解释文字。
 
 ### 8.3 结果校准（`calibrateItems`）
 
@@ -303,6 +316,8 @@ body：
 2. 未命中但有 `kcal` 而缺宏量 → 用 4/4/9 按 `carb:protein:fat = 0.5:0.2:0.3` 反推。
 3. `grams <= 0` 或 `> 2000` 视为异常，夹到 `50`/`500` 并降 `confidence` 为 `low`。
 4. 结果为空数组时抛错，提示"没识别出食物，换个角度重拍或手动添加"。
+5. （v1.2）命中 `kind === 'dish'` 的成品菜**优先于**原料命中；模型给出的 `kind` 参与匹配期望（`findFood(name, { kind })`：精确名称/别名命中始终最高，相同时按 kind 加权，避免「土豆丝」被带偏到原料「土豆」）。
+6. （v1.2）成品菜数值按**含油成品**口径（家常炒菜每 100g 约 5–10g 油），因此 `菠菜炒鸡蛋 300g ≈ 318 kcal`，而不是「鸡蛋 + 菠菜」生料相加的约 258 kcal。
 
 ## 9. 错误处理
 
@@ -338,7 +353,7 @@ body：
 
 ## 12. 版本
 
-`docs/SPEC.md` v1.1（2026-10-20）。契约变更须记录在 §13。
+`docs/SPEC.md` v1.3（2026-10-20）。契约变更须记录在 §13。
 
 ## 13. 变更记录
 
@@ -353,3 +368,16 @@ body：
 - **影响**：识别链路已用 `qwen3-vl-plus` 实跑成功（2.2s，单张合成图返回可被食物库校准的条目）。
   契约中其余签名、字段、类名均未变动。
 - **未改动**：§4 数据模型、§5 各模块契约、§6 视觉规范、§9 错误处理均保持原样。
+
+### v1.2 · 2026-10-20 · 复合菜食物库 + 识别返回菜名
+- **改动**：`Food` 新增 `kind: 'ingredient' | 'dish'`；食物库由 159 条扩到 **513 条**（`dish` 351 / `ingredient` 162）；
+  `searchFoods` / `findFood` 支持菜品优先与别名（如「菠菜炒蛋」→ 菠菜炒鸡蛋）；`buildPrompt()` 要求
+  **成品菜返回菜名一项、不拆成原料**，并内置 50–60 个高频标准菜名作引导。
+- **依据**：用户实测反馈「菠菜炒鸡蛋识别成了鸡蛋+菠菜」，且旧库无复合菜；另按原料相加会漏掉烹饪用油，热量显著偏低。
+- **新增闸门**：`tests/foods.data.test.mjs`（条数下限、字段自洽、别名指向、菜品优先排序、整份校准走库值）。
+
+### v1.3 · 2026-10-20 · 体重单位与刻度尺
+- **改动**：`nutrition.js` 新增`WEIGHT_UNITS`/`weightUnitLabel`/`kgToUnit`/`unitToKg`/`weightStep`/`weightRange`；
+  `store` 的 `DEFAULT_SETTINGS` 增加 `weightUnit: 'kg'`；体重录入改为左右滑动刻度尺（`ui.rulerPicker`），
+  支持 kg/斤 切换与切回键盘输入。
+- **约束**：`weights.weightKg`、`daySummary().weight`、CSV/JSON 导出**一律仍为 kg**，单位只在显示与输入层换算。

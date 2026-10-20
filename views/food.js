@@ -2,7 +2,7 @@
 import {
   el, clear, toast, openSheet, confirmDialog, emptyState, fmtKcal, fmt1, fmtDateCN, fmtTime, bar,
 } from '../js/ui.js';
-import { localDateStr, parseDateStr, round1, sumItems } from '../js/nutrition.js';
+import { localDateStr, parseDateStr, round1, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
 import { getSettings, getGoals, daySummary, logMeal, updateMeal, deleteMeal, savePhoto } from '../js/store.js';
 import { fileToDataUrl, analyzeFoodPhoto, MODEL_CANDIDATES } from '../js/vision.js';
 import { searchFoods } from '../js/foods.js';
@@ -48,22 +48,86 @@ function rescaleItem(item, grams) {
   return out;
 }
 
+function clampGrams(value) {
+  return Math.max(1, Math.min(2000, Math.round(Number(value) || 0)));
+}
+
+// 复合菜在数据侧用 kind === 'dish' 标记（另一人并行补数据，字段可能暂时缺失）。
+// 判定只认这一个字段：缺失 / 其它值一律按原料处理，不抛错。
+export function isDish(food) {
+  return Boolean(food && food.kind === 'dish');
+}
+
+/** 整份克数：优先单位换算（1 盘 ≈ 300g），缺省 200g。 */
+export function defaultDishGrams(food) {
+  const unitGrams = Number(food && food.unit && food.unit.grams);
+  if (Number.isFinite(unitGrams) && unitGrams > 0) return clampGrams(unitGrams);
+  return 200;
+}
+
+/** 选中食物时份量框默认值：菜品按整份算，原料沿用 unit.grams 或 100g。 */
+export function pickDefaultGrams(food) {
+  if (isDish(food)) return defaultDishGrams(food);
+  const unitGrams = Number(food && food.unit && food.unit.grams);
+  if (Number.isFinite(unitGrams) && unitGrams > 0) return clampGrams(unitGrams);
+  return 100;
+}
+
+/** 搜索结果排序：菜品整体前置，两组内保持库内相对顺序。 */
+export function orderFoodsForPick(foods) {
+  const list = Array.isArray(foods) ? foods.filter(Boolean) : [];
+  return [...list.filter(isDish), ...list.filter((food) => !isDish(food))];
+}
+
+// 每 100g 数值换算到实际克数（计算统一走 nutrition.scaleFood，避免两套公式漂移）。
 function scaleFood(food, grams) {
-  const g = Math.max(1, Math.min(2000, Math.round(Number(grams) || 0)));
-  const k = g / 100;
-  const p = food.per100g || {};
+  const g = clampGrams(grams);
+  const p = (food && food.per100g) || {};
+  const scaled = scalePer100g(p, g);
   const item = {
     name: food.name,
     grams: g,
-    kcal: Math.round(Number(p.kcal || 0) * k),
-    carb: round1(Number(p.carb || 0) * k),
-    protein: round1(Number(p.protein || 0) * k),
-    fat: round1(Number(p.fat || 0) * k),
+    kcal: scaled.kcal,
+    carb: scaled.carb,
+    protein: scaled.protein,
+    fat: scaled.fat,
     foodId: food.id,
   };
-  if (p.fiber != null) item.fiber = round1(Number(p.fiber) * k);
-  if (p.sodium != null) item.sodium = round1(Number(p.sodium) * k);
+  if (p.fiber != null) item.fiber = scaled.fiber;
+  if (p.sodium != null) item.sodium = scaled.sodium;
   return item;
+}
+
+/** 整份合并：把清单里的全部条目换成选中的这一道菜（保留数组引用，调用方原地替换）。 */
+export function mergeToDish(items, food, grams) {
+  const current = Array.isArray(items) ? items : [];
+  if (!food) return current.map((item) => ({ ...item }));
+  const g = Number(grams) > 0 ? clampGrams(grams) : defaultDishGrams(food);
+  return [scaleFood(food, g)];
+}
+
+export function mergeConfirmMessage(itemCount, food) {
+  const name = food && food.name ? food.name : '这道菜';
+  return `当前 ${Math.max(0, Number(itemCount) || 0)} 项将被替换成「${name}」`;
+}
+
+/** 搜索结果单行：菜品带「菜」徽标，原料不带。 */
+export function renderPickRow(food, onPick) {
+  const meta = [`${fmtKcal(food.per100g && food.per100g.kcal)} kcal / 100g`];
+  if (food.unit) meta.push(`1 ${food.unit.name}=${food.unit.grams}g`);
+  return el('button', {
+    className: 'list__item pick-item', type: 'button',
+    onClick: onPick,
+  },
+    el('div', { className: 'list__item--main' },
+      el('div', { className: 'row' },
+        el('span', { className: 'strong', text: food.name }),
+        isDish(food) ? el('span', { className: 'pill pill--dish', text: '菜' }) : null,
+      ),
+      el('div', { className: 'list__item--meta', text: meta.join(' · ') }),
+    ),
+    el('span', { className: 'muted', text: '选择' }),
+  );
 }
 
 function dataUrlToBlob(dataUrl, mime = 'image/jpeg') {
@@ -103,8 +167,9 @@ function totalsBlock(items) {
   );
 }
 
-// 可编辑清单：改克数、删单项、实时合计、选餐次、保存。返回 'saved' | 'add' | null。
-async function openDraftSheet(initialItems, meta) {
+// 可编辑清单：改克数、删单项、整份合并成一道菜、实时合计、选餐次、保存。
+// 返回 'saved' | 'add' | null。AI 识别与手动添加共用同一张表（只有标题/来源不同）。
+export async function openDraftSheet(initialItems, meta) {
   const items = initialItems.map((i) => ({ ...i }));
   return openSheet({
     title: meta.source === 'ai' ? '识别结果（可编辑）' : '确认食物',
@@ -151,6 +216,36 @@ async function openDraftSheet(initialItems, meta) {
       };
       repaint();
 
+      // 模型常把一道家常菜拆成多个原料（鸡蛋 + 菠菜），这里给一条「还原成一道菜」的出口。
+      const runMerge = async () => {
+        if (!items.length) {
+          toast('清单是空的，先加点食物', 'error');
+          return;
+        }
+        const pick = await openPickFoodSheet({ title: '整份是一道菜', mode: 'dish' });
+        if (!pick || !pick.food) return;
+        const ok = await confirmDialog({
+          title: '整份是一道菜？',
+          message: mergeConfirmMessage(items.length, pick.food),
+          okText: '替换',
+        });
+        if (!ok) return;
+        const merged = mergeToDish(items, pick.food, pick.item && pick.item.grams);
+        items.splice(0, items.length, ...merged);
+        toast(`已记成一道菜：${items[0] ? items[0].name : ''}`, 'ok');
+        repaint();
+      };
+      const mergeBar = el('div', { className: 'merge-bar' },
+        el('button', {
+          className: 'btn btn--ghost merge-bar__btn',
+          text: '整份是一道菜',
+          attr: { 'aria-label': '整份是一道菜：用库里的一道菜替换整个清单' },
+          onClick: () => {
+            runMerge().catch((err) => toast(`合并失败：${err && err.message ? err.message : err}`, 'error'));
+          },
+        }),
+      );
+
       const saveBtn = el('button', { className: 'btn btn--primary btn--block', text: '保存到当日' });
       saveBtn.addEventListener('click', async () => {
         if (!items.length) {
@@ -187,6 +282,7 @@ async function openDraftSheet(initialItems, meta) {
           el('summary', { className: 'muted', text: '查看模型原文' }),
           el('pre', { className: 'details__pre', text: meta.raw }),
         ) : null,
+        mergeBar,
         listNode,
         totalsNode,
         el('div', { className: 'divider' }),
@@ -201,19 +297,22 @@ async function openDraftSheet(initialItems, meta) {
   });
 }
 
-// 食物搜索 + 份量选择，解析为 MealItem 或 null。
-function openPickFoodSheet() {
+// 食物搜索 + 份量选择，解析为 { food, item }（item 为按克数算好的 MealItem）或 null。
+// mode === 'dish' 时给的是「整份替换」语境：文案改成挑一道菜，数据侧没菜时也照常可选原料。
+function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
+  const isDishMode = mode === 'dish';
   return openSheet({
-    title: '手动添加',
+    title,
     actions: [],
     content: ({ close }) => {
-      const search = el('input', { className: 'input', type: 'search', placeholder: '搜索食物，如「米饭」「鸡蛋」' });
+      const search = el('input', { className: 'input', type: 'search', placeholder: isDishMode ? '搜索菜名，如「菠菜炒鸡蛋」' : '搜索食物，如「米饭」「鸡蛋」' });
       const results = el('div', { className: 'list pick-list' });
       const detail = el('div', { className: 'col' });
 
       const showDetail = (food) => {
         clear(detail);
-        const defaultGrams = food.unit && food.unit.grams ? food.unit.grams : 100;
+        const defaultGrams = pickDefaultGrams(food);
+        const unitText = food.unit ? `1 ${food.unit.name} ≈ ${food.unit.grams}g` : '';
         const grams = el('input', { className: 'input', type: 'number', inputmode: 'decimal', min: '1', max: '2000', step: '1', value: String(defaultGrams) });
         const preview = el('div', { className: 'muted' });
         const updatePreview = () => {
@@ -235,18 +334,21 @@ function openPickFoodSheet() {
         }));
         const detailParts = [
           el('div', { className: 'row row--between divider' },
-            el('span', { className: 'strong', text: food.name }),
+            el('div', { className: 'row' },
+              el('span', { className: 'strong', text: food.name }),
+              isDish(food) ? el('span', { className: 'pill pill--dish', text: '菜' }) : null,
+            ),
             el('span', { className: 'muted', text: `每 100g ${fmtKcal(food.per100g && food.per100g.kcal)} kcal` }),
           ),
           el('div', { className: 'row chips' }, quick),
-          el('label', { className: 'field' }, el('span', { className: 'field__label', text: '克数' }), grams),
+          el('label', { className: 'field' }, el('span', { className: 'field__label', text: unitText ? `克数（${unitText}）` : '克数' }), grams),
           preview,
           el('button', {
-            className: 'btn btn--primary btn--block', text: '加入清单',
+            className: 'btn btn--primary btn--block', text: isDishMode ? '就用这道菜' : '加入清单',
             onClick: () => {
               const g = Number(grams.value);
               if (!Number.isFinite(g) || g <= 0) { toast('请填写克数', 'error'); return; }
-              close(scaleFood(food, g));
+              close({ food, item: scaleFood(food, g) });
             },
           }),
         ];
@@ -254,23 +356,14 @@ function openPickFoodSheet() {
       };
 
       const runSearch = () => {
-        const foods = searchFoods(search.value.trim(), 20);
+        const foods = orderFoodsForPick(searchFoods(search.value.trim(), 20));
         clear(results);
         if (!foods.length) {
           results.appendChild(el('div', { className: 'empty', text: '没有匹配的食物，换个关键词试试' }));
           return;
         }
         for (const food of foods) {
-          results.appendChild(el('button', {
-            className: 'list__item pick-item', type: 'button',
-            onClick: () => showDetail(food),
-          },
-            el('div', { className: 'list__item--main' },
-              el('div', { className: 'strong', text: food.name }),
-              el('div', { className: 'list__item--meta', text: `${fmtKcal(food.per100g && food.per100g.kcal)} kcal / 100g${food.unit ? ` · 1 ${food.unit.name}=${food.unit.grams}g` : ''}` }),
-            ),
-            el('span', { className: 'muted', text: '选择' }),
-          ));
+          results.appendChild(renderPickRow(food, () => showDetail(food)));
         }
       };
 
@@ -284,7 +377,7 @@ function openPickFoodSheet() {
 
       return el('div', { className: 'col' },
         search,
-        el('div', { className: 'muted', text: '从内置食物库选择，营养值按克数换算' }),
+        el('div', { className: 'muted', text: isDishMode ? '选一道菜，整份清单会替换成它（菜品排在前面）' : '从内置食物库选择，营养值按克数换算' }),
         results,
         detail,
       );
@@ -413,9 +506,9 @@ async function startPhoto(file, date, reload) {
 async function manualFlow(date, reload) {
   const picked = [];
   for (;;) {
-    const item = await openPickFoodSheet();
-    if (!item) break;
-    picked.push(item);
+    const pick = await openPickFoodSheet();
+    if (!pick || !pick.item) break;
+    picked.push(pick.item);
     const action = await openDraftSheet(picked, { date, source: 'manual', slot: defaultSlot() });
     if (action === 'saved') { await reload(); return; }
     if (action === 'add') continue;

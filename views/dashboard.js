@@ -1,7 +1,7 @@
 // 今日总览（SPEC §7「今日」）。只读聚合 + 两个快捷写入（饮水）。
-import { el, ring, bar, toast, emptyState, fmtKcal, fmtKg, fmtDateCN, fmtTime, fmt1 } from '../js/ui.js';
-import { localDateStr, targetMacros, weightStats, sumItems } from '../js/nutrition.js';
-import { daySummary, getGoals, recentWeights, addWater } from '../js/store.js';
+import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1 } from '../js/ui.js';
+import { localDateStr, targetMacros, weightStats, sumItems, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
+import { daySummary, getGoals, recentWeights, addWater, getSettings } from '../js/store.js';
 
 const SLOT_LABEL = { breakfast: '早餐', lunch: '午餐', dinner: '晚餐', snack: '加餐' };
 const go = (hash) => window.HMS.navigate(hash);
@@ -31,11 +31,16 @@ function statBlock(label, value, unit) {
 
 export async function render(root) {
   const date = localDateStr();
-  const [summary, goals, weights] = await Promise.all([
+  const [summary, goals, weights, settings] = await Promise.all([
     daySummary(date),
     getGoals(),
     recentWeights(30),
+    getSettings(),
   ]);
+  // 体重只按「设置里的单位」显示；库里始终是 kg，差值同样要换算（0.1kg = 0.2斤）。
+  const weightUnit = settings && settings.weightUnit === 'jin' ? 'jin' : 'kg';
+  const weightLabel = weightUnitLabel(weightUnit);
+  const showWeight = (kg) => kgToUnit(kg, weightUnit);
 
   const intake = summary.intake || { kcal: 0, carb: 0, protein: 0, fat: 0 };
   const burned = Number(summary.burned) || 0;
@@ -93,12 +98,12 @@ export async function render(root) {
   } else {
     const delta = stats.delta7;
     weightCard.appendChild(el('div', { className: 'row row--between' },
-      statBlock('最近一次', fmtKg(stats.latest), 'kg'),
+      statBlock('最近一次', fmt1(showWeight(stats.latest)), weightLabel),
       el('div', { className: 'col align-end' },
         el('div', { className: 'label', text: '较 7 天前' }),
         el('div', {
           className: `strong ${delta != null && delta > 0 ? 'trend-up' : 'trend-down'}`,
-          text: delta == null ? '—' : `${delta > 0 ? '+' : ''}${fmt1(delta)} kg`,
+          text: delta == null ? '—' : `${delta > 0 ? '+' : ''}${fmt1(showWeight(delta))} ${weightLabel}`,
         }),
         el('div', { className: 'muted', text: stats.latestDate || '' }),
       ),

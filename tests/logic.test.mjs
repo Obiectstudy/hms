@@ -6,10 +6,10 @@
  *   await m.run();   // -> { passed, failed, failures }
  * 直接执行本文件（node tests/logic.test.mjs）也会自己跑一遍。
  *
- * 覆盖面：nutrition.js 全部导出 + 边界、pure.js 的整形/去重/聚合/CSV、
+ * 覆盖面：nutrition.js 全部导出 + 边界（含 kg/斤 换算）、pure.js 的整形/去重/聚合/CSV、
  * 以及「导出→清空→导入」的纯逻辑往返一致性。
- * IndexedDB 路径（db.js/store.js 的异步读写）Node 里没有 indexedDB，只能靠 import 后
- * 断言「不可用时抛中文错误」+ 浏览器 #/debug 页人工确认，见回报里的已知风险。
+ * IndexedDB 路径：Node 没有 indexedDB，默认只能断言「不可用时抛中文错误」；
+ * 唯一例外是 store 的 settings / weightUnit 部分更新，用文件末尾的最小假 IDB 真跑一遍后立即清理。
  */
 
 import assert from 'node:assert/strict';
@@ -349,6 +349,78 @@ function testSeries() {
     eq(g.get('2026-10-01').length, 1);
     eq(g.get('').length, 1);
     eq(nutrition.groupByDate().size, 0);
+  });
+}
+
+// ---------- nutrition: 体重单位换算（斤=0.5kg，存储永远 kg） ----------
+
+function decimalsOf(v) {
+  const s = String(v);
+  const dot = s.indexOf('.');
+  return dot < 0 ? 0 : s.length - dot - 1;
+}
+
+function testWeightUnits() {
+  check('WEIGHT_UNITS 顺序与标签（未知单位回退 kg）', () => {
+    deep(nutrition.WEIGHT_UNITS, ['kg', 'jin']);
+    eq(nutrition.weightUnitLabel('kg'), 'kg');
+    eq(nutrition.weightUnitLabel('jin'), '斤');
+    eq(nutrition.weightUnitLabel('lb'), 'kg');
+    eq(nutrition.weightUnitLabel(undefined), 'kg');
+  });
+
+  check('斤换算：90.6kg <-> 181.2斤，kg 原样返回', () => {
+    eq(nutrition.kgToUnit(90.6, 'jin'), 181.2);
+    eq(nutrition.unitToKg(181.2, 'jin'), 90.6);
+    eq(nutrition.kgToUnit(70, 'kg'), 70);
+    eq(nutrition.unitToKg(70, 'kg'), 70);
+    eq(nutrition.kgToUnit(0, 'jin'), 0);
+    eq(nutrition.unitToKg(0, 'jin'), 0);
+  });
+
+  check('斤往返无漂移：40–300kg 步进 0.7，误差 ≤0.05kg', () => {
+    let checked = 0;
+    for (let i = 0; 40 + i * 0.7 <= 300; i += 1) {
+      const kg = 40 + i * 0.7;
+      const back = nutrition.unitToKg(nutrition.kgToUnit(kg, 'jin'), 'jin');
+      ok(Math.abs(back - kg) <= 0.05, `${kg}kg 往返后变成 ${back}`);
+      checked += 1;
+    }
+    ok(checked > 300, `样本太少：${checked}`);
+  });
+
+  check('精度：斤 ≤1 位小数，kg ≤2 位小数，无浮点尾巴', () => {
+    for (const kg of [40, 55.55, 70, 90.6, 123.45, 299.9]) {
+      const jin = nutrition.kgToUnit(kg, 'jin');
+      ok(decimalsOf(jin) <= 1, `kgToUnit(${kg},'jin')=${jin} 超过 1 位小数`);
+      const back = nutrition.unitToKg(jin, 'jin');
+      ok(decimalsOf(back) <= 2, `unitToKg(${jin},'jin')=${back} 超过 2 位小数`);
+      ok(!/0000000/.test(String(jin)) && !/0000000/.test(String(back)), `出现浮点尾巴：${jin} / ${back}`);
+    }
+  });
+
+  check('步长与刻度区间（两套单位边界换算一致）', () => {
+    eq(nutrition.weightStep('kg'), 0.1);
+    eq(nutrition.weightStep('jin'), 0.2);
+    eq(nutrition.weightStep('lb'), 0.1);
+    deep(nutrition.weightRange('kg'), { min: 20, max: 300 });
+    deep(nutrition.weightRange('jin'), { min: 40, max: 600 });
+    deep(nutrition.weightRange('lb'), { min: 20, max: 300 });
+    eq(nutrition.kgToUnit(20, 'jin'), nutrition.weightRange('jin').min);
+    eq(nutrition.kgToUnit(300, 'jin'), nutrition.weightRange('jin').max);
+    // 返回的是副本，改它不会污染下一次调用
+    const range = nutrition.weightRange('jin');
+    range.min = 1;
+    eq(nutrition.weightRange('jin').min, 40);
+  });
+
+  check('未知单位按 kg 处理且不抛异常', () => {
+    eq(nutrition.kgToUnit(70, 'lb'), 70);
+    eq(nutrition.unitToKg(70, 'lb'), 70);
+    eq(nutrition.kgToUnit(70), 70);
+    eq(nutrition.unitToKg(70), 70);
+    eq(nutrition.kgToUnit(NaN, 'jin'), 0);
+    eq(nutrition.unitToKg(Infinity, 'jin'), 0);
   });
 }
 
@@ -803,6 +875,218 @@ async function testModules() {
   });
 }
 
+// ---------- store: weightUnit 持久化（Node 没有 indexedDB，用最小假实现真跑一遍） ----------
+
+/**
+ * 只够 db.js 跑通的假 IndexedDB：meta 的 get/put + schema 建表。
+ * 用完必须把 dbPromise 缓存也清掉（调 db 实例的 onversionchange），
+ * 否则后面的「IDB 不可用」断言会拿到这个假库而假通过。
+ */
+function createFakeIndexedDb() {
+  const databases = [];
+  const clone = (v) => (typeof structuredClone === 'function' ? structuredClone(v) : JSON.parse(JSON.stringify(v)));
+
+  class FakeRequest {
+    constructor(tx, run) {
+      this.tx = tx;
+      this.result = undefined;
+      this.error = null;
+      this._run = run;
+      this._ok = null;
+      this._err = null;
+      if (tx) tx.pending += 1;
+      setTimeout(() => this.fire(), 0);
+    }
+    set onsuccess(fn) { this._ok = fn; }
+    set onerror(fn) { this._err = fn; }
+    fire() {
+      try {
+        this.result = this._run();
+      } catch (err) {
+        this.error = err;
+        if (this._err) this._err();
+        if (this.tx) this.tx.settle();
+        return;
+      }
+      if (this._ok) this._ok();
+      if (this.tx) this.tx.settle();
+    }
+  }
+
+  class FakeStore {
+    constructor(name, options = {}) {
+      this.name = name;
+      this.keyPath = options.keyPath;
+      this.autoIncrement = !!options.autoIncrement;
+      this.data = new Map();
+      this.indexes = new Map();
+      this.seq = 0;
+    }
+    createIndex(name, keyPath) { this.indexes.set(name, { keyPath }); }
+    nextKey(obj) {
+      if (this.keyPath) {
+        if (obj[this.keyPath] != null) return obj[this.keyPath];
+        if (this.autoIncrement) { this.seq += 1; obj[this.keyPath] = this.seq; return this.seq; }
+        throw new Error('keyPath 为空且未启用 autoIncrement');
+      }
+      this.seq += 1;
+      return this.seq;
+    }
+    get(key) { const v = this.data.get(key); return v === undefined ? undefined : clone(v); }
+    getAll() { return [...this.data.values()].map(clone); }
+    put(obj) { const key = this.nextKey(obj); this.data.set(key, clone(obj)); return key; }
+    delete(key) { this.data.delete(key); }
+    clear() { this.data.clear(); }
+    count() { return this.data.size; }
+    index(name) {
+      const def = this.indexes.get(name);
+      if (!def) throw new Error(`没有索引 ${name}`);
+      const self = this;
+      return {
+        get(value) {
+          const hit = [...self.data.values()].find((row) => row[def.keyPath] === value);
+          return hit === undefined ? undefined : clone(hit);
+        },
+        getAll(value) {
+          return [...self.data.values()].filter((row) => row[def.keyPath] === value).map(clone);
+        },
+      };
+    }
+  }
+
+  class FakeTransaction {
+    constructor(stores, mode) {
+      this.stores = stores;
+      this.mode = mode;
+      this.pending = 0;
+      this.settled = false;
+      this.oncomplete = null;
+      this.onerror = null;
+      this.onabort = null;
+    }
+    objectStore(name) {
+      const store = this.stores[name];
+      if (!store) throw new Error(`没有 store ${name}`);
+      const tx = this;
+      return {
+        get: (key) => new FakeRequest(tx, () => store.get(key)),
+        getAll: () => new FakeRequest(tx, () => store.getAll()),
+        put: (obj) => new FakeRequest(tx, () => store.put(obj)),
+        delete: (key) => new FakeRequest(tx, () => { store.delete(key); }),
+        clear: () => new FakeRequest(tx, () => { store.clear(); }),
+        count: () => new FakeRequest(tx, () => store.count()),
+        index: (indexName) => ({
+          get: (value) => new FakeRequest(tx, () => store.index(indexName).get(value)),
+          getAll: (value) => new FakeRequest(tx, () => store.index(indexName).getAll(value)),
+        }),
+      };
+    }
+    settle() {
+      this.pending -= 1;
+      if (this.pending <= 0 && !this.settled) {
+        this.settled = true;
+        setTimeout(() => { if (this.oncomplete) this.oncomplete(); }, 0);
+      }
+    }
+    abort() { this.settled = true; }
+  }
+
+  class FakeDb {
+    constructor(name, version) {
+      this.name = name;
+      this.version = version;
+      this.stores = new Map();
+      this.objectStoreNames = { contains: (n) => this.stores.has(n) };
+      this.onversionchange = null;
+    }
+    createObjectStore(name, options = {}) {
+      const store = new FakeStore(name, options);
+      this.stores.set(name, store);
+      return store;
+    }
+    transaction(names, mode) {
+      const list = Array.isArray(names) ? names : [names];
+      const scoped = {};
+      for (const n of list) {
+        if (!this.stores.has(n)) throw new Error(`NotFoundError: ${n}`);
+        scoped[n] = this.stores.get(n);
+      }
+      return new FakeTransaction(scoped, mode);
+    }
+    close() {}
+  }
+
+  const indexedDB = {
+    open(name, version) {
+      const database = new FakeDb(name, version);
+      databases.push(database);
+      const request = { result: database, error: null, onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null };
+      setTimeout(() => {
+        try {
+          if (request.onupgradeneeded) request.onupgradeneeded();
+        } catch (err) {
+          request.error = err;
+          if (request.onerror) request.onerror();
+          return;
+        }
+        setTimeout(() => { if (request.onsuccess) request.onsuccess(); }, 0);
+      }, 0);
+      return request;
+    },
+  };
+
+  return { indexedDB, databases };
+}
+
+async function testStoreSettings() {
+  await checkAsync('store: 默认 weightUnit=kg，部分更新不丢键，可切斤并读回', async () => {
+    const fake = createFakeIndexedDb();
+    const prev = globalThis.indexedDB;
+    globalThis.indexedDB = fake.indexedDB;
+    try {
+      const fresh = await store.getSettings();
+      eq(fresh.weightUnit, 'kg', '默认应为 kg');
+      eq(fresh.model, 'qwen3-vl-plus');
+
+      await store.saveSettings({ apiKey: 'x' });
+      const afterKey = await store.getSettings();
+      eq(afterKey.apiKey, 'x');
+      eq(afterKey.weightUnit, 'kg', '只改 apiKey 不能把 weightUnit 冲掉');
+      eq(afterKey.model, 'qwen3-vl-plus', '只改 apiKey 不能把 model 冲掉');
+
+      await store.saveSettings({ weightUnit: 'jin' });
+      const afterJin = await store.getSettings();
+      eq(afterJin.weightUnit, 'jin');
+      eq(afterJin.apiKey, 'x', '切单位不能把 apiKey 冲掉');
+      eq(afterJin.model, 'qwen3-vl-plus');
+
+      // 旧数据 / 手改数据：缺键或非法值都回退 kg
+      await db.setMeta('settings', { apiKey: 'k', model: 'm' });
+      eq((await store.getSettings()).weightUnit, 'kg');
+      await db.setMeta('settings', { apiKey: 'k', model: 'm', weightUnit: 'lb' });
+      eq((await store.getSettings()).weightUnit, 'kg');
+    } finally {
+      // 让 db.js 丢掉这个假库的 dbPromise 缓存，后续断言仍然对着「无 IDB」的场景
+      for (const database of fake.databases) {
+        try { if (database.onversionchange) database.onversionchange(); } catch { /* 忽略 */ }
+      }
+      if (prev === undefined) delete globalThis.indexedDB;
+      else globalThis.indexedDB = prev;
+    }
+  });
+
+  await checkAsync('store: 假 IDB 撤走后 db.js 缓存已失效', async () => {
+    if (!IDB_ABSENT) return;
+    let msg = '';
+    try {
+      await store.getSettings();
+    } catch (err) {
+      msg = err.message;
+    }
+    eq(msg, IDB_MSG);
+  });
+}
+
 // ---------- 入口 ----------
 
 export async function run() {
@@ -810,11 +1094,14 @@ export async function run() {
   testMetabolism();
   testFoodMath();
   testSeries();
+  testWeightUnits();
   testNormalize();
   testAggregate();
   testRoundTrip();
   testPurity();
   await testModules();
+  // 放最后：它会临时注入假 indexedDB 并清理，不干扰上面的「IDB 不可用」断言
+  await testStoreSettings();
 
   const result = { passed, failed: failures.length, failures };
   console.log(`[logic.test] passed=${result.passed} failed=${result.failed}`);

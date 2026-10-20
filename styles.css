@@ -308,6 +308,14 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 .pick-item:active { background: var(--tap); }
 .pick-list { max-height: 34vh; overflow-y: auto; }
 
+/* ---------- 菜品（复合菜） ---------- */
+
+/* 「菜」徽标：只取变量色，不写死色值。 */
+.pill--dish { background: var(--brand-soft); color: var(--brand-2); border: 1px solid var(--brand); }
+/* 「整份是一道菜」入口：右对齐的次级动作，点击区不得小于 44px。 */
+.merge-bar { display: flex; justify-content: flex-end; padding: 2px 0 6px; }
+.merge-bar__btn { min-height: 44px; padding: 0 14px; }
+
 .details { background: var(--surface-2); border-radius: var(--radius-sm); padding: 8px 10px; }
 .details summary { cursor: pointer; font-size: 12px; }
 .details__pre {
@@ -465,10 +473,114 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 .tab:active { background: var(--tap); }
 .tab--active { color: var(--brand-2); font-weight: 600; }
 
+/* ---------- 体重刻度尺（SPEC §7 体重） ---------- */
+
+.weight-readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  padding: 4px 0 2px;
+}
+.weight-value {
+  font-size: 52px;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -1.5px;
+  font-variant-numeric: tabular-nums;
+}
+.unit-chip {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--brand-2);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.unit-chip:active { background: var(--brand-soft); }
+
+.weight-entry { display: block; }
+.weight-input {
+  text-align: center;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -.5px;
+  font-variant-numeric: tabular-nums;
+}
+.keypad-toggle {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.keypad-toggle:active { background: var(--surface-2); }
+
+/* 刻度尺：中心指针固定，刻度条整体位移。touch-action:none 保证拖动不滚页面。 */
+.ruler {
+  position: relative;
+  height: 86px;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grab;
+  outline: none;
+}
+.ruler:focus-visible { box-shadow: 0 0 0 3px var(--brand-glow); }
+.ruler--dragging { cursor: grabbing; }
+.ruler__pointer {
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  width: 2px;
+  height: 26px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--brand);
+  z-index: 2;
+}
+.ruler__strip {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  height: 100%;
+  will-change: transform;
+}
+.ruler__tick {
+  position: absolute;
+  top: 36px;
+  width: 1px;
+  height: 12px;
+  background: var(--line);
+}
+.ruler__tick--major { top: 32px; height: 18px; background: var(--text-2); opacity: .55; }
+.ruler__tick--label { top: 28px; height: 24px; opacity: .8; }
+.ruler__label {
+  position: absolute;
+  top: 6px;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------- 小屏微调 ---------- */
 
 @media (max-width: 359px) {
   .stat__value { font-size: 26px; }
+  .weight-value { font-size: 46px; }
   .ring { width: 150px; height: 150px; }
   .grid-3 { gap: 8px; }
 }

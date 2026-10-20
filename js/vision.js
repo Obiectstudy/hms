@@ -49,6 +49,8 @@ const FAT_KEYS = fieldSet(['fat', 'fats', 'fat_g', 'lipid', 'lipids', '脂肪'])
 const FIBER_KEYS = fieldSet(['fiber', 'fibre', 'dietary_fiber', 'dietary_fibre', 'fiber_g', '纤维', '膳食纤维']);
 const SODIUM_KEYS = fieldSet(['sodium', 'na', 'sodium_mg', 'salt', '钠', '盐']);
 const CONFIDENCE_KEYS = fieldSet(['confidence', 'conf', 'certainty', '置信度', '把握']);
+const KIND_KEYS = fieldSet(['kind', 'type', 'category', 'class', '类别', '类型', '分类']);
+const UNIT_KEYS = fieldSet(['unit', 'unit_name', 'portion_unit', '单位', '份量单位', '份量']);
 const NOTE_KEYS = fieldSet(['note', 'notes', 'message', 'comment', '说明', '备注']);
 const ITEMS_KEYS = fieldSet(['items', 'foods', 'results', 'data', 'list', 'food_items', '食物', '结果', '条目']);
 
@@ -71,6 +73,36 @@ function normalizeConfidence(value) {
   if (text === 'medium' || text === '中') return 'medium';
   if (text === 'low' || text === '低') return 'low';
   return undefined;
+}
+
+// 模型偶尔把成品菜写成「菜品/菜肴」，把原料写成「食材/生料」，这里统一成 kind 枚举。
+function normalizeKind(value) {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (!text) return undefined;
+  if (['dish', 'dishes', 'meal', 'course', '菜品', '菜', '菜肴', '成品菜', '成品'].includes(text)) return 'dish';
+  if (['ingredient', 'ingredients', 'food', 'raw', '原料', '食材', '生料', '配料'].includes(text)) return 'ingredient';
+  return undefined;
+}
+
+// unit 既可能是字符串（"1 盘"），也可能是 { name, grams }；只有带克数时才用来补 grams。
+function readUnit(value) {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return null;
+    return { name: text, grams: toNum(text) };
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    let name = '';
+    for (const [k, v] of Object.entries(value)) {
+      if (typeof v === 'string' && (NAME_KEYS.has(normalizeKey(k)) || UNIT_KEYS.has(normalizeKey(k)))) {
+        name = v.trim();
+        break;
+      }
+    }
+    const grams = toNum(pick(value, GRAM_KEYS)) ?? toNum(name);
+    return { name, grams };
+  }
+  return null;
 }
 
 function modelJsonError(message, raw) {
@@ -158,7 +190,9 @@ function normalizeRawItem(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
   const rawName = pick(obj, NAME_KEYS);
   const name = typeof rawName === 'string' ? rawName.trim() : '';
-  const grams = toNum(pick(obj, GRAM_KEYS));
+  const unit = readUnit(pick(obj, UNIT_KEYS));
+  let grams = toNum(pick(obj, GRAM_KEYS));
+  if (!Number.isFinite(grams) && unit && Number.isFinite(unit.grams)) grams = unit.grams;
   let kcal = toNum(pick(obj, KCAL_KEYS));
   let carb = toNum(pick(obj, CARB_KEYS));
   let protein = toNum(pick(obj, PROTEIN_KEYS));
@@ -177,6 +211,8 @@ function normalizeRawItem(obj) {
   }
 
   const item = { name: name || '未命名食物' };
+  const kind = normalizeKind(pick(obj, KIND_KEYS));
+  if (kind) item.kind = kind;
   if (Number.isFinite(grams)) item.grams = round1(grams);
   item.kcal = Number.isFinite(kcal) ? Math.round(Math.max(0, kcal)) : 0;
   item.carb = round1(Math.max(0, carb || 0));
@@ -209,14 +245,32 @@ export function parseModelJson(text) {
   return result;
 }
 
+// 提示词里的标准菜名参考：与食物库同名，用来把模型输出拉回可校准的写法（控制 token，只放最高频的 56 个）。
+export const STANDARD_DISHES = [
+  '米饭', '蛋炒饭', '炒饭', '西红柿鸡蛋面', '牛肉面', '兰州拉面', '炸酱面', '螺蛳粉', '酸辣粉',
+  '黄焖鸡米饭', '馄饨', '饺子', '小笼包', '猪肉白菜包子', '馒头', '小米粥', '皮蛋瘦肉粥',
+  '豆浆', '煎饼果子', '油条', '手抓饼', '肉夹馍',
+  '菠菜炒鸡蛋', '番茄炒蛋', '青椒炒肉', '青椒土豆丝', '酸辣土豆丝', '宫保鸡丁', '鱼香肉丝',
+  '麻婆豆腐', '红烧肉', '红烧茄子', '地三鲜', '蒜蓉油麦菜', '清炒西兰花', '回锅肉',
+  '糖醋里脊', '可乐鸡翅', '咖喱鸡', '红烧鸡块', '农家小炒肉', '干煸豆角', '家常豆腐',
+  '西红柿鸡蛋汤', '紫菜蛋花汤', '冬瓜排骨汤', '酸辣汤', '麻辣烫', '麻辣香锅',
+  '清蒸鲈鱼', '水煮鱼', '白灼虾', '酱牛肉', '蔬菜沙拉', '汉堡', '炸鸡',
+];
+
 export function buildPrompt() {
   return [
     '请分析这张食物照片，完成：',
-    '1. 识别画面中全部食物（包括主食、配菜、汤和饮料），不要遗漏。',
-    '2. 中式菜品按常见一份的真实份量估算克数与营养素。',
-    '3. 每项输出 { name, grams, kcal, carb, protein, fat, fiber?, sodium?, confidence }。',
-    '4. 碳水/蛋白质/脂肪单位为克，钠单位为毫克，数值都是这一份的实际摄入量。',
-    '5. 无法确定克数时给出合理估计，并把 confidence 设为 "low"。',
+    '1. 先判断画面主体是一道做好的菜，还是多份分开的食物：',
+    '   - 如果是一道成品菜（例如菠菜炒鸡蛋、红烧茄子、青椒土豆丝），只返回这道菜的菜名，作为一项；kind 填 "dish"，unit 填整份（如 "1 盘"）。',
+    '   - 只有当画面里明显是分开的多份食物（例如一碗白饭 + 一盘炒菜 + 一碗汤）时，才拆成多项，每项分别判断。',
+    '   - 禁止把一道炒菜拆成原料：菠菜炒鸡蛋不能拆成「鸡蛋」和「菠菜」两项。',
+    '2. 菜名用常见标准写法，尽量直接使用下面的参考菜名（同义时选库里有的写法，不要自造）：',
+    `   参考菜名：${STANDARD_DISHES.join('、')}`,
+    '3. 每项输出 { name, kind, unit?, grams, kcal, carb, protein, fat, fiber?, sodium?, confidence }。',
+    '   kind 取 "dish"（做好的菜或成品主食，如米饭、炒饭、包子）或 "ingredient"（单一原料，如生菠菜、生鸡蛋、生猪肉）。',
+    '4. 成品菜的营养值按「含油烹饪后的整份成品」估算：炒菜要把烹调油算进去（家常炒菜每 100g 约含 5–10g 油），不要用生料相加；grams 是这一份的总重量（常见一份 150–400g）。',
+    '5. 碳水/蛋白质/脂肪单位为克，钠单位为毫克，数值都是这一份的实际摄入量。',
+    '6. 无法确定克数时给出合理估计，并把 confidence 设为 "low"。',
     '只输出 {"items":[...]} 这一段 JSON，不要解释文字，不要 Markdown 围栏。',
   ].join('\n');
 }
