@@ -1,0 +1,19 @@
+# Generated payload (produced by sync-assets.ps1)
+app/src/main/assets/www/
+# Build output and local machine state
+.gradle/
+build/
+app/build/
+local.properties
+# Signing secrets must never reach the public repository
+keystore.properties
+*.keystore
+# Downloaded toolchain (JDK / SDK / Gradle)
+.tools/
+setup-tools.log
+setup-tools.err.log
+build.log
+build.err.log
+gradle-wrapper.log
+gradle-wrapper.err.log
+*.log

@@ -16,6 +16,7 @@
 ## 目录
 
 ```
+android/                安卓 APK 工程（WebView 壳，内嵌同一套网页，见 docs/APK.md）
 index.html              入口（ES Module，必须经 HTTP 打开，file:// 会被 CORS 拦）
 app.js                  哈希路由 + 底部导航
 styles.css              设计令牌与组件样式
@@ -57,6 +58,14 @@ node tests/all.mjs
 覆盖四类：纯逻辑（营养计算/聚合/合并/CSV）、识别链路（请求体/容错解析/校准/全错误分支）、七个视图的真实渲染（假 DOM + 假 IndexedDB）、以及集成契约（文件齐备、导出符号、SW 预缓存清单、manifest）。
 
 IndexedDB 真实行为与相机、安装、离线这些只能真机确认，清单见 `docs/VERIFY.md`；应用内 **设置 → 数据 → 运行自检**（`#/debug`）也能就地跑一遍存储链路。
+
+## 安卓 APK 版
+
+除 PWA 外还提供自包含 APK（1.6 MB，不依赖 Chrome、完全离线）：安装包在
+`C:\Users\Administrator\Desktop\hms-release\`，构建与装机的完整说明见 `docs/APK.md`。
+
+两者数据互不相通，从 PWA 切过去要先「导出 JSON」再「导入」。keystore 在仓库外
+（`C:\Users\Administrator\.hms-keystore\`），**丢了就无法覆盖升级**，务必备份。
 
 ## 配置视觉识别
 

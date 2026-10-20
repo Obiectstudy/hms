@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand colour taken from the site palette in styles.css. -->
+    <color name="brand">#0FA37F</color>
+    <color name="window_bg">#F6F8F7</color>
+</resources>

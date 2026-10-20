@@ -1,0 +1,60 @@
+apply plugin: 'com.android.application'
+
+// Signing material lives outside the repository; the file is git-ignored.
+def propsFile = rootProject.file('keystore.properties')
+def props = new Properties()
+if (propsFile.exists()) {
+    propsFile.withInputStream { props.load(it) }
+}
+
+android {
+    namespace 'com.obiectstudy.hms'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.obiectstudy.hms'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0.0'
+    }
+
+    if (propsFile.exists()) {
+        signingConfigs {
+            release {
+                storeFile file(props['storeFile'])
+                storePassword props['storePassword']
+                keyAlias props['keyAlias']
+                keyPassword props['keyPassword']
+                enableV1Signing true
+                enableV2Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (propsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+    }
+}
+
+dependencies {
+    // WebViewAssetLoader: serves the PWA from https://appassets.androidplatform.net so that
+    // ES modules are same-origin (file:// would be blocked by the module CORS rule).
+    implementation 'androidx.webkit:webkit:1.11.0'
+    // FileProvider for the camera intent output URI.
+    implementation 'androidx.core:core:1.13.1'
+}
