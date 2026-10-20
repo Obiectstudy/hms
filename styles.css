@@ -528,7 +528,7 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 /* 刻度尺：中心指针固定，刻度条整体位移。touch-action:none 保证拖动不滚页面。 */
 .ruler {
   position: relative;
-  height: 86px;
+  height: 68px;
   overflow: hidden;
   border-radius: var(--radius-sm);
   background: var(--surface-2);
@@ -542,10 +542,10 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 .ruler--dragging { cursor: grabbing; }
 .ruler__pointer {
   position: absolute;
-  top: 2px;
+  top: 26px;
   left: 50%;
   width: 2px;
-  height: 26px;
+  height: 24px;
   margin-left: -1px;
   border-radius: 1px;
   background: var(--brand);
@@ -560,12 +560,12 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 }
 .ruler__tick {
   position: absolute;
-  top: 36px;
+  top: 34px;
   width: 1px;
   height: 12px;
   background: var(--line);
 }
-.ruler__tick--major { top: 32px; height: 18px; background: var(--text-2); opacity: .55; }
+.ruler__tick--major { top: 30px; height: 20px; background: var(--text-2); opacity: .55; }
 .ruler__tick--label { top: 28px; height: 24px; opacity: .8; }
 .ruler__label {
   position: absolute;

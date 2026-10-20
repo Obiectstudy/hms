@@ -64,13 +64,6 @@ export async function render(root) {
     if (target && typeof target.focus === 'function') target.focus();
   }
 
-  // 单位或数值变化后把「大号数字 + 刻度尺/输入框」一起对齐到 display。
-  function syncReadout() {
-    valueText.textContent = fmt1(display);
-    if (mode === 'ruler' && rulerNode) rulerNode.setValue(display);
-    if (mode === 'keypad' && numberInput) numberInput.value = fmt1(display);
-  }
-
   function buildEntry() {
     clear(entryBox);
     rulerNode = null;
@@ -90,6 +83,7 @@ export async function render(root) {
         onChange: (next) => { display = next; valueText.textContent = fmt1(display); },
       });
       entryBox.appendChild(rulerNode);
+      display = rulerNode.getValue(); // 键盘里输了越界值时，刻度尺的 clamp 结果才是真值
       keypadToggle.textContent = '⌨ 键盘输入';
       modeHint.textContent = '左右滑动刻度，松手自动对齐';
     } else {
@@ -113,6 +107,7 @@ export async function render(root) {
       keypadToggle.textContent = '🎚 刻度尺';
       modeHint.textContent = '直接输入数字，保存时按当前单位换算';
     }
+    valueText.textContent = fmt1(display);
   }
 
   keypadToggle.addEventListener('click', () => {
@@ -127,7 +122,6 @@ export async function render(root) {
     display = kgToUnit(kg, unit);
     unitChip.textContent = unitLabel();
     buildEntry();
-    syncReadout();
     renderSummary();
     try {
       await saveSettings({ weightUnit: unit });

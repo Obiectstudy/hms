@@ -51,6 +51,9 @@ foreach ($f in $files) {
     $dst = Join-Path $dest ($f -replace '/', '\')
     if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) { throw "NOT COPIED: $f" }
     $len = (Get-Item -LiteralPath $dst).Length
+    # Byte-for-byte length check: catches a truncated copy when the file list itself is unchanged.
+    $srcLen = (Get-Item -LiteralPath (Join-Path $repo ($f -replace '/', '\'))).Length
+    if ($len -ne $srcLen) { throw "SIZE MISMATCH: $f (copied $len, source $srcLen)" }
     $total += $len
     Write-Host ("[{0,2}] {1,-30} {2,8} bytes" -f $i, $f, $len)
 }

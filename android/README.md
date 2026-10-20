@@ -7,12 +7,15 @@
 
 | 项 | 值 |
 | --- | --- |
-| APK | `C:\Users\Administrator\Desktop\hms-release\HMS-健康-1.0.0.apk` |
-| 大小 | 1,677,701 字节（1.6 MB） |
-| sha256 | `6e09a4888c754bee4837f155433be2c599b9897a8059cff4becb37c899abb6e9` |
-| 包名 / 版本 | `com.obiectstudy.hms` / `1.0.0` (versionCode 1) |
+| APK（当前） | `C:\Users\Administrator\Desktop\hms-release\HMS-健康-1.1.0.apk` |
+| 大小 | 1,700,824 字节（1.62 MB） |
+| sha256 | `7b4da6064ffc9e24615802bb8d51d8371d46582ee4edae57ac3240235b5df92a` |
+| 包名 / 版本 | `com.obiectstudy.hms` / `1.1.0` (versionCode 2) |
 | sdk | minSdk 24，targetSdk 34，compileSdk 34 |
 | 签名 | v1 (JAR) + v2，RSA 2048，CN=HMS Health |
+| 上一版（保留回退） | `HMS-健康-1.0.0.apk`，1,677,701 字节，versionCode 1 |
+
+`build.ps1` 从 `app/build.gradle` 读 `versionName` 来命名产物，改版本只需改一处，APK 文件名不会和清单漂移。
 
 ## 结构
 

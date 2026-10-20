@@ -647,6 +647,13 @@ export async function run() {
       assert.ok(dashText.includes('42.8'), `dashboard 的 7 天差值没有换算：${dashText.slice(0, 160)}`);
       assert.ok(dashText.includes('斤'), 'dashboard 缺少单位文案');
 
+      await store.saveSettings({ weightUnit: 'jin' }); // 直接改设置，验证「下次打开」的初始单位
+      const reopened = await renderView('weight');
+      const reopenedChip = byClass(reopened, 'unit-chip')[0];
+      assert.equal(reopenedChip.textOf(), '斤', '重新打开时应沿用设置里的单位');
+      const reopenedValue = reopened.walk().find((n) => String(n.className).split(/\s+/).includes('weight-value'));
+      assert.equal(Number(reopenedValue.textOf()), 181.2, '重新打开时应按设置单位显示最近体重');
+
       await store.saveSettings({ weightUnit: 'kg' }); // 复原，别把单位状态漏给后续用例
     });
 

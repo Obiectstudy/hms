@@ -9,13 +9,15 @@
 | 离线 | 靠 Service Worker 缓存 | 网页文件本来就在安装包里 |
 | 更新 | 打开即用新版 | 要重新装一次 APK |
 | 数据位置 | Chrome 的站点存储 | APK 自己的 WebView 存储 |
+| 更新方式 | 打开即最新 | 重装新 APK（versionCode 必须递增，可覆盖安装不丢数据） |
 
 ## 1. 产物
 
-- 安装包：`C:\Users\Administrator\Desktop\hms-release\HMS-健康-1.0.0.apk`
-- 大小：1,677,701 字节（1.6 MB）
-- SHA-256：`6e09a4888c754bee4837f155433be2c599b9897a8059cff4becb37c899abb6e9`
-- 包名 `com.obiectstudy.hms`，应用名 `HMS 健康`，版本 `1.0.0`（versionCode 1）
+- 安装包：`C:\Users\Administrator\Desktop\hms-release\HMS-健康-1.1.0.apk`（当前）
+- 大小：1,700,824 字节
+- SHA-256：`7b4da6064ffc9e24615802bb8d51d8371d46582ee4edae57ac3240235b5df92a`
+- 包名 `com.obiectstudy.hms`，应用名 `HMS 健康`，版本 `1.1.0`（versionCode 2）
+- 旧版保留：`HMS-健康-1.0.0.apk`（1,677,701 字节，可回退）
 - minSdk 24（Android 7.0+），targetSdk 34
 - 权限只有 `INTERNET`（调视觉识别 API 用），**没有** CAMERA 权限——拍照走系统相机 intent 委托
 
