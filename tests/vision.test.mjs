@@ -181,6 +181,13 @@ test('buildRequestBody 缺图片时报中文错误', () => {
   throwsSync(() => buildRequestBody({}), /图片/, '缺 dataUrl');
 });
 
+test('默认模型与候选清单锁定为实测可用值', () => {
+  eq(DEFAULT_MODEL, 'qwen3-vl-plus', '默认模型');
+  eq(MODEL_CANDIDATES, ['qwen3-vl-plus', 'qwen-vl-max', 'qwen-vl-plus', 'qwen2.5-vl-72b-instruct'], '候选清单');
+  eq(MODEL_CANDIDATES[0], DEFAULT_MODEL, '默认模型必须在候选首位');
+  assert(!MODEL_CANDIDATES.some((m) => /ocr/i.test(m)), 'OCR 类模型不适合食物识别，不应进入候选');
+});
+
 test('buildPrompt 覆盖 SPEC 8.2 的字段与低置信度要求', () => {
   const prompt = buildPrompt();
   for (const token of ['name', 'grams', 'kcal', 'carb', 'protein', 'fat', 'fiber', 'sodium', 'confidence']) {
@@ -253,12 +260,12 @@ test('analyzeFoodPhoto 200 正常 JSON：回填库值、透传模型与请求结
   let captured;
   const fetchImpl = async (url, options) => {
     captured = { url, options };
-    return jsonResponse({ model: 'qwen-vl-max', choices: [{ message: { content: ITEM_CONTENT } }], usage: { total_tokens: 12 } });
+    return jsonResponse({ model: 'qwen3-vl-plus', choices: [{ message: { content: ITEM_CONTENT } }], usage: { total_tokens: 12 } });
   };
   const out = await analyzeFoodPhoto({ dataUrl: 'data:image/jpeg;base64,AAAA', mime: 'image/jpeg' }, { apiKey: 'test-key', fetchImpl });
   eq(out.items[0].foodId, 'rice', '库校准');
   eq(out.items[0].kcal, 232, '库值覆盖模型估算');
-  eq(out.model, 'qwen-vl-max', '模型名');
+  eq(out.model, 'qwen3-vl-plus', '模型名');
   eq(out.raw, ITEM_CONTENT, 'raw 保留模型原文');
   eq(out.usage.total_tokens, 12, 'usage 透传');
   eq(captured.url, `${DEFAULT_BASE_URL}/chat/completions`, '端点拼接');
@@ -384,10 +391,10 @@ test('analyzeFoodPhoto 对模型返回空 items 走规则 4 中文提示', async
 // ---------------------------------------------------------------- testConnection
 
 test('testConnection 成功：ok=true 且回传模型', async () => {
-  const fetchImpl = async () => jsonResponse({ model: 'qwen-vl-max', choices: [{ message: { content: 'ok' } }] });
+  const fetchImpl = async () => jsonResponse({ model: 'qwen3-vl-plus', choices: [{ message: { content: 'ok' } }] });
   const out = await testConnection({ apiKey: 'k', fetchImpl });
   eq(out.ok, true, 'ok');
-  eq(out.model, 'qwen-vl-max', 'model');
+  eq(out.model, 'qwen3-vl-plus', 'model');
   assert(/成功/.test(out.message), `成功文案（实际：${out.message}）`);
 });
 

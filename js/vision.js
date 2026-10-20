@@ -3,8 +3,8 @@
 import { calibrateItems } from './foods.js';
 
 export const DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
-export const DEFAULT_MODEL = 'qwen-vl-max';
-export const MODEL_CANDIDATES = ['qwen-vl-max', 'qwen-vl-plus', 'qwen2.5-vl-72b-instruct'];
+export const DEFAULT_MODEL = 'qwen3-vl-plus';
+export const MODEL_CANDIDATES = ['qwen3-vl-plus', 'qwen-vl-max', 'qwen-vl-plus', 'qwen2.5-vl-72b-instruct'];
 export const REQUEST_TIMEOUT_MS = 25000;
 
 const SYSTEM_PROMPT = '你是营养分析助手。你只输出 JSON，不输出解释文字或 Markdown 围栏。';

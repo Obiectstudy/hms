@@ -26,7 +26,7 @@ v1 明确**不做**：账号登录、多成员档案、云同步、社交/分享
   **所有资源引用一律用相对路径**（`./js/db.js`、`./sw.js`），禁止以 `/` 开头的绝对路径。
 - 数据全部落在浏览器 IndexedDB，不上传任何服务器（除用户主动调用的视觉识别 API）。
 - 视觉识别：阿里百炼 DashScope OpenAI 兼容模式
-  `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`，模型默认 `qwen-vl-max`。
+  `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`，模型默认 `qwen3-vl-plus`（2026-10-20 依据真实账号可用模型清单修正，见 §13 变更记录）。
   实测该端点返回 `access-control-allow-origin: *`，浏览器可直连；Key 存 IndexedDB 元数据，仅本机。
 - **开发环境限制**：本机 pwsh 与任何子进程均不可用（0xC0000142），无 JDK/Android SDK。
   因此：不能 `npm install`、不能起 dev server、不能跑浏览器自动化。
@@ -168,8 +168,8 @@ export function calibrateItems(items): MealItem[]         // 见 8.3
 
 ```js
 export const DEFAULT_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-export const DEFAULT_MODEL = 'qwen-vl-max'
-export const MODEL_CANDIDATES = ['qwen-vl-max', 'qwen-vl-plus', 'qwen2.5-vl-72b-instruct']
+export const DEFAULT_MODEL = 'qwen3-vl-plus'
+export const MODEL_CANDIDATES = ['qwen3-vl-plus', 'qwen-vl-max', 'qwen-vl-plus', 'qwen2.5-vl-72b-instruct']
 export async function fileToDataUrl(file, { maxEdge = 1024, quality = 0.8 }): Promise<{ dataUrl, mime }>
 //  用 canvas 缩放压缩，输出 JPEG dataURL；HEIC 等失败时抛出可读中文错误
 export function buildPrompt(): string
@@ -283,7 +283,7 @@ CSS 变量（`styles.css` 顶部定义，视图只用变量，禁止写死颜色
 body：
 
 ```json
-{ "model": "qwen-vl-max", "messages": [
+{ "model": "qwen3-vl-plus", "messages": [
   { "role": "system", "content": "你是营养分析助手…只输出 JSON" },
   { "role": "user", "content": [
     { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,..." } },
@@ -338,4 +338,18 @@ body：
 
 ## 12. 版本
 
-`docs/SPEC.md` v1（2026-10-19）。契约变更须记录在此文件的"变更记录"小节。
+`docs/SPEC.md` v1.1（2026-10-20）。契约变更须记录在 §13。
+
+## 13. 变更记录
+
+### v1.1 · 2026-10-20 · 默认视觉模型修正
+- **改动**：`DEFAULT_MODEL` 由 `qwen-vl-max` 改为 `qwen3-vl-plus`；`MODEL_CANDIDATES` 增补并重排为
+  `['qwen3-vl-plus', 'qwen-vl-max', 'qwen-vl-plus', 'qwen2.5-vl-72b-instruct']`；`store.js` 的
+  `DEFAULT_SETTINGS.model` 同步为 `qwen3-vl-plus`。
+- **依据**：用真实账号 Key 实测——错误 Key 返回 `401 invalid_api_key`，本账号 Key 对 `qwen-vl-max`
+  返回 `404 model_not_found`；`GET /compatible-mode/v1/models` 显示该账号可用的视觉模型为
+  `qwen3-vl-plus`、`qwen-vl-ocr`、`qwen-vl-ocr-2025-11-20`、`qwen3.5-ocr` 等。
+  OCR 类模型不适合食物识别，故不进候选。
+- **影响**：识别链路已用 `qwen3-vl-plus` 实跑成功（2.2s，单张合成图返回可被食物库校准的条目）。
+  契约中其余签名、字段、类名均未变动。
+- **未改动**：§4 数据模型、§5 各模块契约、§6 视觉规范、§9 错误处理均保持原样。

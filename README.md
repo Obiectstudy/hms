@@ -62,7 +62,7 @@ IndexedDB 真实行为与相机、安装、离线这些只能真机确认，清�
 
 1. 去阿里云百炼控制台创建 API Key（OpenAI 兼容模式）
 2. App 里 设置 → 视觉识别 → 填 Key → 点「测试连接」
-3. 模型默认 `qwen-vl-max`，不可用时在设置里换 `qwen-vl-plus` 等候选
+3. 模型默认 `qwen3-vl-plus`；如果你的账号没开通它（会报「模型不存在」），在设置里换候选 `qwen-vl-max` / `qwen-vl-plus` 等
 
 Key 只存在你这台设备的 IndexedDB 里，不写进仓库。换设备/清缓存前先导出 JSON。
 

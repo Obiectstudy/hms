@@ -26,9 +26,10 @@ import {
 } from './pure.js';
 
 // 与 js/vision.js 的 DEFAULT_* 保持一致；这里写字面量是为了不跨边界 import 别人的文件
+// qwen-vl-max 在部分百炼账号上返回 404 model_not_found，实测可用的默认是 qwen3-vl-plus
 const DEFAULT_SETTINGS = {
   apiKey: '',
-  model: 'qwen-vl-max',
+  model: 'qwen3-vl-plus',
   baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
 };
 
