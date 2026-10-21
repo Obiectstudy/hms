@@ -3,7 +3,10 @@ import {
   el, clear, toast, openSheet, confirmDialog, emptyState, fmtKcal, fmt1, fmtDateCN, fmtTime, bar,
 } from '../js/ui.js';
 import { localDateStr, parseDateStr, round1, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
-import { getSettings, getGoals, daySummary, logMeal, updateMeal, deleteMeal, savePhoto } from '../js/store.js';
+import {
+  getSettings, getGoals, daySummary, logMeal, updateMeal, deleteMeal, savePhoto,
+  getMealTemplates, saveMealTemplate, deleteMealTemplate, recentFoodItems,
+} from '../js/store.js';
 import { fileToDataUrl, analyzeFoodPhoto, MODEL_CANDIDATES } from '../js/vision.js';
 import { searchFoods } from '../js/foods.js';
 
@@ -15,6 +18,11 @@ const SLOTS = [
 ];
 
 const go = (hash) => window.HMS.navigate(hash);
+
+// 常吃套餐的 chip 上限：横条只放一屏，超出的靠删除旧套餐腾位置。
+export const MAX_TEMPLATE_CHIPS = 6;
+// 「最近吃过」只放一屏 8 条，再多就和搜索框抢注意力了。
+const RECENT_LIMIT = 8;
 
 function slotLabel(slot) {
   const hit = SLOTS.find((s) => s.value === slot);
@@ -111,6 +119,121 @@ export function mergeConfirmMessage(itemCount, food) {
   return `当前 ${Math.max(0, Number(itemCount) || 0)} 项将被替换成「${name}」`;
 }
 
+/* ---------- 常吃套餐（SPEC §7 饮食：一键记入 + 存为套餐） ---------- */
+
+/** 只渲染前 6 个；脏数据（缺 name）直接丢掉，不占位。 */
+export function visibleTemplates(templates) {
+  const list = Array.isArray(templates) ? templates.filter((t) => t && t.name) : [];
+  return list.slice(0, MAX_TEMPLATE_CHIPS);
+}
+
+/** 套餐在 chip 上要显示的总热量：与当日合计同一套求和口径。 */
+export function templateKcal(template) {
+  return sumItems((template && template.items) || []).kcal;
+}
+
+/** 弹层里的小表单：只收一个套餐名，空名视为取消。 */
+function askTemplateName(defaultName) {
+  const input = el('input', {
+    className: 'input', type: 'text', value: String(defaultName || ''), placeholder: '例如：午餐套餐',
+    attr: { maxlength: '20' },
+  });
+  return openSheet({
+    title: '存为套餐',
+    content: el('div', { className: 'col' },
+      el('div', { className: 'muted', text: '存下来以后，在饮食页点一下就能把这份清单记入当天；同名套餐会被覆盖' }),
+      el('label', { className: 'field' }, el('span', { className: 'field__label', text: '套餐名' }), input),
+    ),
+    actions: [{ text: '保存套餐', value: 'save', primary: true }, { text: '取消', value: null }],
+  }).then((value) => (value === 'save' ? String(input.value || '').trim() : ''));
+}
+
+async function recordTemplate(template, date, reload) {
+  try {
+    await logMeal({
+      date,
+      slot: template.slot,
+      source: 'manual',
+      items: (template.items || []).map((item) => ({ ...item })),
+    });
+    toast(`已记入 · ${template.name}`, 'ok');
+    await reload();
+  } catch (err) {
+    toast(`记入失败：${err && err.message ? err.message : err}`, 'error');
+  }
+}
+
+async function removeTemplate(template, reload) {
+  const ok = await confirmDialog({
+    title: '删除这个套餐？',
+    message: `「${template.name}」删除后需要重新保存，已记入的记录不受影响。`,
+    okText: '删除',
+  });
+  if (!ok) return;
+  try {
+    await deleteMealTemplate(template.id);
+    toast('套餐已删除', 'ok');
+    await reload();
+  } catch (err) {
+    toast(`删除失败：${err && err.message ? err.message : err}`, 'error');
+  }
+}
+
+/** 常吃套餐横条：无套餐时返回 null，调用方不 append，页面不留空白。 */
+function renderTemplateCard(templates, date, reload) {
+  const list = visibleTemplates(templates);
+  if (!list.length) return null;
+  const row = el('div', { className: 'tpl-row' });
+  for (const template of list) {
+    row.appendChild(el('div', { className: 'tpl-chip' },
+      el('button', {
+        className: 'tpl-chip__main',
+        type: 'button',
+        attr: { 'aria-label': `记入套餐 ${template.name}` },
+        onClick: () => { recordTemplate(template, date, reload).catch((err) => toast(`记入失败：${err && err.message ? err.message : err}`, 'error')); },
+      },
+        el('span', { className: 'tpl-chip__name', text: template.name }),
+        el('span', { className: 'tpl-chip__kcal', text: `${fmtKcal(templateKcal(template))} kcal` }),
+      ),
+      el('button', {
+        className: 'tpl-chip__del',
+        type: 'button',
+        text: '×',
+        attr: { 'aria-label': `删除套餐 ${template.name}` },
+        onClick: () => { removeTemplate(template, reload).catch((err) => toast(`删除失败：${err && err.message ? err.message : err}`, 'error')); },
+      }),
+    ));
+  }
+  return el('div', { className: 'card col template-card' },
+    el('div', { className: 'card__head', style: { marginBottom: '0' } },
+      el('div', { className: 'card__title', text: '常吃套餐' }),
+      el('div', { className: 'muted', text: '点一下记入当天' }),
+    ),
+    row,
+  );
+}
+
+/* ---------- 最近吃过 ---------- */
+
+/**
+ * 最近吃过的条目 → 详情层需要的「类食物」对象。
+ * 营养值按上次的克数折回每 100g；真正的换算仍走 baseItem，避免二次取整漂移。
+ */
+export function recentToFood(entry) {
+  const item = (entry && entry.item) || {};
+  const grams = Number(item.grams) > 0 ? Number(item.grams) : 100;
+  const per100g = {};
+  for (const key of ['kcal', 'carb', 'protein', 'fat', 'fiber', 'sodium']) {
+    if (item[key] == null) continue;
+    per100g[key] = (Number(item[key]) || 0) * 100 / grams;
+  }
+  return {
+    id: item.foodId,
+    name: String((entry && entry.name) || item.name || '食物'),
+    per100g,
+  };
+}
+
 /** 搜索结果单行：菜品带「菜」徽标，原料不带。 */
 export function renderPickRow(food, onPick) {
   const meta = [`${fmtKcal(food.per100g && food.per100g.kcal)} kcal / 100g`];
@@ -171,6 +294,10 @@ function totalsBlock(items) {
 // 返回 'saved' | 'add' | null。AI 识别与手动添加共用同一张表（只有标题/来源不同）。
 export async function openDraftSheet(initialItems, meta) {
   const items = initialItems.map((i) => ({ ...i }));
+  // 存套餐后让调用方重画饮食页（弹层挂在 body 上，重画不会把它冲掉）。
+  const notifyTemplatesChanged = async () => {
+    if (typeof meta.onTemplateSaved === 'function') await meta.onTemplateSaved();
+  };
   return openSheet({
     title: meta.source === 'ai' ? '识别结果（可编辑）' : '确认食物',
     actions: [],
@@ -235,7 +362,32 @@ export async function openDraftSheet(initialItems, meta) {
         toast(`已记成一道菜：${items[0] ? items[0].name : ''}`, 'ok');
         repaint();
       };
-      const mergeBar = el('div', { className: 'merge-bar' },
+      // 把这份清单固化下来，下次在饮食页一键记入。
+      const saveAsTemplate = async () => {
+        if (!items.length) {
+          toast('清单是空的，先加点食物', 'error');
+          return;
+        }
+        const name = await askTemplateName(`${slotLabel(slotSelect.value)}套餐`);
+        if (!name) return;
+        try {
+          await saveMealTemplate({ name, slot: slotSelect.value, items: items.map((i) => ({ ...i })) });
+          toast(`已存为套餐 · ${name}`, 'ok');
+          await notifyTemplatesChanged();
+        } catch (err) {
+          toast(`保存套餐失败：${err && err.message ? err.message : err}`, 'error');
+        }
+      };
+
+      const mergeBar = el('div', { className: 'merge-bar merge-bar--split' },
+        el('button', {
+          className: 'btn btn--ghost merge-bar__btn',
+          text: '存为套餐',
+          attr: { 'aria-label': '把这份清单存为常吃套餐' },
+          onClick: () => {
+            saveAsTemplate().catch((err) => toast(`保存套餐失败：${err && err.message ? err.message : err}`, 'error'));
+          },
+        }),
         el('button', {
           className: 'btn btn--ghost merge-bar__btn',
           text: '整份是一道菜',
@@ -308,15 +460,20 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
       const search = el('input', { className: 'input', type: 'search', placeholder: isDishMode ? '搜索菜名，如「菠菜炒鸡蛋」' : '搜索食物，如「米饭」「鸡蛋」' });
       const results = el('div', { className: 'list pick-list' });
       const detail = el('div', { className: 'col' });
+      const recentBox = el('div', { className: 'col recent-block' });
 
-      const showDetail = (food) => {
+      // options.grams 覆盖默认份量（最近吃过用上次的克数）；
+      // options.baseItem 有值时按它等比缩放，保住上次记录里的原始数值。
+      const showDetail = (food, options = {}) => {
         clear(detail);
-        const defaultGrams = pickDefaultGrams(food);
+        const baseItem = options.baseItem || null;
+        const defaultGrams = Number(options.grams) > 0 ? clampGrams(options.grams) : pickDefaultGrams(food);
         const unitText = food.unit ? `1 ${food.unit.name} ≈ ${food.unit.grams}g` : '';
         const grams = el('input', { className: 'input', type: 'number', inputmode: 'decimal', min: '1', max: '2000', step: '1', value: String(defaultGrams) });
         const preview = el('div', { className: 'muted' });
+        const itemAt = (value) => (baseItem ? rescaleItem(baseItem, value) : scaleFood(food, value));
         const updatePreview = () => {
-          const item = scaleFood(food, grams.value);
+          const item = itemAt(grams.value);
           preview.textContent = `${fmtKcal(item.kcal)} kcal · 碳水 ${fmt1(item.carb)}g · 蛋白质 ${fmt1(item.protein)}g · 脂肪 ${fmt1(item.fat)}g`;
         };
         grams.addEventListener('input', updatePreview);
@@ -326,6 +483,12 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
           quick.push(el('button', {
             className: 'chip', text: `1 ${food.unit.name} ≈ ${food.unit.grams}g`,
             onClick: () => { grams.value = String(food.unit.grams); updatePreview(); },
+          }));
+        }
+        if (baseItem && Number(baseItem.grams) > 0) {
+          quick.push(el('button', {
+            className: 'chip', text: `上次 ${clampGrams(baseItem.grams)}g`,
+            onClick: () => { grams.value = String(clampGrams(baseItem.grams)); updatePreview(); },
           }));
         }
         quick.push(el('button', {
@@ -348,11 +511,43 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
             onClick: () => {
               const g = Number(grams.value);
               if (!Number.isFinite(g) || g <= 0) { toast('请填写克数', 'error'); return; }
-              close({ food, item: scaleFood(food, g) });
+              close({ food, item: itemAt(g) });
             },
           }),
         ];
         for (const part of detailParts) detail.appendChild(part);
+      };
+
+      // 「最近吃过」：无数据整块不渲染，点一下直接进份量编辑（默认克数取上次）。
+      const showRecent = async () => {
+        if (isDishMode) return;
+        let entries = [];
+        try {
+          entries = await recentFoodItems(RECENT_LIMIT);
+        } catch {
+          // 最近吃过只是锦上添花：读不到就整块不渲染，不影响搜索与手动添加。
+          return;
+        }
+        if (!Array.isArray(entries) || !entries.length) return;
+        clear(recentBox);
+        recentBox.appendChild(el('div', { className: 'label', text: '最近吃过' }));
+        const list = el('div', { className: 'list recent-list' });
+        for (const entry of entries.slice(0, RECENT_LIMIT)) {
+          const item = entry.item || {};
+          list.appendChild(el('button', {
+            className: 'list__item recent-item',
+            type: 'button',
+            attr: { 'aria-label': `编辑 ${entry.name} 的份量` },
+            onClick: () => showDetail(recentToFood(entry), { grams: item.grams, baseItem: item }),
+          },
+            el('div', { className: 'list__item--main' },
+              el('div', { className: 'strong', text: entry.name }),
+              el('div', { className: 'list__item--meta', text: `上次 ${entry.lastDate} · ${fmtKcal(item.kcal)} kcal / ${fmtKcal(item.grams)} g` }),
+            ),
+            el('span', { className: 'muted', text: '份量' }),
+          ));
+        }
+        recentBox.appendChild(list);
       };
 
       const runSearch = () => {
@@ -374,8 +569,10 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
         timer = window.setTimeout(runSearch, 200);
       });
       runSearch();
+      showRecent();
 
       return el('div', { className: 'col' },
+        recentBox,
         search,
         el('div', { className: 'muted', text: isDishMode ? '选一道菜，整份清单会替换成它（菜品排在前面）' : '从内置食物库选择，营养值按克数换算' }),
         results,
@@ -493,6 +690,7 @@ async function startPhoto(file, date, reload) {
       source: 'ai',
       raw: run.value.raw,
       slot: defaultSlot(),
+      onTemplateSaved: reload,
       photo: compressed && compressed.dataUrl
         ? { blob: dataUrlToBlob(compressed.dataUrl, compressed.mime || 'image/jpeg'), mime: compressed.mime || 'image/jpeg' }
         : { blob: currentFile, mime: currentFile.type || 'image/jpeg' },
@@ -509,7 +707,9 @@ async function manualFlow(date, reload) {
     const pick = await openPickFoodSheet();
     if (!pick || !pick.item) break;
     picked.push(pick.item);
-    const action = await openDraftSheet(picked, { date, source: 'manual', slot: defaultSlot() });
+    const action = await openDraftSheet(picked, {
+      date, source: 'manual', slot: defaultSlot(), onTemplateSaved: reload,
+    });
     if (action === 'saved') { await reload(); return; }
     if (action === 'add') continue;
     return;
@@ -597,7 +797,9 @@ function renderMealCard(meal, reload) {
 
 async function paint(root, date, reload) {
   const today = localDateStr();
-  const [summary, settings, goals] = await Promise.all([daySummary(date), getSettings(), getGoals()]);
+  const [summary, settings, goals, templates] = await Promise.all([
+    daySummary(date), getSettings(), getGoals(), getMealTemplates(),
+  ]);
 
   const hasKey = Boolean(settings && settings.apiKey && String(settings.apiKey).trim());
   root.appendChild(el('div', { className: 'col' },
@@ -618,6 +820,10 @@ async function paint(root, date, reload) {
     }),
   );
   root.appendChild(nav);
+
+  // 日期条下方：常吃套餐。没有套餐时整块不渲染，不留空白。
+  const templateCard = renderTemplateCard(templates, date, reload);
+  if (templateCard) root.appendChild(templateCard);
 
   // 相机/相册各一个 label 包 input：label 点击即原生打开选择器，没有额外的用户手势损耗。
   const cameraInput = el('input', { className: 'hidden-file', type: 'file', accept: 'image/*', attr: { capture: 'environment' } });
@@ -693,10 +899,18 @@ async function paint(root, date, reload) {
 
 export async function render(root) {
   let date = localDateStr();
+  let seq = 0;
   const reload = async (nextDate) => {
     if (nextDate) date = nextDate;
+    const current = ++seq;
+    // 连点套餐、快速切日期都会并发触发 reload：先画到临时容器，最后一次整体替换，
+    // 否则两次 paint 交错会把整页内容追加两遍。
+    const staging = el('div');
+    await paint(staging, date, reload);
+    if (current !== seq) return;
+    const kids = Array.from(staging.childNodes);
     clear(root);
-    await paint(root, date, reload);
+    for (const child of kids) root.appendChild(child);
   };
   await reload();
 }

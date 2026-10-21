@@ -100,6 +100,13 @@ export function kgToUnit(kg, unit): number           // jin: kg*2，保留 1 位
 export function unitToKg(value, unit): number        // jin: value/2，保留 2 位
 export function weightStep(unit): number             // kg: 0.1 | jin: 0.2
 export function weightRange(unit): { min, max }      // kg: 20–300 | jin: 40–600
+
+// v1.4 起：体重趋势均线
+export function movingAverage(series, size = 7): Array<{ date, value, avg }>
+//  入参 series: [{ date, value }]（按 date 升序）；输出同长度同顺序、不修改入参
+//  avg = 最近 size 个点（含当前点）中**有效值**的算术平均，保留 1 位
+//  有效点 < 2 时 avg = null；size = 1 因此恒为 null（避免单点画出假趋势）
+//  value 非有限数的点 avg = null 且不进入任何窗口统计；size 非有限数回退 7，size ≤ 0 按 1 处理
 ```
 
 ### 5.2 `js/db.js` —— 只做存储，不含业务规则
@@ -157,6 +164,19 @@ export async function exportJSON(): Promise<object>
 export async function importJSON(obj, mode): Promise<{weights,meals,exercises,waters}>
 export async function exportCSV(): Promise<string>     // 体重+饮食+运动+饮水四段，带表头
 export async function clearAllData(): Promise<void>    // 业务数据 + photos，保留 profile/goals/settings
+
+// v1.4 起：常吃套餐 / 最近吃过 / 备份时间戳
+//  套餐与备份时间戳均存 meta（键 mealTemplates / lastExportedAt），不新增 object store、不做 IDB 版本迁移
+//  Template = { id: string, name: string, slot, items: MealItem[] }
+export async function getMealTemplates(): Promise<Template[]>       // 脏数据过滤，绝不抛
+export async function saveMealTemplate({ name, slot, items }): Promise<Template>  // 同名覆盖并保留 id；空名抛「套餐名称不能为空」
+export async function deleteMealTemplate(id): Promise<void>
+export async function recentFoodItems(limit = 12): Promise<Array<{ name, lastDate, slot, item }>>
+//  只取最近 200 条 meals；按 item.name（trim 后）去重，保留最后一次出现的信息；limit 在去重后生效
+export async function markExported(): Promise<void>
+export async function exportStatus(): Promise<{ lastExportedAt: number|null, days: number|null, hasData: boolean }>
+//  days 用 localDateStr 算整天差（未来时间夹到 0）；hasData = weights 或 meals 至少一条
+//  exportJSON() 成功返回前会自动 markExported()
 ```
 
 ### 5.4 `js/foods.js` —— 内置食物营养库 + 名称校准
@@ -381,3 +401,11 @@ body：
   `store` 的 `DEFAULT_SETTINGS` 增加 `weightUnit: 'kg'`；体重录入改为左右滑动刻度尺（`ui.rulerPicker`），
   支持 kg/斤 切换与切回键盘输入。
 - **约束**：`weights.weightKg`、`daySummary().weight`、CSV/JSON 导出**一律仍为 kg**，单位只在显示与输入层换算。
+
+### v1.4 · 2026-10-21 · 四项高频功能的数据契约
+- **新增**：`nutrition.movingAverage`；`store` 的 `getMealTemplates`/`saveMealTemplate`/`deleteMealTemplate`/
+  `recentFoodItems`/`markExported`/`exportStatus`。
+- **存储策略**：套餐与备份时间戳都写在 `meta` 表（`mealTemplates` / `lastExportedAt`），
+  **不新增 object store、不做 IndexedDB 版本迁移**——升级失败的风险大于这点设计洁癖。
+- **注意**：`movingAverage` 的第二形参命名为 `size` 而非 `window`（旧测试里有「纯模块源码不得出现 window」
+  的守卫，参数名会被误判）；**位置参数语义不变**。

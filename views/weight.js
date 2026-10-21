@@ -2,7 +2,7 @@
 // 存储永远是 kg；斤只是「显示与输入」单位，落库前一律过 unitToKg。
 import { el, clear, rulerPicker, lineChart, bar, toast, confirmDialog, emptyState, fmt1, fmtDateCN } from '../js/ui.js';
 import {
-  localDateStr, bmi, bmiClass, weightStats,
+  localDateStr, bmi, bmiClass, weightStats, movingAverage,
   WEIGHT_UNITS, kgToUnit, unitToKg, weightStep, weightRange, weightUnitLabel,
 } from '../js/nutrition.js';
 import {
@@ -13,6 +13,70 @@ import {
 const PX_PER_STEP = 8;
 // 数字标签间隔：kg 每 5 格一个（5kg），斤每 25 格一个（5斤）。
 const LABEL_EVERY = { kg: 50, jin: 25 };
+
+/* ---------- 7 日均线叠加 ----------
+   ui.lineChart 只画一条线（js/ui.js 不在本文件可写范围），
+   所以每日线仍交给它画，均线按同一套几何（340×170 viewBox、同样的内边距与 12% 纵轴留白）
+   叠一张透明 SVG。两层的数据和坐标同源，缩放后一定是同一条基准线。 */
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const AVG_CHART = { w: 340, h: 170, pad: { l: 38, r: 12, t: 14, b: 22 } };
+const AVG_DASH = '6 4';
+
+/** 与 ui.lineChart 内部一致的纵轴范围：只由每日值决定，均线不参与，避免两层各算一套。 */
+export function avgChartRange(values) {
+  const nums = (Array.isArray(values) ? values : []).map((v) => Number(v)).filter((v) => Number.isFinite(v));
+  if (!nums.length) return null;
+  let min = Math.min(...nums);
+  let max = Math.max(...nums);
+  if (max - min < 0.5) {
+    min -= 1;
+    max += 1;
+  } else {
+    min -= (max - min) * 0.12;
+    max += (max - min) * 0.12;
+  }
+  return { min, max, span: (max - min) || 1 };
+}
+
+/** movingAverage 的结果 → 虚线 path 的 d；avg 为 null 处断线（多段 M），全空返回 ''。 */
+export function buildAvgPath(series, height = AVG_CHART.h) {
+  const rows = (Array.isArray(series) ? series : []).filter((row) => row && typeof row === 'object');
+  if (!rows.length) return '';
+  const range = avgChartRange(rows.map((row) => row.value));
+  if (!range) return '';
+  const h = Number(height) || AVG_CHART.h;
+  const innerW = AVG_CHART.w - AVG_CHART.pad.l - AVG_CHART.pad.r;
+  const innerH = h - AVG_CHART.pad.t - AVG_CHART.pad.b;
+  const xOf = (i) => (rows.length === 1
+    ? AVG_CHART.pad.l + innerW / 2
+    : AVG_CHART.pad.l + (i * innerW) / (rows.length - 1));
+  const yOf = (v) => AVG_CHART.pad.t + (1 - (v - range.min) / range.span) * innerH;
+  let d = '';
+  let open = false;
+  rows.forEach((row, i) => {
+    const avg = row.avg == null ? null : Number(row.avg);
+    if (!Number.isFinite(avg)) { open = false; return; }
+    d += `${open ? 'L' : 'M'}${xOf(i).toFixed(1)},${yOf(avg).toFixed(1)} `;
+    open = true;
+  });
+  return d.trim();
+}
+
+function avgOverlay(d, height) {
+  const svgNode = document.createElementNS(SVG_NS, 'svg');
+  svgNode.setAttribute('viewBox', `0 0 ${AVG_CHART.w} ${height}`);
+  svgNode.setAttribute('preserveAspectRatio', 'none');
+  svgNode.setAttribute('class', 'chart__overlay');
+  svgNode.setAttribute('aria-hidden', 'true');
+  const line = document.createElementNS(SVG_NS, 'path');
+  line.setAttribute('d', d);
+  // 颜色在 styles.css 里用变量给；虚线间隔同时写进属性，CSS 没加载也还是虚线。
+  line.setAttribute('class', 'chart__line chart__line--avg');
+  line.setAttribute('stroke-dasharray', AVG_DASH);
+  svgNode.appendChild(line);
+  return svgNode;
+}
 
 export async function render(root) {
   const [profile, goals, weightsRaw, settings] = await Promise.all([
@@ -248,13 +312,37 @@ export async function render(root) {
         el('div', { className: 'muted', text: `${recent.length} 个数据点` }),
       ),
     );
-    trendCard.appendChild(recent.length
-      ? lineChart({
-        points: recent.map((w) => ({ x: w.date, y: show(w.weightKg) })),
-        height: 170,
-        yLabel: `体重 ${label}`,
-      })
-      : emptyState('近 30 天没有数据', '记录今天的体重', focusEntry));
+    if (!recent.length) {
+      trendCard.appendChild(emptyState('近 30 天没有数据', '记录今天的体重', focusEntry));
+    } else {
+      // 每日线（原样式）交给 ui.lineChart；均线只叠一层虚线，两个都在同一 viewBox 里对齐。
+      const dailyPoints = recent.map((w) => ({ x: w.date, y: show(w.weightKg) }));
+      const avgPath = buildAvgPath(movingAverage(
+        recent.map((w) => ({ date: w.date, value: show(w.weightKg) })),
+        7,
+      ));
+      const base = lineChart({ points: dailyPoints, height: 170, yLabel: '' });
+      const baseSvg = Array.from(base.childNodes || []).find((n) => n.tagName === 'svg');
+      const axis = Array.from(base.childNodes || [])
+        .find((n) => String(n.className).split(/\s+/).includes('chart__axis'));
+      if (!baseSvg) {
+        // 万一 ui.lineChart 换了结构，宁可只显示每日线也不要拼出一张错位的图。
+        trendCard.appendChild(base);
+      } else {
+        trendCard.appendChild(el('div', { className: 'chart' },
+          el('div', { className: 'chart__label label', text: `体重 ${label}` }),
+          el('div', { className: 'chart-stack' },
+            baseSvg,
+            avgPath ? avgOverlay(avgPath, 170) : null,
+          ),
+          avgPath ? el('div', { className: 'chart__legend' },
+            el('span', { className: 'chart__legend-item chart__legend-item--daily', text: '— 每日' }),
+            el('span', { className: 'chart__legend-item chart__legend-item--avg', text: '－ － 7 日均线' }),
+          ) : null,
+          axis || null,
+        ));
+      }
+    }
     summaryBox.appendChild(trendCard);
 
     const historyCard = el('div', { className: 'card' },

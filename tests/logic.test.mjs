@@ -6,10 +6,10 @@
  *   await m.run();   // -> { passed, failed, failures }
  * 直接执行本文件（node tests/logic.test.mjs）也会自己跑一遍。
  *
- * 覆盖面：nutrition.js 全部导出 + 边界（含 kg/斤 换算）、pure.js 的整形/去重/聚合/CSV、
- * 以及「导出→清空→导入」的纯逻辑往返一致性。
+ * 覆盖面：nutrition.js 全部导出 + 边界（含 kg/斤 换算、移动平均）、pure.js 的整形/去重/聚合/CSV/
+ * 套餐模板/最近吃过/导出天数，以及「导出→清空→导入」的纯逻辑往返一致性。
  * IndexedDB 路径：Node 没有 indexedDB，默认只能断言「不可用时抛中文错误」；
- * 唯一例外是 store 的 settings / weightUnit 部分更新，用文件末尾的最小假 IDB 真跑一遍后立即清理。
+ * 唯一例外是 store 的 settings / 套餐 / 导出状态，用文件末尾的最小假 IDB 真跑一遍后立即清理。
  */
 
 import assert from 'node:assert/strict';
@@ -352,6 +352,82 @@ function testSeries() {
   });
 }
 
+// ---------- nutrition: 移动平均 ----------
+
+/** 造一组按日期升序的序列；值原样塞进去（含 NaN/undefined）。 */
+function seriesOf(values, start = '2026-10-01') {
+  const base = nutrition.parseDateStr(start);
+  return values.map((value, i) => {
+    const d = new Date(base.getTime());
+    d.setDate(d.getDate() + i);
+    return { date: nutrition.localDateStr(d), value };
+  });
+}
+
+function testMovingAverage() {
+  check('movingAverage 正常 7 点窗口（第 1 点 avg=null）', () => {
+    const series = seriesOf([10, 20, 30, 40, 50, 60, 70]);
+    const out = nutrition.movingAverage(series, 7);
+    eq(out.length, 7);
+    deep(out.map((p) => p.avg), [null, 15, 20, 25, 30, 35, 40]);
+    deep(out.map((p) => p.date), series.map((p) => p.date));
+    deep(out.map((p) => p.value), [10, 20, 30, 40, 50, 60, 70]);
+  });
+
+  check('movingAverage 窗口按最近 N 点滑动（window=3）', () => {
+    const out = nutrition.movingAverage(seriesOf([10, 20, 30, 40, 50]), 3);
+    deep(out.map((p) => p.avg), [null, 15, 20, 30, 40]);
+  });
+
+  check('movingAverage 点数 < 2：单点/空/非数组', () => {
+    deep(nutrition.movingAverage([{ date: '2026-10-01', value: 70 }]), [
+      { date: '2026-10-01', value: 70, avg: null },
+    ]);
+    deep(nutrition.movingAverage([]), []);
+    deep(nutrition.movingAverage(), []);
+    deep(nutrition.movingAverage(null), []);
+    deep(nutrition.movingAverage(seriesOf([70, 72])).map((p) => p.avg), [null, 71]);
+  });
+
+  check('movingAverage 窗口大于序列长度：用全部可用点', () => {
+    const out = nutrition.movingAverage(seriesOf([10, 20, 30]), 30);
+    deep(out.map((p) => p.avg), [null, 15, 20]);
+  });
+
+  check('movingAverage NaN/undefined 点 avg=null 且不进窗口统计', () => {
+    const series = [
+      { date: '2026-10-01', value: 10 },
+      { date: '2026-10-02', value: NaN },
+      { date: '2026-10-03', value: 30 },
+      { date: '2026-10-04' },
+      { date: '2026-10-05', value: 50 },
+    ];
+    const out = nutrition.movingAverage(series, 7);
+    deep(out.map((p) => p.avg), [null, null, 20, null, 30]);
+    eq(out[3].value, undefined);
+  });
+
+  check('movingAverage 不修改入参且不复用入参对象', () => {
+    const series = seriesOf([10, 20, 30]);
+    const snapshot = JSON.stringify(series);
+    const out = nutrition.movingAverage(series, 7);
+    eq(JSON.stringify(series), snapshot, '入参被改坏');
+    ok(out[0] !== series[0], '应返回新对象');
+    deep(Object.keys(out[0]).sort(), ['avg', 'date', 'value']);
+  });
+
+  check('movingAverage window=1：窗口最多 1 个有效点 -> avg 恒为 null', () => {
+    deep(nutrition.movingAverage(seriesOf([10, 20, 30, 40]), 1).map((p) => p.avg), [null, null, null, null]);
+    // window<=0 按 1 处理，不抛异常
+    deep(nutrition.movingAverage(seriesOf([10, 20]), 0).map((p) => p.avg), [null, null]);
+  });
+
+  check('movingAverage 平均值保留 1 位小数', () => {
+    eq(nutrition.movingAverage(seriesOf([1, 2, 2]), 7)[2].avg, 1.7);
+    eq(nutrition.movingAverage(seriesOf([1, 2]), 7)[1].avg, 1.5);
+  });
+}
+
 // ---------- nutrition: 体重单位换算（斤=0.5kg，存储永远 kg） ----------
 
 function decimalsOf(v) {
@@ -530,6 +606,103 @@ function testNormalize() {
       { date: '2026-10-02', weightKg: 72 },
     ]);
     deep(mergePlan.map((r) => r.date), ['2026-10-02']);
+  });
+}
+
+// ---------- pure: 套餐模板 / 最近吃过 ----------
+
+function testMealTemplatePure() {
+  check('normalizeMealTemplates 过滤脏数据并兜底 slot', () => {
+    deep(pure.normalizeMealTemplates(null), []);
+    deep(pure.normalizeMealTemplates('oops'), []);
+    const rows = pure.normalizeMealTemplates([
+      null,
+      { id: 't1', name: ' 早餐 ', slot: 'lunch', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }] },
+      { id: 't2', name: '' },
+      { name: '无 id' },
+      { id: 't1', name: '重复 id' },
+      { id: 't3', name: '加餐', slot: 'brunch', items: 'bad' },
+    ]);
+    deep(rows.map((t) => t.id), ['t1', 't3']);
+    eq(rows[0].name, '早餐');
+    eq(rows[1].slot, 'snack');
+    deep(rows[1].items, []);
+  });
+
+  check('planMealTemplateSave 同名覆盖保留原 id，空名抛中文错', () => {
+    const first = pure.planMealTemplateSave(
+      [],
+      { name: ' 减脂早餐 ', slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }] },
+      1000,
+    );
+    eq(first.template.id, '1000');
+    eq(first.template.name, '减脂早餐');
+    eq(first.templates.length, 1);
+
+    const second = pure.planMealTemplateSave(
+      first.templates,
+      { name: '减脂早餐', slot: 'lunch', items: [{ name: '牛奶', grams: 250, kcal: 140 }] },
+      2000,
+    );
+    eq(second.templates.length, 1, '同名不应新增第二条');
+    eq(second.template.id, '1000', '同名覆盖必须保留原 id');
+    eq(second.template.slot, 'lunch');
+    eq(second.template.items[0].name, '牛奶');
+
+    let msg = '';
+    try {
+      pure.planMealTemplateSave([], { name: '   ' });
+    } catch (err) {
+      msg = err.message;
+    }
+    eq(msg, '套餐名称不能为空');
+
+    // 同一毫秒内连存两个新套餐：id 顺延，不能互顶
+    const a = pure.planMealTemplateSave([], { name: 'A' }, 5000);
+    const b = pure.planMealTemplateSave(a.templates, { name: 'B' }, 5000);
+    ok(b.template.id !== a.template.id, '同毫秒新建应顺延 id');
+    deep(pure.removeMealTemplate(b.templates, a.template.id).map((t) => t.name), ['B']);
+    deep(pure.removeMealTemplate(b.templates, '不存在').map((t) => t.name), ['A', 'B']);
+  });
+}
+
+function testRecentFoodItemsPure() {
+  const d0 = nutrition.daysAgo(0);
+  const d1 = nutrition.daysAgo(1);
+  const d2 = nutrition.daysAgo(2);
+  const meals = [
+    { date: d2, slot: 'dinner', createdAt: 200, items: [{ name: '米饭', kcal: 200 }, { name: '西兰花', kcal: 34 }] },
+    { date: d0, slot: 'breakfast', createdAt: 100, items: [{ name: '米饭', kcal: 232 }, { name: '鸡蛋', kcal: 90 }] },
+    { date: d0, slot: 'lunch', createdAt: 300, items: [{ name: '米饭', kcal: 260 }, { name: '鸡胸肉', kcal: 248 }] },
+    { date: d1, slot: 'snack', createdAt: 50, items: [{ name: '牛奶', kcal: 140 }] },
+  ];
+
+  check('collectRecentFoodItems 日期/createdAt 降序 + 按名字去重保留最新', () => {
+    const out = pure.collectRecentFoodItems(meals, 12);
+    deep(out.map((r) => r.name), ['米饭', '鸡胸肉', '鸡蛋', '牛奶', '西兰花']);
+    eq(out[0].lastDate, d0);
+    eq(out[0].slot, 'lunch');
+    eq(out[0].item.kcal, 260, '同名应保留最新一次出现的条目信息');
+    eq(out[2].slot, 'breakfast');
+    eq(out[3].lastDate, d1);
+    eq(out[4].lastDate, d2);
+  });
+
+  check('collectRecentFoodItems limit 在去重之后生效', () => {
+    deep(pure.collectRecentFoodItems(meals, 2).map((r) => r.name), ['米饭', '鸡胸肉']);
+    deep(pure.collectRecentFoodItems(meals, 0), []);
+    eq(pure.collectRecentFoodItems(meals).length, 5);
+  });
+
+  check('collectRecentFoodItems 只取最近 200 条 meals', () => {
+    const many = [];
+    for (let i = 0; i < 205; i += 1) {
+      many.push({ date: d0, slot: 'snack', createdAt: i, items: [{ name: `食物${i}` }] });
+    }
+    const out = pure.collectRecentFoodItems(many, 500);
+    eq(out.length, 200);
+    eq(out[0].name, '食物204');
+    ok(!out.some((r) => r.name === '食物4'), '最老的 5 条不应参与计算');
   });
 }
 
@@ -767,6 +940,7 @@ const STORE_EXPORTS = [
   'logWeight', 'deleteWeight', 'logMeal', 'updateMeal', 'deleteMeal', 'logExercise', 'deleteExercise',
   'getWater', 'setWater', 'addWater', 'savePhoto', 'getPhoto', 'daySummary', 'rangeSummary',
   'recentWeights', 'exportJSON', 'importJSON', 'exportCSV', 'clearAllData',
+  'getMealTemplates', 'saveMealTemplate', 'deleteMealTemplate', 'recentFoodItems', 'markExported', 'exportStatus',
 ];
 
 async function testModules() {
@@ -1087,6 +1261,197 @@ async function testStoreSettings() {
   });
 }
 
+// ---------- store: 套餐 / 最近吃过 / 导出状态（同样用最小假 IDB，用完必须清理） ----------
+
+/** 注入假 IDB 跑一段断言，结束后无条件清掉 db.js 的单例并还原全局。 */
+async function withFakeIdb(fn) {
+  const fake = createFakeIndexedDb();
+  const prev = globalThis.indexedDB;
+  globalThis.indexedDB = fake.indexedDB;
+  try {
+    return await fn(fake);
+  } finally {
+    for (const database of fake.databases) {
+      try { if (database.onversionchange) database.onversionchange(); } catch { /* 忽略 */ }
+    }
+    if (prev === undefined) delete globalThis.indexedDB;
+    else globalThis.indexedDB = prev;
+  }
+}
+
+async function testStoreMealTemplates() {
+  await checkAsync('store: 套餐保存→读取→同名覆盖(id 不变)→删除→再读为空', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      deep(await store.getMealTemplates(), []);
+
+      const t1 = await store.saveMealTemplate({
+        name: '  减脂早餐 ',
+        slot: 'breakfast',
+        items: [{ name: '鸡蛋', grams: 60, kcal: 90, carb: 0.6, protein: 7.2, fat: 6 }],
+      });
+      eq(t1.name, '减脂早餐');
+      eq(t1.slot, 'breakfast');
+      eq(typeof t1.id, 'string');
+      eq(t1.items.length, 1);
+
+      const list1 = await store.getMealTemplates();
+      eq(list1.length, 1);
+      deep(list1[0], t1);
+
+      const t2 = await store.saveMealTemplate({
+        name: '减脂早餐',
+        slot: 'lunch',
+        items: [{ name: '牛奶', grams: 250, kcal: 140 }],
+      });
+      eq(t2.id, t1.id, '同名覆盖必须保留原 id');
+      const list2 = await store.getMealTemplates();
+      eq(list2.length, 1);
+      eq(list2[0].slot, 'lunch');
+      eq(list2[0].items[0].name, '牛奶');
+
+      const t3 = await store.saveMealTemplate({ name: '加餐', slot: 'snack', items: [] });
+      ok(t3.id !== t1.id, '不同套餐应有不同 id');
+      eq((await store.getMealTemplates()).length, 2);
+
+      await store.deleteMealTemplate(t1.id);
+      const list3 = await store.getMealTemplates();
+      eq(list3.length, 1);
+      eq(list3[0].id, t3.id);
+      await store.deleteMealTemplate(t3.id);
+      deep(await store.getMealTemplates(), []);
+    });
+  });
+
+  await checkAsync('store: 空套餐名抛中文错误且不落库', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      for (const bad of [{ name: '   ', slot: 'lunch' }, {}, undefined]) {
+        let msg = '';
+        try {
+          await store.saveMealTemplate(bad);
+        } catch (err) {
+          msg = err.message;
+        }
+        eq(msg, '套餐名称不能为空');
+      }
+      deep(await store.getMealTemplates(), []);
+    });
+  });
+
+  await checkAsync('store: getMealTemplates 遇到脏 meta 不抛，返回过滤后的列表', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await db.setMeta('mealTemplates', 'oops');
+      deep(await store.getMealTemplates(), []);
+
+      await db.setMeta('mealTemplates', [
+        null,
+        { id: 't1', name: '早餐', slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }] },
+        { id: 't2', name: '' },
+        { name: '无 id' },
+        { id: 't3', name: '加餐', slot: 'brunch' },
+      ]);
+      const rows = await store.getMealTemplates();
+      deep(rows.map((t) => t.id), ['t1', 't3']);
+      eq(rows[1].slot, 'snack');
+      deep(rows[1].items, []);
+    });
+  });
+
+  await checkAsync('store: recentFoodItems 走真 meals 表并按 limit 截断', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const d0 = nutrition.daysAgo(0);
+      const d1 = nutrition.daysAgo(1);
+      await db.put('meals', {
+        date: d1,
+        slot: 'dinner',
+        source: 'manual',
+        createdAt: 10,
+        items: [{ name: '米饭', kcal: 200 }],
+      });
+      await db.put('meals', {
+        date: d0,
+        slot: 'breakfast',
+        source: 'manual',
+        createdAt: 20,
+        items: [{ name: '米饭', kcal: 232 }, { name: '鸡蛋', kcal: 90 }],
+      });
+
+      const rows = await store.recentFoodItems(2);
+      deep(rows.map((r) => r.name), ['米饭', '鸡蛋']);
+      eq(rows[0].lastDate, d0);
+      eq(rows[0].item.kcal, 232);
+      deep(await store.recentFoodItems(0), []);
+    });
+  });
+
+  await checkAsync('store: 新增假 IDB 测试结束后 db.js 缓存再次失效', async () => {
+    if (!IDB_ABSENT) return;
+    let msg = '';
+    try {
+      await store.getMealTemplates();
+    } catch (err) {
+      msg = err.message;
+    }
+    eq(msg, IDB_MSG);
+  });
+}
+
+async function testStoreExportStatus() {
+  await checkAsync('store: exportStatus 无记录 days=null / markExported 后 0 / 8 天前 -> 8', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      deep(await store.exportStatus(), { lastExportedAt: null, days: null, hasData: false });
+
+      await store.markExported();
+      const marked = await store.exportStatus();
+      ok(typeof marked.lastExportedAt === 'number' && marked.lastExportedAt > 0, '应记录毫秒时间戳');
+      eq(marked.days, 0);
+      eq(marked.hasData, false);
+
+      await db.put('weights', { date: nutrition.daysAgo(0), weightKg: 70, createdAt: 1 });
+      eq((await store.exportStatus()).hasData, true);
+
+      const eightDaysAgo = nutrition.parseDateStr(nutrition.daysAgo(8)).getTime() + 12 * 3600 * 1000;
+      await db.setMeta('lastExportedAt', eightDaysAgo);
+      const stale = await store.exportStatus();
+      eq(stale.lastExportedAt, eightDaysAgo);
+      eq(stale.days, 8);
+
+      // 脏 meta 按从未导出处理，不抛
+      await db.setMeta('lastExportedAt', 'not-a-time');
+      deep(await store.exportStatus(), { lastExportedAt: null, days: null, hasData: true });
+    });
+  });
+
+  await checkAsync('store: exportJSON 成功返回前 markExported，days 归 0', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await db.setMeta('lastExportedAt', nutrition.parseDateStr(nutrition.daysAgo(8)).getTime());
+      eq((await store.exportStatus()).days, 8);
+
+      await db.put('meals', {
+        date: nutrition.daysAgo(0),
+        slot: 'lunch',
+        source: 'manual',
+        createdAt: 5,
+        items: [{ name: '米饭', grams: 100, kcal: 116 }],
+      });
+      const payload = await store.exportJSON();
+      eq(payload.app, 'hms');
+      eq(payload.schemaVersion, 1);
+      eq(payload.meals.length, 1);
+      eq(payload.weights.length, 0);
+
+      const after = await store.exportStatus();
+      eq(after.days, 0);
+      eq(after.hasData, true);
+    });
+  });
+}
+
 // ---------- 入口 ----------
 
 export async function run() {
@@ -1094,14 +1459,20 @@ export async function run() {
   testMetabolism();
   testFoodMath();
   testSeries();
+  testMovingAverage();
   testWeightUnits();
   testNormalize();
+  testMealTemplatePure();
+  testRecentFoodItemsPure();
   testAggregate();
   testRoundTrip();
   testPurity();
   await testModules();
   // 放最后：它会临时注入假 indexedDB 并清理，不干扰上面的「IDB 不可用」断言
   await testStoreSettings();
+  // 同样注入假 indexedDB；每段都在 finally 里清掉 db.js 单例
+  await testStoreMealTemplates();
+  await testStoreExportStatus();
 
   const result = { passed, failed: failures.length, failures };
   console.log(`[logic.test] passed=${result.passed} failed=${result.failed}`);

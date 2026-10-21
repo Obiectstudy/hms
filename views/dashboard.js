@@ -1,10 +1,30 @@
 // 今日总览（SPEC §7「今日」）。只读聚合 + 两个快捷写入（饮水）。
 import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1 } from '../js/ui.js';
 import { localDateStr, targetMacros, weightStats, sumItems, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
-import { daySummary, getGoals, recentWeights, addWater, getSettings } from '../js/store.js';
+import { daySummary, getGoals, recentWeights, addWater, getSettings, exportStatus } from '../js/store.js';
+// 导出下载只有一份实现（view 之间共用，避免两处逻辑漂移）。
+import { exportBackupJSON } from './settings.js';
 
 const SLOT_LABEL = { breakfast: '早餐', lunch: '午餐', dinner: '晚餐', snack: '加餐' };
+// 提醒阈值：从未备份，或上次备份已满 7 天。
+const BACKUP_REMIND_DAYS = 7;
 const go = (hash) => window.HMS.navigate(hash);
+
+/** 「还没有备份过」/「已 N 天没备份」。 */
+export function backupReminderText(status) {
+  const days = status && status.days;
+  if (days == null || !Number.isFinite(Number(days))) return '还没有备份过';
+  return `已 ${Math.max(0, Math.round(Number(days)))} 天没备份`;
+}
+
+/** hasData 且（从未备份 或 距上次 ≥ 7 天）才提醒；没数据时提醒等于噪音。 */
+export function needsBackupReminder(status) {
+  const s = status || {};
+  if (!s.hasData) return false;
+  if (s.days == null) return true;
+  const days = Number(s.days);
+  return Number.isFinite(days) && days >= BACKUP_REMIND_DAYS;
+}
 
 function macroRow({ label, value, target, color, unit = 'g' }) {
   return el('div', { className: 'col macro' },
@@ -19,6 +39,41 @@ function macroRow({ label, value, target, color, unit = 'g' }) {
   );
 }
 
+/** 顶部备份提醒条：--warn 系配色，导出成功后自己消失；关闭只作用于当前这次渲染，不写进设置。 */
+function backupBar(status) {
+  const exportBtn = el('button', { className: 'btn btn--sm backup-bar__btn', text: '导出' });
+  const closeBtn = el('button', {
+    className: 'backup-bar__close',
+    text: '×',
+    attr: { type: 'button', 'aria-label': '关闭备份提醒' },
+  });
+  const bar = el('div', { className: 'backup-bar', attr: { role: 'status' } },
+    el('div', { className: 'backup-bar__text' },
+      el('span', { className: 'backup-bar__icon', text: '!', attr: { 'aria-hidden': 'true' } }),
+      el('span', { text: `${backupReminderText(status)}，导出 JSON 备份一下` }),
+    ),
+    el('div', { className: 'backup-bar__actions' }, exportBtn, closeBtn),
+  );
+  closeBtn.addEventListener('click', () => {
+    // 只关掉这一次：不持久化，下次打开仍会提醒，不会变成「永不提醒」。
+    bar.remove();
+  });
+  exportBtn.addEventListener('click', async () => {
+    exportBtn.disabled = true;
+    try {
+      await exportBackupJSON();
+      const next = await exportStatus();
+      if (!needsBackupReminder(next)) bar.remove();
+      else exportBtn.disabled = false;
+      toast('备份已导出', 'ok');
+    } catch (err) {
+      toast(`导出失败：${err && err.message ? err.message : err}`, 'error');
+      exportBtn.disabled = false;
+    }
+  });
+  return bar;
+}
+
 function statBlock(label, value, unit) {
   return el('div', { className: 'stat' },
     el('div', { className: 'stat__line' },
@@ -31,11 +86,12 @@ function statBlock(label, value, unit) {
 
 export async function render(root) {
   const date = localDateStr();
-  const [summary, goals, weights, settings] = await Promise.all([
+  const [summary, goals, weights, settings, exportState] = await Promise.all([
     daySummary(date),
     getGoals(),
     recentWeights(30),
     getSettings(),
+    exportStatus(),
   ]);
   // 体重只按「设置里的单位」显示；库里始终是 kg，差值同样要换算（0.1kg = 0.2斤）。
   const weightUnit = settings && settings.weightUnit === 'jin' ? 'jin' : 'kg';
@@ -59,6 +115,9 @@ export async function render(root) {
       onClick: () => go('#/settings'),
     }),
   ));
+
+  // 顶部提醒条：数据在、且该备份了才出现。
+  if (needsBackupReminder(exportState)) root.appendChild(backupBar(exportState));
 
   root.appendChild(el('div', { className: 'card' },
     el('div', { className: 'card__head' },

@@ -6,7 +6,7 @@
  * 本文件同样禁止 DOM / db / fetch。
  */
 
-import { round1, sumItems, netKcal, groupByDate } from './nutrition.js';
+import { round1, sumItems, netKcal, groupByDate, localDateStr, parseDateStr } from './nutrition.js';
 
 export const SLOTS = ['breakfast', 'lunch', 'dinner', 'snack'];
 export const BUSINESS_STORES = ['weights', 'meals', 'exercises', 'waters'];
@@ -182,6 +182,125 @@ export function planImport(store, existingRows, incomingRows) {
     .map((r) => normalizeRecord(store, r))
     .filter(Boolean);
   return pickNewRows(existingRows, dedupeByKey(clean, keyFn), keyFn);
+}
+
+// ---------- 套餐模板（meta.mealTemplates） ----------
+// 套餐存在 meta 里而不是新 object store：加 store 要抬 IDB 版本号，
+// 老设备的升级失败率远高于这点收益。脏数据一律过滤，绝不抛。
+
+/** 单条套餐：id 与 name 缺一不可，其余字段按记录契约兜底。 */
+export function normalizeMealTemplate(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  const id = rec.id == null ? '' : String(rec.id).trim();
+  const name = text(rec.name);
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    slot: SLOTS.includes(rec.slot) ? rec.slot : 'snack',
+    items: normalizeItems(rec.items),
+  };
+}
+
+/** 数组级整形：非数组 -> []，非法条目忽略，重复 id 只留第一条。 */
+export function normalizeMealTemplates(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const rec of Array.isArray(rows) ? rows : []) {
+    const t = normalizeMealTemplate(rec);
+    if (!t || seen.has(t.id)) continue;
+    seen.add(t.id);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * 保存套餐的纯逻辑（不碰 IDB）：name 去首尾空格，同名覆盖并保留原 id。
+ * now 只在新建时用来生成 id（String(now)），测试可注入固定时间。
+ */
+export function planMealTemplateSave(existing, input, now = Date.now()) {
+  const list = normalizeMealTemplates(existing);
+  const src = input && typeof input === 'object' ? input : {};
+  const name = text(src.name);
+  if (!name) throw new Error('套餐名称不能为空');
+  const slot = SLOTS.includes(src.slot) ? src.slot : 'snack';
+  const items = normalizeItems(src.items);
+
+  const index = list.findIndex((t) => t.name === name);
+  if (index >= 0) {
+    const template = { ...list[index], name, slot, items };
+    list[index] = template;
+    return { templates: list, template: { ...template } };
+  }
+
+  const used = new Set(list.map((t) => t.id));
+  let stamp = Math.trunc(num(now, Date.now()));
+  // 同一毫秒内连存两个新套餐时，硬撞 id 会把前一个顶掉：顺延到下一个空位
+  while (used.has(String(stamp))) stamp += 1;
+  const template = { id: String(stamp), name, slot, items };
+  list.push(template);
+  return { templates: list, template: { ...template } };
+}
+
+export function removeMealTemplate(templates, id) {
+  const key = id == null ? '' : String(id).trim();
+  return normalizeMealTemplates(templates).filter((t) => t.id !== key);
+}
+
+// ---------- 最近吃过的食物 ----------
+
+function byRecentFirst(a, b) {
+  const da = text(a?.date);
+  const dbDate = text(b?.date);
+  if (da !== dbDate) return da < dbDate ? 1 : -1;
+  return num(b?.createdAt) - num(a?.createdAt);
+}
+
+/**
+ * 最近 200 条 meals（date 降序、同日 createdAt 降序）里按 item.name 去重，
+ * 保留每个名字**最新一次**出现的信息（首次遍历到的即最新）。
+ * 输出顺序 = 首次出现顺序（最新的在最前），limit 在去重之后生效。
+ */
+export function collectRecentFoodItems(meals, limit = 12) {
+  const max = Math.max(0, Math.floor(num(limit, 12)));
+  if (max <= 0) return [];
+  const rows = (Array.isArray(meals) ? meals : [])
+    .filter((m) => m && typeof m === 'object')
+    .sort(byRecentFirst)
+    .slice(0, 200);
+
+  const out = [];
+  const seen = new Set();
+  for (const meal of rows) {
+    const date = text(meal.date);
+    for (const item of Array.isArray(meal.items) ? meal.items : []) {
+      if (!item || typeof item !== 'object') continue;
+      const name = text(item.name);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      out.push({
+        name,
+        lastDate: date,
+        slot: SLOTS.includes(meal.slot) ? meal.slot : 'snack',
+        item,
+      });
+      if (out.length >= max) return out;
+    }
+  }
+  return out;
+}
+
+/** 上次导出的本地日期与今天相差几天；时间戳非法返回 null。未来时间按今天算（0）。 */
+export function daysSinceExport(lastExportedAt, now = new Date()) {
+  const ts = Number(lastExportedAt);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  const exported = localDateStr(new Date(ts));
+  const today = localDateStr(now);
+  if (!exported || !today) return null;
+  const diff = parseDateStr(today).getTime() - parseDateStr(exported).getTime();
+  if (!Number.isFinite(diff)) return null;
+  return Math.max(0, Math.round(diff / 86400000));
 }
 
 /** 餐次聚合：把所有条目的四项 + 纤维 + 钠加到当日合计。 */

@@ -4,7 +4,7 @@ import { localDateStr } from '../js/nutrition.js';
 import {
   getProfile, saveProfile, getGoals, saveGoals, computeDefaultGoals,
   getSettings, saveSettings,
-  exportJSON, exportCSV, importJSON, clearAllData,
+  exportJSON, exportCSV, importJSON, clearAllData, exportStatus,
 } from '../js/store.js';
 import { testConnection, MODEL_CANDIDATES, DEFAULT_BASE_URL, DEFAULT_MODEL } from '../js/vision.js';
 
@@ -48,6 +48,25 @@ function download(filename, text, mime) {
   a.click();
   a.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/**
+ * 全量 JSON 备份下载：设置页与今日页提醒条共用这一份实现。
+ * exportJSON() 内部会记下备份时间，调用方只管下载与提示。
+ */
+export async function exportBackupJSON() {
+  const payload = await exportJSON();
+  download(`hms-${localDateStr()}.json`, JSON.stringify(payload, null, 2), 'application/json');
+  return payload;
+}
+
+/** 「今天」比「0 天前」更像人话；从未备份时直说。 */
+export function backupStatusText(status) {
+  const s = status || {};
+  if (!s.lastExportedAt) return '从未备份';
+  const days = Number(s.days);
+  if (!Number.isFinite(days) || days <= 0) return '今天';
+  return `${Math.round(days)} 天前`;
 }
 
 export async function render(root) {
@@ -264,13 +283,22 @@ export async function render(root) {
   ));
 
   // ---- 数据 ----
+  const backupLine = el('div', { className: 'muted backup-line', text: '上次备份：读取中…' });
+  const refreshBackupLine = async () => {
+    try {
+      backupLine.textContent = `上次备份：${backupStatusText(await exportStatus())}`;
+    } catch {
+      backupLine.textContent = '上次备份：读取失败';
+    }
+  };
+
   const exportJsonBtn = el('button', { className: 'btn btn--ghost btn--block', text: '导出 JSON（全量备份）' });
   exportJsonBtn.addEventListener('click', async () => {
     exportJsonBtn.disabled = true;
     try {
-      const payload = await exportJSON();
-      download(`hms-${localDateStr()}.json`, JSON.stringify(payload, null, 2), 'application/json');
+      await exportBackupJSON();
       toast('已开始下载 JSON', 'ok');
+      await refreshBackupLine();
     } catch (err) {
       toast(`导出失败：${err && err.message ? err.message : err}`, 'error');
     } finally {
@@ -364,12 +392,15 @@ export async function render(root) {
     }
   });
 
+  refreshBackupLine();
+
   root.appendChild(el('div', { className: 'card col' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
       el('div', { className: 'card__title', text: '数据' }),
       el('div', { className: 'muted', text: '全部在本机' }),
     ),
     el('div', { className: 'grid-2' }, exportJsonBtn, exportCsvBtn),
+    backupLine,
     el('div', { className: 'divider' }),
     labeled('选择备份文件', fileInput),
     labeled('导入方式', modeSelect),

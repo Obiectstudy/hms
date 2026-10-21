@@ -21,6 +21,11 @@ import {
   normalizeWeightRecord,
   normalizeExerciseRecord,
   normalizeRecord,
+  normalizeMealTemplates,
+  planMealTemplateSave,
+  removeMealTemplate,
+  collectRecentFoodItems,
+  daysSinceExport,
   buildDaySummary,
   buildRangeRows,
   buildCSV,
@@ -46,6 +51,10 @@ const SAFE_GOALS = {
 };
 
 const ACTIVITIES = ['sedentary', 'light', 'moderate', 'active', 'very_active'];
+
+// 套餐与导出时间都放 meta：不新增 object store，就不需要抬 IDB 版本号
+const MEAL_TEMPLATES_KEY = 'mealTemplates';
+const LAST_EXPORTED_KEY = 'lastExportedAt';
 
 function num(v, fallback = 0) {
   const n = Number(v);
@@ -272,6 +281,31 @@ export async function deleteMeal(id) {
   await db.del('meals', Number(id));
 }
 
+// ---------- 套餐模板 / 最近吃过 ----------
+
+/** 脏数据（非数组、缺 id/name）由 pure 层过滤，这里只负责取 meta。 */
+export async function getMealTemplates() {
+  return normalizeMealTemplates(await db.getMeta(MEAL_TEMPLATES_KEY, []));
+}
+
+/** 同名视为覆盖并保留原 id；name 为空抛中文错误。 */
+export async function saveMealTemplate({ name, slot, items } = {}) {
+  const existing = await getMealTemplates();
+  const { templates, template } = planMealTemplateSave(existing, { name, slot, items });
+  await db.setMeta(MEAL_TEMPLATES_KEY, templates);
+  return template;
+}
+
+export async function deleteMealTemplate(id) {
+  const existing = await getMealTemplates();
+  await db.setMeta(MEAL_TEMPLATES_KEY, removeMealTemplate(existing, id));
+}
+
+/** 只吃最近 200 条 meals；排序/去重/limit 全在 pure.js 里可测。 */
+export async function recentFoodItems(limit = 12) {
+  return collectRecentFoodItems(await db.getAll('meals'), limit);
+}
+
 // ---------- 运动 ----------
 
 export async function logExercise({ date, type, minutes, kcalBurned, note } = {}) {
@@ -377,10 +411,32 @@ export async function rangeSummary(fromDate, toDate) {
 
 // ---------- 导入导出 ----------
 
-/** 导出全量 JSON：schemaVersion / exportedAt 由 db.dumpAll 提供。 */
+export async function markExported() {
+  await db.setMeta(LAST_EXPORTED_KEY, Date.now());
+}
+
+/** days 用 localDateStr 算整天差（跨时区/夏令时都不会像 toISOString 那样串日）。 */
+export async function exportStatus() {
+  const [last, weights, meals] = await Promise.all([
+    db.getMeta(LAST_EXPORTED_KEY, null),
+    db.getAll('weights'),
+    db.getAll('meals'),
+  ]);
+  const ts = Number(last);
+  const lastExportedAt = Number.isFinite(ts) && ts > 0 ? ts : null;
+  return {
+    lastExportedAt,
+    days: daysSinceExport(lastExportedAt),
+    hasData: weights.length > 0 || meals.length > 0,
+  };
+}
+
+/** 导出全量 JSON：schemaVersion / exportedAt 由 db.dumpAll 提供。成功返回前记一笔导出时间。 */
 export async function exportJSON() {
   const payload = await db.dumpAll();
-  return { app: 'hms', ...payload };
+  const result = { app: 'hms', ...payload };
+  await markExported();
+  return result;
 }
 
 export async function importJSON(obj, mode = 'merge') {

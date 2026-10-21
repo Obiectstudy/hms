@@ -114,6 +114,11 @@ function byClass(root, className) {
   return root.walk().filter((n) => String(n.className).split(/\s+/).includes(className));
 }
 
+/** SVG 的 class 走 setAttribute，不落在 className 上，只能读属性。 */
+function byAttrClass(root, className) {
+  return root.walk().filter((n) => String(n.getAttribute('class') || '').split(/\s+/).includes(className));
+}
+
 /** 文本里不能漏出 undefined / NaN——这是模板拼接最常见的线上事故。 */
 function assertNoLeak(text, label) {
   assert.ok(text.length > 0, `${label} 渲染出空文本`);
@@ -152,6 +157,10 @@ function createDom() {
     set textContent(value) { this._text = String(value); this.childNodes = []; }
 
     appendChild(child) { this.childNodes.push(child); child.parentNode = this; return child; }
+    // 设置页导出走 <a download>.click()：没有它，备份提醒的「导出」在假 DOM 里会抛。
+    click() {
+      for (const fn of this.listeners.click || []) fn({ type: 'click', target: this, preventDefault() {}, stopPropagation() {} });
+    }
     replaceChildren(...kids) { this.childNodes = []; for (const kid of kids) this.appendChild(kid); }
     removeChild(child) { this.childNodes = this.childNodes.filter((x) => x !== child); return child; }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
@@ -275,6 +284,8 @@ function createIndexedDb() {
       const tx = this;
       return {
         getAll: () => new FakeRequest(tx, () => store.getAll()),
+        // 真实 IDBObjectStore.count()：导出备份要用它给照片计数（dumpAll 里的 photoCount）。
+        count: () => new FakeRequest(tx, () => store.data.size),
         get: (key) => new FakeRequest(tx, () => store.get(key)),
         put: (obj) => new FakeRequest(tx, () => store.put(obj)),
         delete: (key) => new FakeRequest(tx, () => { store.delete(key); }),
@@ -395,6 +406,7 @@ export async function run() {
   const dom = createDom();
   const fakeIdb = createIndexedDb();
   let fetchCalls = 0;
+  let urlSnapshot = null;
   const roots = new Map();
 
   const loadView = async (name) => {
@@ -431,6 +443,10 @@ export async function run() {
       fetchCalls += 1;
       throw new Error('测试环境不应发出网络请求');
     });
+    // 导出下载用 Blob + createObjectURL；假 DOM 只关心调用链不抛异常。
+    urlSnapshot = { create: URL.createObjectURL, revoke: URL.revokeObjectURL };
+    URL.createObjectURL = () => 'blob:hms-smoke';
+    URL.revokeObjectURL = () => {};
 
     const today = await seed();
 
@@ -655,6 +671,73 @@ export async function run() {
       assert.equal(Number(reopenedValue.textOf()), 181.2, '重新打开时应按设置单位显示最近体重');
 
       await store.saveSettings({ weightUnit: 'kg' }); // 复原，别把单位状态漏给后续用例
+    });
+
+    // ---- 1.7 7 日均线：折线叠加一条虚线，且原有刻度尺/历史/目标不回退 ----
+    await checkAsync('weight 7 日均线：多一条虚线 path，刻度尺与历史仍在', async () => {
+      const weightView = await import('../views/weight.js');
+      // 有效点不足时均线是假信号：全 null 不能画线，也不能出图例
+      assert.equal(weightView.buildAvgPath([{ value: 68, avg: null }, { value: 68.4, avg: null }]), '', '均线全空时不应产出路径');
+      assert.ok(weightView.buildAvgPath([{ value: 68, avg: null }, { value: 68.4, avg: 68.2 }, { value: 68.1, avg: 68.1 }]).includes('L'), '均线路径应有折线段');
+
+      // 补几个更早的点，让 7 日窗口真正滚起来（只有 2 个点时窗口内 < 2 个有效点）
+      for (let d = 10; d >= 3; d -= 1) await store.logWeight({ date: nutrition.daysAgo(d), weightKg: 70 + (d % 3) * 0.1 });
+
+      const root = await renderView('weight');
+      const text = nodeText(root);
+      assertNoLeak(text, 'weight(均线)');
+      for (const needle of ['7 日均线', '每日', '历史记录', '目标体重进度']) {
+        assert.ok(text.includes(needle), `均线版体重页缺少「${needle}」`);
+      }
+
+      const avgPaths = byAttrClass(root, 'chart__line--avg');
+      assert.equal(avgPaths.length, 1, `均线虚线 path 数量不对：${avgPaths.length}`);
+      const d = avgPaths[0].getAttribute('d') || '';
+      assert.ok(d.startsWith('M'), `均线 path 没有起点：${d.slice(0, 40)}`);
+      assert.ok(d.includes('L'), '均线 path 只有单点，画不出趋势');
+      assert.ok(avgPaths[0].getAttribute('stroke-dasharray'), '均线 path 没有 stroke-dasharray，不是虚线');
+      assert.ok(byAttrClass(root, 'chart__line').length >= 1, '每日折线不见了');
+      assert.equal(byClass(root, 'ruler').length, 1, '滑动刻度尺被回退了');
+      assert.ok(byClass(root, 'unit-chip').length === 1, 'kg/斤 切换被回退了');
+    });
+
+    // ---- 1.8 备份提醒：days >= 7 出现，点导出后消失 ----
+    await checkAsync('dashboard 备份提醒：days >= 7 出现，导出后消失', async () => {
+      const dashboardView = await import('../views/dashboard.js');
+      assert.equal(dashboardView.needsBackupReminder({ hasData: true, days: null }), true, '从未备份应提醒');
+      assert.equal(dashboardView.needsBackupReminder({ hasData: true, days: 7 }), true, '满 7 天应提醒');
+      assert.equal(dashboardView.needsBackupReminder({ hasData: true, days: 6 }), false, '不足 7 天不应提醒');
+      assert.equal(dashboardView.needsBackupReminder({ hasData: false, days: 30 }), false, '没有数据时不该提醒');
+
+      // 直接改 meta 里的备份时间，构造「已 8 天没备份」。
+      // 取 8 天前的中午而不是 now-8*24h：有夏令时的时区也不会被整点差推到 7/9 天。
+      const exportedAt = nutrition.parseDateStr(nutrition.daysAgo(8));
+      exportedAt.setHours(12, 0, 0, 0);
+      await db.setMeta('lastExportedAt', exportedAt.getTime());
+      const root = await renderView('dashboard');
+      const bar = root.walk().find((n) => String(n.className).split(/\s+/).includes('backup-bar'));
+      assert.ok(bar, 'days >= 7 时今日页顶部没有备份提醒条');
+      assert.ok(bar.textOf().includes('已 8 天没备份'), `提醒文案不对：${bar.textOf()}`);
+      assertNoLeak(nodeText(root), 'dashboard(备份提醒)');
+
+      // 关闭只作用于这一次：重画后仍会提醒，不会被记成「永不提醒」
+      fireClick(findButton(bar, '×'));
+      assert.ok(!root.walk().some((n) => String(n.className).split(/\s+/).includes('backup-bar')), '点关闭后提醒条没有消失');
+      const again = await renderView('dashboard');
+      const barAgain = again.walk().find((n) => String(n.className).split(/\s+/).includes('backup-bar'));
+      assert.ok(barAgain, '关闭被持久化了：重画后不应还提醒');
+
+      fireClick(findButton(barAgain, '导出'));
+      await tick(320);
+      assert.ok(!again.walk().some((n) => String(n.className).split(/\s+/).includes('backup-bar')), '导出成功后提醒条没有消失');
+      const status = await store.exportStatus();
+      assert.equal(status.days, 0, '导出后没有记下备份时间');
+
+      // 设置页「数据」区也要能看到上次备份时间（状态是异步读的，等一拍再断言）
+      const settingsRoot = await renderView('settings');
+      await tick(120);
+      const settingsText = nodeText(settingsRoot);
+      assert.ok(settingsText.includes('上次备份：今天'), `设置页没有显示上次备份：${settingsText.slice(0, 260)}`);
     });
 
     // ---- 2. 手动添加整链：搜索 → 定克数 → 加入清单 → 落库 ----
@@ -892,6 +975,139 @@ export async function run() {
       assert.equal(merged[0].kcal, nutrition.scaleFood(legacy.per100g, 200).kcal);
     });
 
+    // ---- 2.6 常吃套餐：点 chip 记入当前日期对应餐次 ----
+    await checkAsync('food 常吃套餐：点 chip 后当日餐次 +1，可删除', async () => {
+      const foodView = await import('../views/food.js');
+      // chip 上限 6 个；缺名字的脏套餐直接过滤
+      assert.equal(foodView.visibleTemplates(Array.from({ length: 8 }, (_, i) => ({ id: String(i), name: `套餐${i}` }))).length, 6, '套餐 chip 最多显示 6 个');
+      assert.equal(foodView.visibleTemplates([null, { id: 'x' }, { id: 'y', name: '有名字' }]).length, 1, '缺 name 的套餐应被过滤');
+
+      const template = await store.saveMealTemplate({
+        name: '测试午餐套餐',
+        slot: 'lunch',
+        items: [{ name: '套餐测试饭', grams: 150, kcal: 321, carb: 20, protein: 30, fat: 10 }],
+      });
+      assert.ok(template && template.id, 'saveMealTemplate 没有返回套餐');
+
+      const root = await renderView('food');
+      const chip = root.walk().find((n) => String(n.className).split(/\s+/).includes('tpl-chip__main'));
+      assert.ok(chip, '日期条下方没有渲染常吃套餐 chip');
+      assert.ok(chip.textOf().includes('测试午餐套餐'), `chip 没有显示套餐名：${chip.textOf()}`);
+      assert.ok(chip.textOf().includes('321'), `chip 没有显示套餐总热量：${chip.textOf()}`);
+
+      const before = await store.daySummary(today);
+      fireClick(chip);
+      await tick(220);
+      const after = await store.daySummary(today);
+      assert.equal(after.meals.length, before.meals.length + 1, '点套餐后餐次数没有 +1');
+      const added = after.meals.filter((meal) => (meal.items || []).some((it) => it.name === '套餐测试饭')).pop();
+      assert.ok(added, '落库后找不到套餐记入的条目');
+      assert.equal(added.slot, 'lunch', '套餐没有记入它自己的餐次');
+      assert.equal(after.intake.kcal, before.intake.kcal + 321, '热量没有按套餐累加');
+      assert.ok(
+        dom.body.childNodes.some((n) => String(n.className).split(/\s+/).includes('toast') && n.textOf().includes('已记入 · 测试午餐套餐')),
+        '没有「已记入 · 套餐名」的 toast',
+      );
+      // 连点会产生多条：允许重复记入
+      const reopened = await renderView('food');
+      const chipAgain = reopened.walk().find((n) => String(n.className).split(/\s+/).includes('tpl-chip__main'));
+      fireClick(chipAgain);
+      await tick(220);
+      assert.equal((await store.daySummary(today)).meals.length, after.meals.length + 1, '连点第二次没有产生新记录');
+
+      // 删除套餐：二次确认后才真的删，无套餐时整块不渲染
+      const forDelete = await renderView('food');
+      const del = forDelete.walk().find((n) => String(n.className).split(/\s+/).includes('tpl-chip__del'));
+      assert.ok(del, '套餐 chip 没有删除入口');
+      fireClick(del);
+      await tick(80);
+      const modal = dom.body.childNodes.find((n) => n.className === 'modal-backdrop');
+      assert.ok(modal, '删除套餐没有二次确认');
+      fireClick(findButton(modal, '删除'));
+      await tick(220);
+      assert.equal((await store.getMealTemplates()).length, 0, '确认后套餐没有被删除');
+      const cleared = await renderView('food');
+      assert.ok(!nodeText(cleared).includes('常吃套餐'), '没有套餐时不应渲染套餐块');
+    });
+
+    // ---- 2.65 存为套餐：草稿弹层起名 → 落库 → 饮食页出现 chip ----
+    await checkAsync('food 存为套餐：草稿弹层起名后可在饮食页看到', async () => {
+      const foodView = await import('../views/food.js');
+      const done = foodView.openDraftSheet(
+        [{ name: '番茄炒蛋', grams: 200, kcal: 210, carb: 8, protein: 12, fat: 14 }],
+        { date: today, source: 'manual', slot: 'lunch' },
+      );
+      await tick(80);
+      const draft = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop');
+      assert.ok(draft, '没有弹出可编辑清单');
+      const saveAsTemplate = findButton(draft, '存为套餐');
+      assert.ok(saveAsTemplate, '草稿弹层缺少「存为套餐」入口');
+      fireClick(saveAsTemplate);
+      await tick(100);
+
+      const nameSheet = dom.body.childNodes.filter((n) => n.className === 'sheet-backdrop').pop();
+      assert.ok(nameSheet && nameSheet.textOf().includes('存为套餐'), '起名弹层没有打开');
+      const nameInput = nameSheet.walk().find((n) => n.tagName === 'input' && n.type === 'text');
+      assert.ok(nameInput, '起名弹层没有输入框');
+      assert.equal(nameInput.value, '午餐套餐', `默认套餐名应按餐次建议：${nameInput.value}`);
+      nameInput.value = '我的常吃套餐';
+      fireClick(findButton(nameSheet, '保存套餐'));
+      await tick(180);
+
+      const saved = await store.getMealTemplates();
+      assert.equal(saved.length, 1, '存为套餐后没有落库');
+      assert.equal(saved[0].name, '我的常吃套餐', '落库的套餐名不对');
+      assert.equal(saved[0].slot, 'lunch', '落库的餐次不对');
+      assert.equal(saved[0].items[0].name, '番茄炒蛋', '落库的条目不对');
+
+      const root = await renderView('food');
+      assert.ok(nodeText(root).includes('我的常吃套餐'), '存完套餐后饮食页没有显示 chip');
+
+      // 收尾：删套餐 + 关草稿，别把状态漏给后续用例
+      await store.deleteMealTemplate(saved[0].id);
+      fireClick(findButton(draft, '×'));
+      await tick(60);
+      assert.equal(await done, null, '关闭草稿应返回 null');
+      assert.equal((await store.getMealTemplates()).length, 0, '收尾没有删掉套餐');
+    });
+
+    // ---- 2.7 最近吃过：点一下直接进份量编辑，默认克数取上次 ----
+    await checkAsync('food 最近吃过：点一下进入份量编辑', async () => {
+      const expected = await store.recentFoodItems(8);
+      assert.ok(expected.length > 0, '种子数据下 recentFoodItems 为空');
+
+      const root = await renderView('food');
+      fireClick(findButton(root, '手动添加'));
+      await tick(260);
+      const sheet = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop');
+      assert.ok(sheet, '没有弹出手动添加层');
+      assert.ok(sheet.textOf().includes('最近吃过'), '手动添加层顶部没有「最近吃过」');
+
+      const rows = sheet.walk().filter((n) => String(n.className).split(/\s+/).includes('recent-item'));
+      assert.equal(rows.length, expected.length, `最近吃过的条数不对：${rows.length} / ${expected.length}`);
+      assert.ok(rows[0].textOf().includes(expected[0].name), `第一条不是最近吃的：${rows[0].textOf()}`);
+      assert.ok(rows[0].textOf().includes(expected[0].lastDate), '没有显示上次日期');
+
+      fireClick(rows[0]);
+      await tick(80);
+      const grams = sheet.walk().find((n) => n.tagName === 'input' && (n.type === 'number' || n.attributes.type === 'number'));
+      assert.ok(grams, '点最近吃过没有进入份量编辑');
+      assert.equal(Number(grams.value), Number(expected[0].item.grams), '默认克数不是上次的克数');
+      assert.ok(sheet.textOf().includes(String(expected[0].item.kcal)), `份量预览没有按上次的营养值算：${sheet.textOf().slice(0, 160)}`);
+
+      // 改克数后加入清单：数值按比例缩放，落到可编辑清单里
+      grams.value = String(Number(expected[0].item.grams) * 2);
+      fireInput(grams);
+      fireClick(findButton(sheet, '加入清单'));
+      await tick(160);
+      const draft = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop' && n.textOf().includes('确认食物'));
+      assert.ok(draft, '最近吃过后没有进入可编辑清单');
+      const row = draft.walk().find((n) => String(n.className).split(/\s+/).includes('item-row'));
+      assert.ok(row && row.textOf().includes(expected[0].name), '清单里没有最近吃过的条目');
+      fireClick(findButton(draft, '×'));
+      await tick(80);
+    });
+
     // ---- 3. 无 API Key：走「去设置」引导，绝不发请求 ----
     await checkAsync('food 无 API Key 时给引导且不发请求', async () => {
       const root = await renderView('food');
@@ -948,6 +1164,12 @@ export async function run() {
       }
     });
   } finally {
+    if (urlSnapshot) {
+      if (typeof urlSnapshot.create === 'function') URL.createObjectURL = urlSnapshot.create;
+      else delete URL.createObjectURL;
+      if (typeof urlSnapshot.revoke === 'function') URL.revokeObjectURL = urlSnapshot.revoke;
+      else delete URL.revokeObjectURL;
+    }
     // 先让 db.js 丢掉缓存的连接，再还原全局，否则后续套件会拿到这个假数据库。
     try {
       const database = await db.openDb();

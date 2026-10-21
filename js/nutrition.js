@@ -235,6 +235,33 @@ export function weightStats(weights) {
   };
 }
 
+/**
+ * 移动平均：avg = 最近 window 个点（含当前点）的算术平均，1 位小数。
+ * - 入参 series 按 date 升序，返回**同长度、同顺序**的 [{ date, value, avg }]，不改入参、不重排。
+ * - 窗口内有效点 < 2 → avg = null：单点连不成趋势，画出来是假信号。
+ *   由此推出 window=1 的语义：窗口最多只装得下 1 个有效点，所以 avg 恒为 null。
+ * - value 非有限数的点 avg=null，且不参与任何窗口的平均（脏点不能污染趋势）。
+ */
+export function movingAverage(series, size = 7) {
+  const rows = Array.isArray(series) ? series : [];
+  const span = Math.max(1, Math.floor(num(size, 7)));
+  const out = [];
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i] && typeof rows[i] === 'object' ? rows[i] : {};
+    const date = typeof row.date === 'string' ? row.date : '';
+    const values = [];
+    for (let j = Math.max(0, i - span + 1); j <= i; j += 1) {
+      const n = Number(rows[j]?.value);
+      if (Number.isFinite(n)) values.push(n);
+    }
+    const avg = Number.isFinite(Number(row.value)) && values.length >= 2
+      ? round1(values.reduce((sum, n) => sum + n, 0) / values.length)
+      : null;
+    out.push({ date, value: row.value, avg });
+  }
+  return out;
+}
+
 // ---------- 体重单位换算 ----------
 // 存储永远是 kg（weights.weightKg / daySummary().weight / weightStats() 都不变），
 // 斤只是「显示与输入」单位；导出 CSV/JSON 同样保持 kg，跨单位备份才一致。
