@@ -431,11 +431,35 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   cursor: pointer;
 }
 .tpl-chip__del:active { background: var(--warn-soft); color: var(--warn); }
+/* 整日套餐 chip 的副标题（早+午+晚）：只占一行小字，不撑高 chip。 */
+.tpl-chip__sub { font-size: 11px; color: var(--text-2); white-space: nowrap; }
+/* 「把今天存为整日套餐」入口：套餐卡片头右侧，点击区 ≥44px。 */
+.tpl-save-day { min-height: 44px; }
 
-/* ---------- 最近吃过（手动添加弹层顶部） ---------- */
+/* ---------- 最近吃过（手动添加弹层，默认折叠成一行） ---------- */
 
 .recent-block { gap: 4px; }
 .recent-list { border-top: 1px solid var(--line); }
+/* 折叠行：整行可点，点击区 ≥44px；箭头在展开/收起时切换。 */
+.recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 2px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.recent-head:active { background: var(--surface-2); }
+.recent-head__caret { flex: none; color: var(--text-2); font-size: 12px; }
 .recent-item {
   width: 100%;
   background: transparent;
@@ -446,6 +470,30 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   cursor: pointer;
 }
 .recent-item:active { background: var(--tap); }
+
+/* ---------- 卡片头折叠行（今日页「今日餐次」，默认折成一行） ---------- */
+
+/* 折叠时卡片头不留 12px 空档，展开后由列表自带间距。 */
+.meal-fold__head { margin-bottom: 0; }
+.meal-fold {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 2px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.meal-fold:active { background: var(--tap); }
+.meal-fold__caret { flex: none; color: var(--text-2); font-size: 12px; }
+.meal-fold__list { margin-top: 12px; }
 
 /* ---------- 折线：7 日均线叠加 ---------- */
 

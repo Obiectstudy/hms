@@ -219,17 +219,20 @@ export async function render(root) {
     ),
   ));
 
-  const mealCard = el('div', { className: 'card' },
-    el('div', { className: 'card__head' },
-      el('div', { className: 'card__title', text: '今日餐次' }),
-      el('button', { className: 'btn btn--ghost btn--sm', text: '去记录', onClick: () => go('#/food') }),
-    ),
-  );
+  // 「今日餐次」默认折成一行：头行本身就是折叠开关，点它才展开逐餐列表；
+  // 「去记录」是并列的按钮（不是头行的子节点），点它只跳饮食页、不触发展开。
   const meals = Array.isArray(summary.meals) ? summary.meals : [];
+  const mealCard = el('div', { className: 'card' });
+  const recordBtn = el('button', { className: 'btn btn--ghost btn--sm', text: '去记录', onClick: () => go('#/food') });
   if (!meals.length) {
+    mealCard.appendChild(el('div', { className: 'card__head' },
+      el('div', { className: 'card__title', text: '今日餐次' }),
+      recordBtn,
+    ));
     mealCard.appendChild(emptyState('今天还没有饮食记录', '拍照记录第一餐', () => go('#/food')));
   } else {
-    const list = el('div', { className: 'list' });
+    const totalKcal = meals.reduce((sum, meal) => sum + sumItems(meal.items || []).kcal, 0);
+    const list = el('div', { className: 'list meal-fold__list' });
     for (const meal of meals.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))) {
       const total = sumItems(meal.items || []);
       const names = (meal.items || []).map((i) => i.name).filter(Boolean);
@@ -242,7 +245,24 @@ export async function render(root) {
         el('div', { className: 'pill', text: meal.source === 'ai' ? 'AI' : '手动' }),
       ));
     }
-    mealCard.appendChild(list);
+    const caret = el('span', { className: 'meal-fold__caret', text: '▼', attr: { 'aria-hidden': 'true' } });
+    const toggle = el('button', {
+      className: 'meal-fold',
+      type: 'button',
+      attr: { 'aria-expanded': 'false', 'aria-label': '展开今日餐次' },
+      onClick: () => {
+        const open = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        toggle.setAttribute('aria-label', `${open ? '收起' : '展开'}今日餐次`);
+        caret.textContent = open ? '▲' : '▼';
+        if (open) mealCard.appendChild(list);
+        else list.remove();
+      },
+    },
+      el('span', { className: 'card__title', text: `今日餐次 · ${meals.length} 餐 ${fmtKcal(totalKcal)} kcal` }),
+      caret,
+    );
+    mealCard.appendChild(el('div', { className: 'card__head meal-fold__head' }, toggle, recordBtn));
   }
   root.appendChild(mealCard);
 }

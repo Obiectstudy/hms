@@ -5,7 +5,7 @@ import {
 import { localDateStr, parseDateStr, round1, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
 import {
   getSettings, getGoals, daySummary, logMeal, updateMeal, deleteMeal, savePhoto,
-  getMealTemplates, saveMealTemplate, deleteMealTemplate, recentFoodItems,
+  getMealTemplates, saveMealTemplate, saveDayTemplate, deleteMealTemplate, recentFoodItems,
 } from '../js/store.js';
 import { fileToDataUrl, analyzeFoodPhoto, MODEL_CANDIDATES } from '../js/vision.js';
 import * as foodsLib from '../js/foods.js';
@@ -332,21 +332,38 @@ export function visibleTemplates(templates) {
   return list.slice(0, MAX_TEMPLATE_CHIPS);
 }
 
-/** 套餐在 chip 上要显示的总热量：与当日合计同一套求和口径。 */
+/**
+ * 套餐在 chip 上要显示的总热量：单餐看 items，整日看每一餐的 items，
+ * 与当日合计走同一套求和口径。
+ */
 export function templateKcal(template) {
-  return sumItems((template && template.items) || []).kcal;
+  const items = [];
+  if (template && template.kind === 'day') {
+    for (const meal of Array.isArray(template.meals) ? template.meals : []) {
+      for (const item of Array.isArray(meal && meal.items) ? meal.items : []) items.push(item);
+    }
+  } else {
+    for (const item of Array.isArray(template && template.items) ? template.items : []) items.push(item);
+  }
+  return sumItems(items).kcal;
 }
 
-/** 弹层里的小表单：只收一个套餐名，空名视为取消。 */
-function askTemplateName(defaultName) {
+/** 整日套餐的副标题：把覆盖到的餐次缩写连起来（早+午+晚），一眼看出这一天有哪些餐。 */
+export function dayTemplateSlots(template) {
+  const meals = Array.isArray(template && template.meals) ? template.meals : [];
+  return meals.map((meal) => slotLabel(meal && meal.slot).replace('餐', '')).join('+');
+}
+
+/** 弹层里的小表单：只收一个套餐名，空名视为取消。title/hint 让整日套餐复用同一张表单。 */
+function askTemplateName(defaultName, { title = '存为套餐', hint = '存下来以后，在饮食页点一下就能把这份清单记入当天；同名套餐会被覆盖' } = {}) {
   const input = el('input', {
     className: 'input', type: 'text', value: String(defaultName || ''), placeholder: '例如：午餐套餐',
     attr: { maxlength: '20' },
   });
   return openSheet({
-    title: '存为套餐',
+    title,
     content: el('div', { className: 'col' },
-      el('div', { className: 'muted', text: '存下来以后，在饮食页点一下就能把这份清单记入当天；同名套餐会被覆盖' }),
+      el('div', { className: 'muted', text: hint }),
       el('label', { className: 'field' }, el('span', { className: 'field__label', text: '套餐名' }), input),
     ),
     actions: [{ text: '保存套餐', value: 'save', primary: true }, { text: '取消', value: null }],
@@ -355,16 +372,72 @@ function askTemplateName(defaultName) {
 
 async function recordTemplate(template, date, reload) {
   try {
-    await logMeal({
-      date,
-      slot: template.slot,
-      source: 'manual',
-      items: (template.items || []).map((item) => ({ ...item })),
-    });
-    toast(`已记入 · ${template.name}`, 'ok');
+    if (template && template.kind === 'day') {
+      const meals = Array.isArray(template.meals) ? template.meals : [];
+      // 整日套餐逐餐记入：每餐一条记录，与手动记一餐完全同构。
+      for (const meal of meals) {
+        await logMeal({
+          date,
+          slot: meal.slot,
+          source: 'manual',
+          items: (meal.items || []).map((item) => ({ ...item })),
+        });
+      }
+      toast(`已记入 ${meals.length} 餐 · ${template.name}`, 'ok');
+    } else {
+      await logMeal({
+        date,
+        slot: template.slot,
+        source: 'manual',
+        items: (template.items || []).map((item) => ({ ...item })),
+      });
+      toast(`已记入 · ${template.name}`, 'ok');
+    }
     await reload();
   } catch (err) {
     toast(`记入失败：${err && err.message ? err.message : err}`, 'error');
+  }
+}
+
+/** 当天已有餐次按 slot 归并：同餐次的多条记录合成一份清单，空餐次直接不出现。 */
+export function groupDayMeals(meals) {
+  const out = [];
+  for (const slot of SLOTS) {
+    const items = [];
+    for (const meal of Array.isArray(meals) ? meals : []) {
+      if (!meal || meal.slot !== slot.value) continue;
+      for (const item of Array.isArray(meal.items) ? meal.items : []) items.push({ ...item });
+    }
+    if (items.length) out.push({ slot: slot.value, items });
+  }
+  return out;
+}
+
+/** 把当天已有餐次存成整日套餐：不足 2 餐只提示，不落库（saveDayTemplate 同样会拒）。 */
+async function saveTodayAsDayTemplate(date, reload) {
+  let summary;
+  try {
+    summary = await daySummary(date);
+  } catch (err) {
+    toast(`读取当天饮食失败：${err && err.message ? err.message : err}`, 'error');
+    return;
+  }
+  const meals = groupDayMeals(summary && summary.meals);
+  if (meals.length < 2) {
+    toast('今天还没有足够的餐次可存', 'error');
+    return;
+  }
+  const name = await askTemplateName('工作日常餐', {
+    title: '存为整日套餐',
+    hint: '存下来以后，点一下就能把这一天的每一餐都记入当天；同名套餐会被覆盖',
+  });
+  if (!name) return;
+  try {
+    await saveDayTemplate({ name, meals });
+    toast(`已存为整日套餐 · ${name}`, 'ok');
+    await reload();
+  } catch (err) {
+    toast(`保存整日套餐失败：${err && err.message ? err.message : err}`, 'error');
   }
 }
 
@@ -384,21 +457,24 @@ async function removeTemplate(template, reload) {
   }
 }
 
-/** 常吃套餐横条：无套餐时返回 null，调用方不 append，页面不留空白。 */
+/** 常吃套餐横条：单餐与整日两类共用一行；无套餐时返回 null，调用方不 append，页面不留空白。 */
 function renderTemplateCard(templates, date, reload) {
   const list = visibleTemplates(templates);
   if (!list.length) return null;
   const row = el('div', { className: 'tpl-row' });
   for (const template of list) {
+    const isDay = template.kind === 'day';
+    const sub = isDay ? dayTemplateSlots(template) : '';
     row.appendChild(el('div', { className: 'tpl-chip' },
       el('button', {
         className: 'tpl-chip__main',
         type: 'button',
-        attr: { 'aria-label': `记入套餐 ${template.name}` },
+        attr: { 'aria-label': `${isDay ? '记入整日套餐' : '记入套餐'} ${template.name}` },
         onClick: () => { recordTemplate(template, date, reload).catch((err) => toast(`记入失败：${err && err.message ? err.message : err}`, 'error')); },
       },
         el('span', { className: 'tpl-chip__name', text: template.name }),
         el('span', { className: 'tpl-chip__kcal', text: `${fmtKcal(templateKcal(template))} kcal` }),
+        sub ? el('span', { className: 'tpl-chip__sub', text: sub }) : null,
       ),
       el('button', {
         className: 'tpl-chip__del',
@@ -412,7 +488,12 @@ function renderTemplateCard(templates, date, reload) {
   return el('div', { className: 'card col template-card' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
       el('div', { className: 'card__title', text: '常吃套餐' }),
-      el('div', { className: 'muted', text: '点一下记入当天' }),
+      el('button', {
+        className: 'btn btn--ghost btn--sm tpl-save-day',
+        type: 'button',
+        text: '把今天存为整日套餐',
+        onClick: () => { saveTodayAsDayTemplate(date, reload).catch((err) => toast(`保存整日套餐失败：${err && err.message ? err.message : err}`, 'error')); },
+      }),
     ),
     row,
   );
@@ -684,7 +765,8 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
         }));
       };
 
-      // 「最近吃过」：无数据整块不渲染，点一下直接进份量编辑（默认克数取上次）。
+      // 「最近吃过」：无数据整块不渲染；默认折叠成一行，点开才 inline 展开。
+      // 折叠时不建行节点，弹层一打开不会先被 8 条历史占满一屏。
       const showRecent = async () => {
         if (isDishMode) return;
         let entries = [];
@@ -695,10 +777,9 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
           return;
         }
         if (!Array.isArray(entries) || !entries.length) return;
-        clear(recentBox);
-        recentBox.appendChild(el('div', { className: 'label', text: '最近吃过' }));
+        const rows = entries.slice(0, RECENT_LIMIT);
         const list = el('div', { className: 'list recent-list' });
-        for (const entry of entries.slice(0, RECENT_LIMIT)) {
+        for (const entry of rows) {
           const item = entry.item || {};
           list.appendChild(el('button', {
             className: 'list__item recent-item',
@@ -713,7 +794,25 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
             el('span', { className: 'muted', text: '份量' }),
           ));
         }
-        recentBox.appendChild(list);
+        const caret = el('span', { className: 'recent-head__caret', text: '▼', attr: { 'aria-hidden': 'true' } });
+        const toggle = el('button', {
+          className: 'recent-head',
+          type: 'button',
+          attr: { 'aria-expanded': 'false', 'aria-label': `展开最近吃过（${rows.length} 条）` },
+          onClick: () => {
+            const open = toggle.getAttribute('aria-expanded') !== 'true';
+            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+            toggle.setAttribute('aria-label', `${open ? '收起' : '展开'}最近吃过（${rows.length} 条）`);
+            caret.textContent = open ? '▲' : '▼';
+            if (open) recentBox.appendChild(list);
+            else list.remove();
+          },
+        },
+          el('span', { text: `最近吃过 (${rows.length})` }),
+          caret,
+        );
+        clear(recentBox);
+        recentBox.appendChild(toggle);
       };
 
       const runSearch = () => {
@@ -738,11 +837,11 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
       showRecent();
 
       return el('div', { className: 'col' },
-        recentBox,
         search,
         el('div', { className: 'muted', text: isDishMode ? '选一道菜，整份清单会替换成它（菜品排在前面）' : '从内置食物库选择，营养值按克数换算' }),
         results,
         detail,
+        recentBox,
       );
     },
   });

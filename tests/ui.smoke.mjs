@@ -497,7 +497,11 @@ export async function run() {
       }
       assert.ok(text.includes(SEED.weightKg.toFixed(1)), `缺少最新体重 ${SEED.weightKg}`);
       assert.ok(text.includes(String(SEED.intakeKcal)), `缺少当日摄入 ${SEED.intakeKcal} kcal`);
-      assert.ok(text.includes('米饭'), '缺少今日餐次里的食物名');
+      // 「今日餐次」默认折叠成一行：展开后再核对逐餐内容
+      const fold = root.walk().find((n) => String(n.className).split(/\s+/).includes('meal-fold'));
+      assert.ok(fold, '今日餐次没有折叠行');
+      fireClick(fold);
+      assert.ok(nodeText(root).includes('米饭'), '缺少今日餐次里的食物名');
     });
 
     await checkAsync('weight 渲染', async () => {
@@ -1302,7 +1306,11 @@ export async function run() {
       await tick(260);
       const sheet = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop');
       assert.ok(sheet, '没有弹出手动添加层');
-      assert.ok(sheet.textOf().includes('最近吃过'), '手动添加层顶部没有「最近吃过」');
+      assert.ok(sheet.textOf().includes('最近吃过'), '手动添加层里没有「最近吃过」');
+      // 默认折叠成一行：先点开折叠行，再看条目
+      const head = sheet.walk().find((n) => String(n.className).split(/\s+/).includes('recent-head'));
+      assert.ok(head, '最近吃过没有折叠行');
+      fireClick(head);
 
       const rows = sheet.walk().filter((n) => String(n.className).split(/\s+/).includes('recent-item'));
       assert.equal(rows.length, expected.length, `最近吃过的条数不对：${rows.length} / ${expected.length}`);
@@ -1327,6 +1335,170 @@ export async function run() {
       assert.ok(row && row.textOf().includes(expected[0].name), '清单里没有最近吃过的条目');
       fireClick(findButton(draft, '×'));
       await tick(80);
+    });
+
+    // ---- 2.75 手动添加层：搜索框在最上，「最近吃过」折成一行 ----
+    await checkAsync('food 手动添加层：搜索框在「最近吃过」之前', async () => {
+      const root = await renderView('food');
+      fireClick(findButton(root, '手动添加'));
+      await tick(260);
+      const sheet = dom.body.childNodes.filter((n) => n.className === 'sheet-backdrop').pop();
+      assert.ok(sheet, '没有弹出手动添加层');
+
+      const nodes = sheet.walk();
+      const search = nodes.find((n) => n.tagName === 'input' && (n.type === 'search' || n.attributes.type === 'search'));
+      const head = nodes.find((n) => String(n.className).split(/\s+/).includes('recent-head'));
+      assert.ok(search, '手动添加层没有搜索框');
+      assert.ok(head, '最近吃过没有折叠行');
+      assert.ok(nodes.indexOf(search) < nodes.indexOf(head), '搜索框在 DOM 中不在「最近吃过」之前');
+      assert.ok(head.textOf().includes('最近吃过'), `折叠行文案不对：${head.textOf()}`);
+      assert.ok(/最近吃过 \(\d+\)/.test(head.textOf()), `折叠行没有条数：${head.textOf()}`);
+
+      fireClick(findButton(sheet, '×'));
+      await tick(60);
+      assert.ok(!dom.body.childNodes.some((n) => n.className === 'sheet-backdrop'), '收尾时搜索弹层没关掉');
+    });
+
+    // ---- 2.76 最近吃过：默认折叠成一行，点开出现条目，再点收起 ----
+    await checkAsync('food 最近吃过：默认折叠一行，点开出现条目，再点收起', async () => {
+      const expected = await store.recentFoodItems(8);
+      assert.ok(expected.length > 0, '种子数据下 recentFoodItems 为空');
+
+      const root = await renderView('food');
+      fireClick(findButton(root, '手动添加'));
+      await tick(260);
+      const sheet = dom.body.childNodes.filter((n) => n.className === 'sheet-backdrop').pop();
+      assert.ok(sheet, '没有弹出手动添加层');
+
+      const rows = () => sheet.walk().filter((n) => String(n.className).split(/\s+/).includes('recent-item'));
+      const head = sheet.walk().find((n) => String(n.className).split(/\s+/).includes('recent-head'));
+      assert.ok(head, '最近吃过没有折叠行');
+      assert.equal(head.getAttribute('aria-expanded'), 'false', '最近吃过默认不是折叠状态');
+      assert.equal(rows().length, 0, '折叠时不应渲染条目');
+
+      fireClick(head);
+      assert.equal(head.getAttribute('aria-expanded'), 'true', '点开后没有展开态');
+      assert.equal(rows().length, expected.length, `展开后的条数不对：${rows().length} / ${expected.length}`);
+      assert.ok(head.textOf().includes('▲'), `展开后没有可见的状态提示：${head.textOf()}`);
+
+      fireClick(head);
+      assert.equal(rows().length, 0, '再点一次没有收起');
+      assert.ok(head.textOf().includes('▼'), `收起后没有回到折叠态：${head.textOf()}`);
+
+      fireClick(findButton(sheet, '×'));
+      await tick(60);
+    });
+
+    // ---- 2.77 今日餐次：默认折成一行（餐数 + 总热量），点开出现逐餐行 ----
+    await checkAsync('dashboard 今日餐次：默认折成一行，点开出现逐餐行', async () => {
+      const summary = await store.daySummary(today);
+      assert.ok(summary.meals.length >= 2, '当天餐次不足，无法验证折叠行');
+      const totalKcal = Math.round(summary.meals.reduce((sum, meal) => sum + nutrition.sumItems(meal.items || []).kcal, 0));
+
+      const root = await renderView('dashboard');
+      const fold = root.walk().find((n) => String(n.className).split(/\s+/).includes('meal-fold'));
+      assert.ok(fold, '今日餐次没有折叠行');
+      assert.ok(fold.textOf().includes(`${summary.meals.length} 餐`), `折叠行没有餐数：${fold.textOf()}`);
+      assert.ok(fold.textOf().includes(String(totalKcal)), `折叠行没有总热量 ${totalKcal}：${fold.textOf()}`);
+      assert.equal(fold.getAttribute('aria-expanded'), 'false', '今日餐次默认不是折叠状态');
+      assert.equal(byClass(root, 'meal-fold__list').length, 0, '折叠时不应渲染逐餐列表');
+
+      const record = findButton(root, '去记录');
+      assert.ok(record, '折叠行右侧没有「去记录」');
+      fireClick(record);
+      assert.equal(byClass(root, 'meal-fold__list').length, 0, '点「去记录」不应展开逐餐列表');
+
+      fireClick(fold);
+      const lists = byClass(root, 'meal-fold__list');
+      assert.equal(lists.length, 1, '点折叠行没有展开逐餐列表');
+      const mealRows = lists[0].walk().filter((n) => String(n.className).split(/\s+/).includes('list__item'));
+      assert.equal(mealRows.length, summary.meals.length, `展开后的逐餐行数不对：${mealRows.length} / ${summary.meals.length}`);
+      assert.ok(fold.textOf().includes('▲'), `展开后没有可见的状态提示：${fold.textOf()}`);
+    });
+
+    // ---- 2.78 整日套餐 chip：点一下把 meals 里每一餐都记入当天 ----
+    await checkAsync('food 整日套餐 chip：点一下把每一餐都记入当天', async () => {
+      const dayTpl = await store.saveDayTemplate({
+        name: '测试整日套餐',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '整日早餐蛋', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+          { slot: 'lunch', items: [{ name: '整日午餐饭', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+          { slot: 'dinner', items: [{ name: '整日晚餐菜', grams: 150, kcal: 180, carb: 8, protein: 12, fat: 10 }] },
+        ],
+      });
+      assert.ok(dayTpl && dayTpl.id, 'saveDayTemplate 没有返回套餐');
+
+      const root = await renderView('food');
+      const chip = byClass(root, 'tpl-chip__main').find((n) => n.textOf().includes('测试整日套餐'));
+      assert.ok(chip, '饮食页没有渲染整日套餐 chip');
+      assert.ok(chip.textOf().includes('518'), `chip 没有显示总热量：${chip.textOf()}`);
+      assert.ok(chip.textOf().includes('早+午+晚'), `chip 没有显示餐次副标题：${chip.textOf()}`);
+
+      const before = await store.daySummary(today);
+      fireClick(chip);
+      await tick(260);
+      const after = await store.daySummary(today);
+      assert.equal(after.meals.length, before.meals.length + 3, '整日套餐没有按 meals 数量增加餐次');
+      assert.equal(after.intake.kcal, before.intake.kcal + 518, '整日套餐的热量没有全部累加');
+      for (const [slot, name] of [['breakfast', '整日早餐蛋'], ['lunch', '整日午餐饭'], ['dinner', '整日晚餐菜']]) {
+        const hit = after.meals.filter((m) => m.slot === slot && (m.items || []).some((it) => it.name === name)).pop();
+        assert.ok(hit, `整日套餐没有把 ${slot} 记入当天`);
+      }
+      assert.ok(
+        dom.body.childNodes.some((n) => String(n.className).split(/\s+/).includes('toast') && n.textOf().includes('已记入 3 餐 · 测试整日套餐')),
+        '没有「已记入 3 餐 · 套餐名」的 toast',
+      );
+
+      await store.deleteMealTemplate(dayTpl.id);
+      assert.equal((await store.getMealTemplates()).length, 0, '收尾没有删掉整日套餐');
+    });
+
+    // ---- 2.79 把今天存为整日套餐：不足 2 餐给提示，足够时落库为 kind=day ----
+    await checkAsync('food 把今天存为整日套餐：不足时提示，足够时落库', async () => {
+      await store.saveMealTemplate({
+        name: '入口测试套餐',
+        slot: 'snack',
+        items: [{ name: '入口测试坚果', grams: 20, kcal: 120, carb: 3, protein: 4, fat: 10 }],
+      });
+
+      // 不足 2 餐：切到没有任何记录的昨天，点入口只提示、不弹命名表单
+      const root = await renderView('food');
+      fireClick(findButton(root, '‹ 前一天'));
+      await tick(200);
+      const entry = findButton(root, '把今天存为整日套餐');
+      assert.ok(entry, '套餐卡片头没有「把今天存为整日套餐」入口');
+      fireClick(entry);
+      await tick(140);
+      assert.ok(
+        dom.body.childNodes.some((n) => String(n.className).split(/\s+/).includes('toast') && n.textOf().includes('今天还没有足够的餐次可存')),
+        '当天餐次不足时没有给提示',
+      );
+      assert.equal((await store.getMealTemplates()).length, 1, '当天餐次不足时不应写入整日套餐');
+
+      // 足够 2 餐：今天的饮食页 → 命名弹层 → 落库
+      const todayRoot = await renderView('food');
+      const entryToday = findButton(todayRoot, '把今天存为整日套餐');
+      assert.ok(entryToday, '今天的饮食页没有整日套餐入口');
+      fireClick(entryToday);
+      await tick(140);
+      const nameSheet = dom.body.childNodes.filter((n) => n.className === 'sheet-backdrop').pop();
+      assert.ok(nameSheet && nameSheet.textOf().includes('存为整日套餐'), '没有打开整日套餐命名弹层');
+      const input = nameSheet.walk().find((n) => n.tagName === 'input' && n.type === 'text');
+      assert.ok(input, '命名弹层没有输入框');
+      assert.equal(input.value, '工作日常餐', `整日套餐的默认名不对：${input.value}`);
+      fireClick(findButton(nameSheet, '保存套餐'));
+      await tick(240);
+
+      const saved = (await store.getMealTemplates()).filter((t) => t.kind === 'day');
+      assert.equal(saved.length, 1, '足够餐次时没有落库整日套餐');
+      assert.equal(saved[0].name, '工作日常餐', '落库的整日套餐名不对');
+      assert.ok(saved[0].meals.length >= 2, `整日套餐的餐次不足 2：${saved[0].meals.length}`);
+      const slots = saved[0].meals.map((m) => m.slot);
+      assert.ok(slots.includes('breakfast') && slots.includes('lunch'), `当天餐次没有按 slot 分组：${slots.join('/')}`);
+
+      // 收尾：删掉两个套餐，别把状态漏给后续用例
+      for (const t of await store.getMealTemplates()) await store.deleteMealTemplate(t.id);
+      assert.equal((await store.getMealTemplates()).length, 0, '收尾没有删掉套餐');
     });
 
     // ---- 3. 无 API Key：走「去设置」引导，绝不发请求 ----
