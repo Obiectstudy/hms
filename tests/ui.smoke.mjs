@@ -119,6 +119,33 @@ function byAttrClass(root, className) {
   return root.walk().filter((n) => String(n.getAttribute('class') || '').split(/\s+/).includes(className));
 }
 
+/**
+ * 伪造 APK 内置桥：version() 报本地 4/1.3.0，checkUpdate 异步回调 __hmsUpdate，
+ * installUpdate 只记录参数（真机由原生侧去下载安装）。
+ */
+function fakeBridge(remote, calls) {
+  return {
+    version: () => JSON.stringify({ versionCode: 4, versionName: '1.3.0' }),
+    checkUpdate() {
+      calls.push('checkUpdate');
+      setTimeout(() => {
+        const win = globalThis.window;
+        if (typeof win.__hmsUpdate === 'function') win.__hmsUpdate(remote);
+        else calls.push('no-handler');
+      }, 0);
+    },
+    installUpdate(payload) { calls.push({ install: payload }); },
+  };
+}
+
+/** PWA 里没有桥：连同我们挂的两个全局回调一起清掉。 */
+function dropBridge() {
+  const win = globalThis.window;
+  delete win.HmsBridge;
+  delete win.__hmsUpdate;
+  delete win.__hmsUpdateProgress;
+}
+
 /** 文本里不能漏出 undefined / NaN——这是模板拼接最常见的线上事故。 */
 function assertNoLeak(text, label) {
   assert.ok(text.length > 0, `${label} 渲染出空文本`);
@@ -162,6 +189,15 @@ function createDom() {
       for (const fn of this.listeners.click || []) fn({ type: 'click', target: this, preventDefault() {}, stopPropagation() {} });
     }
     replaceChildren(...kids) { this.childNodes = []; for (const kid of kids) this.appendChild(kid); }
+    // 更新提示条落在「今日页最顶部」：异步回调要插到 firstChild 之前。
+    insertBefore(child, ref) {
+      if (!ref) return this.appendChild(child);
+      const index = this.childNodes.indexOf(ref);
+      if (index < 0) return this.appendChild(child);
+      this.childNodes.splice(index, 0, child);
+      child.parentNode = this;
+      return child;
+    }
     removeChild(child) { this.childNodes = this.childNodes.filter((x) => x !== child); return child; }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
     setAttribute(key, value) { this.attributes[key] = String(value); }
@@ -738,6 +774,191 @@ export async function run() {
       await tick(120);
       const settingsText = nodeText(settingsRoot);
       assert.ok(settingsText.includes('上次备份：今天'), `设置页没有显示上次备份：${settingsText.slice(0, 260)}`);
+    });
+
+    // ---- 1.9 应用内更新提示条：纯函数 / 只在有桥时渲染 / 安装与进度 ----
+    await checkAsync('更新纯函数：parseBridgeJson 容错、isNewer 严格大于、shouldPrompt 忽略已稍后', async () => {
+      const update = await import('../js/update.js');
+
+      assert.deepEqual(update.parseBridgeJson('{"versionCode":5,"versionName":"1.4.0"}'), { versionCode: 5, versionName: '1.4.0' });
+      assert.deepEqual(update.parseBridgeJson({ versionCode: 5 }), { versionCode: 5 }, '对象输入应原样接受');
+      for (const bad of [null, undefined, '', '   ', 'not json', '{"versionCode":', '[1,2]', 'null', '"更新"', 42, true]) {
+        assert.equal(update.parseBridgeJson(bad), null, `非法输入应返回 null：${String(bad)}`);
+      }
+
+      assert.equal(update.isNewer(4, 5), true, '远端 code 更大才是新版');
+      assert.equal(update.isNewer(5, 5), false, '等值不算新版本');
+      assert.equal(update.isNewer(5, 4), false, '远端更旧不提示');
+      assert.equal(update.isNewer(4, 'abc'), false, '非法数字不算新版');
+      assert.equal(update.isNewer(undefined, 5), false, '本地版本未知时不瞎提示');
+
+      assert.equal(update.shouldPrompt({ ok: true, versionCode: 5 }, 0), true);
+      assert.equal(update.shouldPrompt({ ok: true, versionCode: 5 }, '5'), false, '点过「稍后」的同一版本不再提示');
+      assert.equal(update.shouldPrompt({ ok: true, versionCode: 6 }, 5), true, '换新版应再次提示');
+      assert.equal(update.shouldPrompt({ ok: false, error: '网络错误' }, 0), false, '失败结果不提示');
+      assert.equal(update.shouldPrompt({ versionName: '1.4.0' }, 0), false, '缺 versionCode 不提示');
+      assert.equal(update.shouldPrompt(null, 0), false);
+
+      assert.equal(update.DISMISS_KEY, 'hms.update.dismissed', '「稍后」的存储键改名了');
+      assert.equal(typeof update.createUpdateBanner, 'function');
+      assert.equal(typeof update.initUpdateBanner, 'function');
+    });
+
+    await checkAsync('dashboard 更新条：无桥不渲染；有桥时渲染并跟随下载进度', async () => {
+      const calls = [];
+      const win = globalThis.window;
+      dropBridge();
+
+      // PWA：不渲染、不请求、也不留下全局回调
+      const plain = await renderView('dashboard');
+      await tick(60);
+      assert.equal(byClass(plain, 'update-bar').length, 0, 'PWA（无桥）里不应出现更新条');
+      assert.equal(win.__hmsUpdate, undefined, '无桥时不应挂 __hmsUpdate');
+      assert.equal(win.__hmsUpdateProgress, undefined, '无桥时不应挂 __hmsUpdateProgress');
+
+      win.HmsBridge = fakeBridge({
+        ok: true,
+        versionCode: 5,
+        versionName: '1.4.0',
+        notes: '修复备份导出时文件名重复的问题',
+        // 原生 HmsBridge 回调里是 url；apkUrl 是任务书里的另一种叫法，两种都要原样透传。
+        url: 'https://example.com/dist/HMS-latest.apk',
+        apkUrl: 'https://example.com/dist/HMS-latest.apk',
+        sha256: 'abc123',
+        size: 1710227,
+      }, calls);
+
+      try {
+        const root = await renderView('dashboard');
+        await tick(80);
+        const bar = byClass(root, 'update-bar')[0];
+        assert.ok(bar, '有桥且版本更新时，今日页顶部没有更新条');
+        assert.equal(byClass(root, 'update-bar').length, 1, '更新条重复渲染');
+        assert.ok(bar.textOf().includes('发现新版本 1.4.0'), `更新条文案不对：${bar.textOf()}`);
+        assert.ok(bar.textOf().includes('修复备份导出时文件名重复的问题'), `更新条缺少 notes 副文案：${bar.textOf()}`);
+        assert.equal(calls.filter((c) => c === 'checkUpdate').length, 1, '一次渲染应只 checkUpdate 一次');
+        assertNoLeak(nodeText(root), 'dashboard(更新条)');
+
+        // 原生侧重复回调不该插出第二条
+        win.__hmsUpdate({ ok: true, versionCode: 6, versionName: '1.9.9', apkUrl: 'https://example.com/x.apk', sha256: 'xxx' });
+        assert.equal(byClass(root, 'update-bar').length, 1, '重复回调插出了第二条更新条');
+
+        const install = findButton(bar, '立即更新');
+        assert.ok(install, '更新条没有「立即更新」按钮');
+        fireClick(install);
+        assert.equal(install.disabled, true, '点「立即更新」后按钮应禁用');
+        assert.equal(install.textOf(), '准备中…', `准备中状态文案不对：${install.textOf()}`);
+
+        const installCall = calls.find((c) => c && typeof c === 'object' && c.install);
+        assert.ok(installCall, '点「立即更新」没有调用 HmsBridge.installUpdate');
+        const sent = JSON.parse(installCall.install);
+        assert.equal(sent.apkUrl, 'https://example.com/dist/HMS-latest.apk', 'installUpdate 参数丢了 apkUrl');
+        assert.equal(sent.url, 'https://example.com/dist/HMS-latest.apk', 'installUpdate 参数丢了 url（原生实际字段名）');
+        assert.equal(sent.sha256, 'abc123', 'installUpdate 参数丢了 sha256');
+
+        win.__hmsUpdateProgress({ state: 'downloading', percent: 42 });
+        assert.ok(install.textOf().includes('42%'), `下载进度没有落到按钮上：${install.textOf()}`);
+        win.__hmsUpdateProgress('{"state":"verifying"}');
+        assert.equal(install.textOf(), '校验中…', '校验状态文案不对');
+        win.__hmsUpdateProgress({ state: 'opening' });
+        assert.equal(install.textOf(), '正在打开安装…', '安装状态文案不对');
+        win.__hmsUpdateProgress({ state: 'error', message: '签名校验失败' });
+        assert.equal(install.disabled, false, '出错后按钮应恢复可点');
+        assert.equal(install.textOf(), '立即更新', '出错后按钮文案应恢复');
+        assert.ok(
+          dom.body.childNodes.some((n) => String(n.className).split(/\s+/).includes('toast') && n.textOf().includes('签名校验失败')),
+          '出错后没有 toast 错误原因',
+        );
+      } finally {
+        dropBridge();
+      }
+    });
+
+    await checkAsync('dashboard 更新条：「稍后」记住 versionCode，同版本不再打扰，换新版再提示', async () => {
+      const calls = [];
+      const win = globalThis.window;
+      const previousStorage = globalThis.localStorage;
+      const bag = new Map();
+      globalThis.localStorage = {
+        getItem: (key) => (bag.has(key) ? bag.get(key) : null),
+        setItem: (key, value) => { bag.set(key, String(value)); },
+        removeItem: (key) => { bag.delete(key); },
+      };
+      win.HmsBridge = fakeBridge({ ok: true, versionCode: 5, versionName: '1.4.0', apkUrl: 'https://example.com/a.apk', sha256: 'aaa' }, calls);
+
+      try {
+        const root = await renderView('dashboard');
+        await tick(80);
+        const bar = byClass(root, 'update-bar')[0];
+        assert.ok(bar, '更新条没有出现（「稍后」用例的前置）');
+
+        fireClick(findButton(bar, '稍后'));
+        await tick(20);
+        assert.equal(bag.get('hms.update.dismissed'), '5', '点「稍后」没有把 versionCode 写进 localStorage');
+        assert.equal(byClass(root, 'update-bar').length, 0, '点「稍后」后更新条没有消失');
+
+        const again = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(again, 'update-bar').length, 0, '同一版本被「稍后」后不应再提示');
+
+        // 换新版：versionCode 6 应重新提示，且不显示旧版本号
+        win.HmsBridge = fakeBridge({ ok: true, versionCode: 6, versionName: '1.5.0', apkUrl: 'https://example.com/b.apk', sha256: 'bbb' }, calls);
+        const newer = await renderView('dashboard');
+        await tick(80);
+        const newerBar = byClass(newer, 'update-bar')[0];
+        assert.ok(newerBar, '换新版后没有再次提示');
+        assert.ok(newerBar.textOf().includes('1.5.0'), `新版本文案不对：${newerBar.textOf()}`);
+        assert.ok(!newerBar.textOf().includes('1.4.0'), `换新版后仍显示旧版本号：${newerBar.textOf()}`);
+
+        // 本机已是最新（versionCode 相等）：不提示
+        win.HmsBridge = fakeBridge({ ok: true, versionCode: 4, versionName: '1.3.0', apkUrl: 'https://example.com/c.apk', sha256: 'ccc' }, calls);
+        const same = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(same, 'update-bar').length, 0, 'versionCode 相等时不应提示');
+
+        // 桥报失败 / 非法 JSON：同样不渲染
+        win.HmsBridge = fakeBridge({ ok: false, error: '检查更新失败' }, calls);
+        const failed = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(failed, 'update-bar').length, 0, '桥返回 ok:false 时不应渲染更新条');
+        win.HmsBridge = fakeBridge('not json', calls);
+        const broken = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(broken, 'update-bar').length, 0, '桥返回非法 JSON 时不应渲染更新条');
+      } finally {
+        dropBridge();
+        if (previousStorage === undefined) delete globalThis.localStorage;
+        else globalThis.localStorage = previousStorage;
+      }
+    });
+
+    await checkAsync('更新条与备份提醒条同时存在，互不覆盖', async () => {
+      const calls = [];
+      const win = globalThis.window;
+      win.HmsBridge = fakeBridge({ ok: true, versionCode: 7, versionName: '1.6.0', apkUrl: 'https://example.com/d.apk', sha256: 'ddd' }, calls);
+      try {
+        const exportedAt = nutrition.parseDateStr(nutrition.daysAgo(9));
+        exportedAt.setHours(12, 0, 0, 0);
+        await db.setMeta('lastExportedAt', exportedAt.getTime());
+
+        const root = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(root, 'update-bar').length, 1, '更新条不见了');
+        assert.equal(byClass(root, 'backup-bar').length, 1, '备份提醒条不见了');
+        assert.ok(
+          root.firstChild && String(root.firstChild.className).split(/\s+/).includes('update-bar'),
+          `更新条没有贴在今日页最顶部：${String(root.firstChild && root.firstChild.className)}`,
+        );
+        assert.ok(byClass(root, 'backup-bar')[0].textOf().includes('已 9 天没备份'), '备份提醒文案被更新条影响');
+
+        // 关掉更新条不影响备份提醒
+        fireClick(findButton(byClass(root, 'update-bar')[0], '稍后'));
+        await tick(20);
+        assert.equal(byClass(root, 'backup-bar').length, 1, '关掉更新条后备份提醒也被带走了');
+      } finally {
+        dropBridge();
+        await store.markExported();
+      }
     });
 
     // ---- 2. 手动添加整链：搜索 → 定克数 → 加入清单 → 落库 ----

@@ -491,6 +491,51 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 .backup-bar__close:active { background: var(--surface-2); }
 .backup-line { padding: 2px 0; }
 
+/* ---------- 应用内更新提示条（今日页顶部，仅 APK 内出现） ---------- */
+
+.update-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--brand-glow);
+  border-radius: var(--radius-sm);
+  background: var(--brand-soft);
+  color: var(--text);
+  font-size: 13px;
+}
+.update-bar__text { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.update-bar__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--brand);
+  color: var(--on-brand);
+  font-size: 12px;
+  font-weight: 700;
+}
+.update-bar__copy { display: flex; flex-direction: column; min-width: 0; }
+.update-bar__title { color: var(--brand-2); font-weight: 600; }
+.update-bar__notes {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.update-bar__actions { display: flex; align-items: center; gap: 6px; flex: none; }
+/* 两个按钮都保持 ≥44px 的点击区域：提示条本身只有 13px 字，不能靠整条可点。 */
+.update-bar__btn { min-height: 44px; padding: 0 14px; font-size: 14px; }
+.update-bar__later { min-height: 44px; padding: 0 12px; font-size: 14px; box-shadow: none; }
+.update-bar__later:active { background: var(--surface); }
+
 .details { background: var(--surface-2); border-radius: var(--radius-sm); padding: 8px 10px; }
 .details summary { cursor: pointer; font-size: 12px; }
 .details__pre {

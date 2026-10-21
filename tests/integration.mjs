@@ -19,6 +19,7 @@ const MODULES = [
   'js/foods.js',
   'js/vision.js',
   'js/ui.js',
+  'js/update.js',
   'views/dashboard.js',
   'views/weight.js',
   'views/food.js',

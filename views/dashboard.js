@@ -119,6 +119,19 @@ export async function render(root) {
   // 顶部提醒条：数据在、且该备份了才出现。
   if (needsBackupReminder(exportState)) root.appendChild(backupBar(exportState));
 
+  // 应用更新提示条（仅 APK 内置 HmsBridge 时出现）：按需加载这段逻辑，
+  // PWA 里 initUpdateBanner 直接返回 null，不请求也不渲染。
+  // 桥的回复是异步的，所以回调里插到根节点最前面（今日页顶部，与备份提醒条各占一行）。
+  // 更新提示只是附加能力：加载失败不能把今日页拖进错误卡片。
+  try {
+    const { initUpdateBanner } = await import('../js/update.js');
+    initUpdateBanner({
+      mount: (node) => { root.insertBefore(node, root.firstChild); },
+    });
+  } catch (error) {
+    if (typeof console !== 'undefined') console.warn('[HMS] 更新提示不可用：', error);
+  }
+
   root.appendChild(el('div', { className: 'card' },
     el('div', { className: 'card__head' },
       el('div', { className: 'card__title', text: '热量' }),
