@@ -1356,6 +1356,174 @@ export async function run() {
       await tick(40);
     });
 
+    // ---- 3.5 份量单位：详情层 chip / 无单位退化 / 搜索行主单位 / 已存条目参照 ----
+    await checkAsync('food 份量单位 chip：点第二个后克数=grams、预览随之变化', async () => {
+      const foodView = await import('../views/food.js');
+      const fake = {
+        id: 'test-multi-unit',
+        name: '测试鸡腿',
+        per100g: { kcal: 200, carb: 0, protein: 20, fat: 12 },
+        units: [
+          { name: '1 只（去皮，去骨）', grams: 90 },
+          { name: '1 只（带骨）', grams: 120 },
+        ],
+      };
+      const panel = foodView.renderPortionDetail(fake, {});
+      const chips = byClass(panel, 'portion-chip--unit');
+      assert.equal(chips.length, 2, `应渲染 2 个单位 chip，实际 ${chips.length}`);
+      assert.ok(chips[0].textOf().includes('1 只（去皮，去骨）'), `chip 缺少单位名：${chips[0].textOf()}`);
+      assert.ok(chips[0].textOf().includes('90g'), `chip 没写明这个单位多少克：${chips[0].textOf()}`);
+      assert.ok(chips[1].textOf().includes('120g'), `第二个 chip 没写明克数：${chips[1].textOf()}`);
+      assert.ok(panel.textOf().includes('1 拳 ≈ 150g · 1 掌心 ≈ 100g · 1 汤匙 ≈ 15g'), '缺少目测参考文案');
+
+      const input = panel.walk().find((n) => n.tagName === 'input' && n.type === 'number');
+      assert.ok(input, '详情层没有克数输入框');
+      assert.equal(Number(input.value), 90, '默认克数应取第一个单位');
+      const preview = () => byClass(panel, 'portion-preview')[0].textOf();
+      assert.ok(chips[0].className.split(/\s+/).includes('is-active'), '默认 chip 没有选中态');
+
+      const before = preview();
+      fireClick(chips[1]);
+      assert.equal(Number(input.value), 120, '点 chip 后克数输入框没有填成该单位的 grams');
+      assert.ok(chips[1].className.split(/\s+/).includes('is-active'), '点击后第二个 chip 没有选中态');
+      assert.ok(!chips[0].className.split(/\s+/).includes('is-active'), '旧 chip 的选中态没撤掉');
+      const after = preview();
+      assert.notEqual(after, before, '热量预览没有随单位变化');
+      assert.ok(after.includes(String(nutrition.scaleFood(fake.per100g, 120).kcal)), `预览热量不对：${after}`);
+
+      // 手动改克数：选中态跟随输入，不留错挂的 chip
+      input.value = '90';
+      fireInput(input);
+      assert.ok(chips[0].className.split(/\s+/).includes('is-active'), '手动改回 90g 后第一个 chip 应重新选中');
+    });
+
+    await checkAsync('food 无 units 食物：不渲染 chip 区且不抛异常', async () => {
+      const foodView = await import('../views/food.js');
+      const legacy = { id: 'test-no-unit', name: '无单位食物', per100g: { kcal: 100, carb: 10, protein: 5, fat: 2 } };
+      let panel;
+      assert.doesNotThrow(() => { panel = foodView.renderPortionDetail(legacy, {}); }, '无 units 的食物渲染详情抛异常了');
+      assert.equal(byClass(panel, 'portion-units').length, 0, '无 units 时不应渲染 chip 区');
+      assert.equal(byClass(panel, 'portion-chip').length, 0, '无 units 时不应有任何 chip');
+      const input = panel.walk().find((n) => n.tagName === 'input' && n.type === 'number');
+      assert.ok(input, '无 units 时克数输入框不见了');
+      assert.equal(Number(input.value), 100, '无 units 的原料默认 100g');
+      input.value = '150';
+      assert.doesNotThrow(() => fireInput(input), '无 units 时手动改克数抛异常');
+      assert.ok(byClass(panel, 'portion-preview')[0].textOf().includes('150'), '无 units 时预览没有按克数换算');
+
+      assert.deepEqual(foodView.unitsOf(legacy), [], '无 units 的 unitsOf 应返回空数组');
+      assert.equal(foodView.itemUnitHint({ foodId: 'test-no-unit', grams: 100 }), '', '无单位条目不应给参照');
+      assert.doesNotThrow(() => foodView.renderPickRow(legacy, () => {}), '无 units 的搜索行渲染抛异常');
+    });
+
+    await checkAsync('food 搜索行显示主单位（foodUnits[0]），且只占元信息一行', async () => {
+      const foodView = await import('../views/food.js');
+      const fake = {
+        id: 'test-row-unit',
+        name: '测试多单位饭',
+        per100g: { kcal: 116, carb: 25.9, protein: 2.6, fat: 0.3 },
+        units: [{ name: '1 碗', grams: 200 }, { name: '1 大碗', grams: 320 }],
+      };
+      const row = foodView.renderPickRow(fake, () => {});
+      const text = row.textOf();
+      assert.ok(text.includes('1 碗 ≈ 200g'), `搜索行没有主单位文案：${text}`);
+      assert.ok(!text.includes('1 大碗'), '搜索行只应显示主单位，不该平铺全部单位');
+      assert.equal(byClass(row, 'list__item--meta').length, 1, '主单位应并进元信息一行，避免撑高行高');
+      const plain = foodView.renderPickRow({ id: 'test-row-plain', name: '无单位食物', per100g: { kcal: 100 } }, () => {});
+      assert.ok(!plain.textOf().includes('≈'), '无单位食物的搜索行不应显示份量参照');
+
+      // 真实搜索链路：库里有单位的食物，结果行同样带主单位
+      const foodsMod = await import('../js/foods.js');
+      const target = foodsMod.FOODS.find((f) => f && f.name && foodView.unitsOf(f).length);
+      assert.ok(target, '食物库里找不到带单位的食物');
+      const unit = foodView.unitsOf(target)[0];
+      const root = await renderView('food');
+      fireClick(findButton(root, '手动添加'));
+      await tick(160);
+      const sheet = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop');
+      assert.ok(sheet, '没有弹出手动添加层');
+      const search = sheet.walk().find((n) => n.tagName === 'input' && (n.type === 'search' || n.attributes.type === 'search'));
+      search.value = target.name;
+      fireInput(search);
+      await tick(280);
+      const hit = sheet.walk().filter((n) => n.className === 'list__item pick-item')
+        .find((n) => n.textOf().startsWith(target.name));
+      assert.ok(hit, `搜索「${target.name}」没有命中`);
+      assert.ok(hit.textOf().includes(`${unit.name} ≈ ${unit.grams}g`), `搜索结果行没有主单位：${hit.textOf()}`);
+      fireClick(findButton(sheet, '×'));
+      await tick(60);
+      assert.ok(!dom.body.childNodes.some((n) => n.className === 'sheet-backdrop'), '收尾时搜索弹层没关掉');
+    });
+
+    await checkAsync('food 已保存条目：接近单位才显示 ≈1 碗，差距大不显示', async () => {
+      const foodView = await import('../views/food.js');
+      const foodsMod = await import('../js/foods.js');
+      const single = foodsMod.FOODS.find((f) => f && f.name && foodView.unitsOf(f).length === 1);
+      assert.ok(single, '食物库里找不到单单位食物');
+      const unit = foodView.unitsOf(single)[0];
+
+      assert.equal(foodView.unitHintFor(unit.grams, [unit]), `≈${unit.name}`, '正好的克数应给参照');
+      assert.equal(foodView.unitHintFor(Math.round(unit.grams * 1.1), [unit]), `≈${unit.name}`, '±15% 内应给参照');
+      assert.equal(foodView.unitHintFor(Math.round(unit.grams * 1.3), [unit]), '', '超过 ±15% 不应给参照');
+      assert.equal(foodView.unitHintFor(unit.grams, []), '', '没有单位时不给参照');
+
+      const nearName = `参照测试近-${single.id}`;
+      const farName = `参照测试远-${single.id}`;
+      const macros = { kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const farGrams = Math.round(unit.grams * 2);
+      assert.ok(farGrams > unit.grams * 1.15, '测试用的「远」克数没有拉开差距');
+      await store.logMeal({
+        date: today, slot: 'snack', source: 'manual',
+        items: [{ name: nearName, grams: unit.grams, foodId: single.id, ...macros }],
+      });
+      await store.logMeal({
+        date: today, slot: 'snack', source: 'manual',
+        items: [{ name: farName, grams: farGrams, foodId: single.id, ...macros }],
+      });
+
+      const root = await renderView('food');
+      const rows = byClass(root, 'list__item');
+      const nearRow = rows.find((n) => n.textOf().includes(nearName));
+      assert.ok(nearRow, '餐次列表里找不到接近单位的那条');
+      assert.ok(nearRow.textOf().includes(`≈${unit.name}`), `接近单位时应显示参照：${nearRow.textOf()}`);
+      const farRow = rows.find((n) => n.textOf().includes(farName));
+      assert.ok(farRow, '餐次列表里找不到差距大的那条');
+      assert.ok(!farRow.textOf().includes('≈'), `差距大时不该显示参照：${farRow.textOf()}`);
+    });
+
+    await checkAsync('food 编辑已有条目的份量层：单位 chip 可点并换算克数', async () => {
+      const foodView = await import('../views/food.js');
+      const foodsMod = await import('../js/foods.js');
+      const single = foodsMod.FOODS.find((f) => f && f.name && foodView.unitsOf(f).length === 1);
+      assert.ok(single, '食物库里找不到单单位食物');
+      const unit = foodView.unitsOf(single)[0];
+      const name = `份量编辑测试-${single.id}`;
+      await store.logMeal({
+        date: today, slot: 'snack', source: 'manual',
+        items: [{ name, grams: Math.round(unit.grams * 2), foodId: single.id, kcal: 100, carb: 10, protein: 5, fat: 3 }],
+      });
+      const root = await renderView('food');
+      const row = byClass(root, 'list__item').find((n) => n.textOf().includes(name));
+      assert.ok(row, '餐次列表里找不到测试条目');
+      fireClick(findButton(row, '份量'));
+      await tick(100);
+
+      const sheet = dom.body.childNodes.find((n) => n.className === 'sheet-backdrop');
+      assert.ok(sheet, '点「份量」没有打开编辑层');
+      const chips = byClass(sheet, 'portion-chip--unit');
+      assert.equal(chips.length, 1, `编辑层应渲染该食物的 1 个单位 chip：${chips.length}`);
+      assert.ok(chips[0].textOf().includes(`${unit.grams}g`), `编辑层 chip 没写明克数：${chips[0].textOf()}`);
+      const input = sheet.walk().find((n) => n.tagName === 'input' && (n.type === 'number' || n.attributes.type === 'number'));
+      assert.ok(input, '编辑层没有克数输入框');
+      fireClick(chips[0]);
+      assert.equal(Number(input.value), unit.grams, '点单位 chip 后克数没有换算成该单位');
+      assert.ok(byClass(sheet, 'portion-preview')[0].textOf().includes('kcal'), '编辑层预览没有刷新');
+
+      fireClick(findButton(sheet, '取消'));
+      await tick(80);
+      assert.ok(!dom.body.childNodes.some((n) => n.className === 'sheet-backdrop'), '取消后编辑层没有关闭');
+    });
+
     // ---- 4. 空数据态：不能白屏、不能 NaN ----
     await checkAsync('空数据时 dashboard 不白屏', async () => {
       await store.clearAllData();

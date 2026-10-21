@@ -8,7 +8,9 @@ import {
   getMealTemplates, saveMealTemplate, deleteMealTemplate, recentFoodItems,
 } from '../js/store.js';
 import { fileToDataUrl, analyzeFoodPhoto, MODEL_CANDIDATES } from '../js/vision.js';
-import { searchFoods } from '../js/foods.js';
+import * as foodsLib from '../js/foods.js';
+
+const { searchFoods } = foodsLib;
 
 const SLOTS = [
   { value: 'breakfast', label: '早餐' },
@@ -60,25 +62,228 @@ function clampGrams(value) {
   return Math.max(1, Math.min(2000, Math.round(Number(value) || 0)));
 }
 
+/* ---------- 份量单位（数据层 foodUnits + 旧 unit 字段） ---------- */
+
+// 目测参考：没有厨房秤时的兜底口径，单位层与保存条目层共用同一句文案。
+export const PORTION_REF_TEXT = '1 拳 ≈ 150g · 1 掌心 ≈ 100g · 1 汤匙 ≈ 15g';
+// 克数离常用份量超过这个比例就不给「≈1 碗」参照，避免误导。
+const UNIT_HINT_TOLERANCE = 0.15;
+
+/** 单位归一化：缺 name 或克数非正的脏数据直接丢掉，界面不因数据层扩展而报错。 */
+function normalizeUnits(list) {
+  const out = [];
+  const seen = new Set();
+  for (const unit of Array.isArray(list) ? list : []) {
+    if (!unit) continue;
+    const grams = Math.round(Number(unit.grams));
+    const name = String(unit.name == null ? '' : unit.name).trim();
+    if (!name || !Number.isFinite(grams) || grams <= 0) continue;
+    const key = `${name}|${grams}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ name, grams: clampGrams(grams) });
+  }
+  return out;
+}
+
+/**
+ * 份量单位清单。优先数据层 foodUnits(food)；并行扩展尚未落地（或它抛错）时
+ * 按同一签名退化到旧字段 unit，保证视图层不因数据侧中间状态整页白屏。
+ */
+export function unitsOf(food) {
+  if (!food) return [];
+  if (typeof foodsLib.foodUnits === 'function') {
+    try {
+      return normalizeUnits(foodsLib.foodUnits(food));
+    } catch {
+      /* 数据层脏数据不该炸界面，继续走旧字段 */
+    }
+  }
+  return normalizeUnits(Array.isArray(food.units) ? food.units : [food.unit]);
+}
+
+function foodById(id) {
+  if (!id || !Array.isArray(foodsLib.FOODS)) return null;
+  return foodsLib.FOODS.find((food) => food && food.id === id) || null;
+}
+
+/** 克数接近某个常用份量（±15%）时才返回「≈1 碗」；否则返回空串。 */
+export function unitHintFor(grams, units) {
+  const value = Number(grams);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  let best = null;
+  let bestDiff = Infinity;
+  for (const unit of Array.isArray(units) ? units : []) {
+    const unitGrams = Number(unit && unit.grams);
+    if (!Number.isFinite(unitGrams) || unitGrams <= 0) continue;
+    const diff = Math.abs(value - unitGrams) / unitGrams;
+    if (diff <= UNIT_HINT_TOLERANCE && diff < bestDiff) {
+      best = unit;
+      bestDiff = diff;
+    }
+  }
+  return best ? `≈${best.name}` : '';
+}
+
+/** 已保存条目：能按 foodId 对上库内食物且克数接近某个单位时给参照，取不到就不显示。 */
+export function itemUnitHint(item) {
+  const food = foodById(item && item.foodId);
+  if (!food) return '';
+  return unitHintFor(item.grams, unitsOf(food));
+}
+
+/** 搜索行主单位文案：`1 碗 ≈ 200g`；无单位返回空串。 */
+function mainUnitText(food) {
+  const unit = unitsOf(food)[0];
+  return unit ? `${unit.name} ≈ ${unit.grams}g` : '';
+}
+
+/**
+ * 份量 chip 排：点一下把克数填成该单位并刷新预览，选中态用品牌色。
+ * 没有单位时返回 null（调用方不渲染 chip 区，退化为纯克数输入）。
+ */
+function renderUnitChips({ units, lastGrams, grams, onChange } = {}) {
+  const list = normalizeUnits(units);
+  const last = Number(lastGrams) > 0 ? clampGrams(lastGrams) : 0;
+  if (!list.length) return null;
+
+  const buttons = [];
+  const activate = (key) => {
+    for (const btn of buttons) {
+      const on = btn.dataset.key === key;
+      btn.classList.toggle('is-active', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+  };
+  const choose = (key, value) => {
+    if (grams) grams.value = String(value);
+    activate(key);
+    if (typeof onChange === 'function') onChange();
+  };
+  const row = el('div', { className: 'portion-units chips' });
+
+  list.forEach((unit, index) => {
+    const btn = el('button', {
+      className: 'portion-chip portion-chip--unit',
+      type: 'button',
+      dataset: { key: `unit-${index}`, grams: unit.grams },
+      attr: { 'aria-label': `${unit.name}，${unit.grams} 克`, 'aria-pressed': 'false' },
+      onClick: () => choose(`unit-${index}`, unit.grams),
+    },
+      el('span', { className: 'portion-chip__name', text: unit.name }),
+      el('span', { className: 'portion-chip__g', text: `${unit.grams}g` }),
+    );
+    buttons.push(btn);
+    row.appendChild(btn);
+  });
+
+  const quick = el('button', {
+    className: 'portion-chip portion-chip--quick',
+    type: 'button',
+    dataset: { key: 'quick-100', grams: 100 },
+    attr: { 'aria-label': '100 克', 'aria-pressed': 'false' },
+    onClick: () => choose('quick-100', 100),
+  }, el('span', { text: '100g' }));
+  buttons.push(quick);
+  row.appendChild(quick);
+
+  if (last) {
+    const lastBtn = el('button', {
+      className: 'portion-chip portion-chip--last',
+      type: 'button',
+      dataset: { key: 'last', grams: last },
+      attr: { 'aria-label': `上次 ${last} 克`, 'aria-pressed': 'false' },
+      onClick: () => choose('last', last),
+    }, el('span', { text: `上次 ${last}g` }));
+    buttons.push(lastBtn);
+    row.appendChild(lastBtn);
+  }
+
+  // 初始/实时选中态：克数与某颗 chip 完全一致才高亮，不替用户猜单位。
+  const sync = () => {
+    const value = Number(grams && grams.value);
+    const hit = buttons.find((btn) => Number(btn.dataset.grams) === value);
+    activate(hit ? hit.dataset.key : null);
+  };
+  sync();
+  return { node: row, sync };
+}
+
+/**
+ * 份量详情面板：食物名 + 单位 chip + 克数输入 + 实时营养预览 + 目测参考。
+ * onSubmit(item) 由调用方接到「加入清单 / 就用这道菜」的收尾（关闭弹层等）。
+ */
+export function renderPortionDetail(food, options = {}) {
+  const baseItem = options.baseItem || null;
+  const defaultGrams = Number(options.grams) > 0 ? clampGrams(options.grams) : pickDefaultGrams(food);
+  const grams = el('input', {
+    className: 'input', type: 'number', inputmode: 'decimal', min: '1', max: '2000', step: '1',
+    value: String(defaultGrams), attr: { 'aria-label': `${food.name} 克数` },
+  });
+  const preview = el('div', { className: 'muted portion-preview' });
+  const itemAt = (value) => (baseItem ? rescaleItem(baseItem, value) : scaleFood(food, value));
+  const updatePreview = () => {
+    const item = itemAt(grams.value);
+    preview.textContent = `${fmtKcal(item.kcal)} kcal · 碳水 ${fmt1(item.carb)}g · 蛋白质 ${fmt1(item.protein)}g · 脂肪 ${fmt1(item.fat)}g`;
+  };
+  const chipRow = renderUnitChips({
+    units: unitsOf(food),
+    lastGrams: baseItem && baseItem.grams,
+    grams,
+    onChange: updatePreview,
+  });
+  grams.addEventListener('input', () => {
+    updatePreview();
+    if (chipRow) chipRow.sync();
+  });
+  updatePreview();
+
+  const submit = el('button', {
+    className: 'btn btn--primary btn--block',
+    text: options.dishMode ? '就用这道菜' : '加入清单',
+    onClick: () => {
+      const value = Number(grams.value);
+      if (!Number.isFinite(value) || value <= 0) {
+        toast('请填写克数', 'error');
+        return;
+      }
+      if (typeof options.onSubmit === 'function') options.onSubmit(itemAt(value));
+    },
+  });
+
+  return el('div', { className: 'col portion-detail' },
+    el('div', { className: 'row row--between divider' },
+      el('div', { className: 'row' },
+        el('span', { className: 'strong', text: food.name }),
+        isDish(food) ? el('span', { className: 'pill pill--dish', text: '菜' }) : null,
+      ),
+      el('span', { className: 'muted', text: `每 100g ${fmtKcal(food.per100g && food.per100g.kcal)} kcal` }),
+    ),
+    chipRow ? chipRow.node : null,
+    el('label', { className: 'field' }, el('span', { className: 'field__label', text: '克数' }), grams),
+    preview,
+    el('div', { className: 'portion-ref', text: PORTION_REF_TEXT }),
+    submit,
+  );
+}
+
 // 复合菜在数据侧用 kind === 'dish' 标记（另一人并行补数据，字段可能暂时缺失）。
 // 判定只认这一个字段：缺失 / 其它值一律按原料处理，不抛错。
 export function isDish(food) {
   return Boolean(food && food.kind === 'dish');
 }
 
-/** 整份克数：优先单位换算（1 盘 ≈ 300g），缺省 200g。 */
+/** 整份克数：优先第一个常用单位（1 盘 ≈ 300g），缺省 200g。 */
 export function defaultDishGrams(food) {
-  const unitGrams = Number(food && food.unit && food.unit.grams);
-  if (Number.isFinite(unitGrams) && unitGrams > 0) return clampGrams(unitGrams);
-  return 200;
+  const unit = unitsOf(food)[0];
+  return unit ? clampGrams(unit.grams) : 200;
 }
 
-/** 选中食物时份量框默认值：菜品按整份算，原料沿用 unit.grams 或 100g。 */
+/** 选中食物时份量框默认值：菜品按整份算，原料沿用首个单位或 100g。 */
 export function pickDefaultGrams(food) {
-  if (isDish(food)) return defaultDishGrams(food);
-  const unitGrams = Number(food && food.unit && food.unit.grams);
-  if (Number.isFinite(unitGrams) && unitGrams > 0) return clampGrams(unitGrams);
-  return 100;
+  const unit = unitsOf(food)[0];
+  if (unit) return clampGrams(unit.grams);
+  return isDish(food) ? 200 : 100;
 }
 
 /** 搜索结果排序：菜品整体前置，两组内保持库内相对顺序。 */
@@ -218,6 +423,7 @@ function renderTemplateCard(templates, date, reload) {
 /**
  * 最近吃过的条目 → 详情层需要的「类食物」对象。
  * 营养值按上次的克数折回每 100g；真正的换算仍走 baseItem，避免二次取整漂移。
+ * 条目带 foodId 且能对上库内食物时，把常用份量一并带过去，最近吃过的详情层同样能选单位。
  */
 export function recentToFood(entry) {
   const item = (entry && entry.item) || {};
@@ -227,17 +433,21 @@ export function recentToFood(entry) {
     if (item[key] == null) continue;
     per100g[key] = (Number(item[key]) || 0) * 100 / grams;
   }
-  return {
+  const out = {
     id: item.foodId,
     name: String((entry && entry.name) || item.name || '食物'),
     per100g,
   };
+  const food = foodById(item.foodId);
+  if (food) out.units = unitsOf(food);
+  return out;
 }
 
-/** 搜索结果单行：菜品带「菜」徽标，原料不带。 */
+/** 搜索结果单行：菜品带「菜」徽标，原料不带；主单位并进元信息行，保持两行以内。 */
 export function renderPickRow(food, onPick) {
   const meta = [`${fmtKcal(food.per100g && food.per100g.kcal)} kcal / 100g`];
-  if (food.unit) meta.push(`1 ${food.unit.name}=${food.unit.grams}g`);
+  const unitText = mainUnitText(food);
+  if (unitText) meta.push(unitText);
   return el('button', {
     className: 'list__item pick-item', type: 'button',
     onClick: onPick,
@@ -466,56 +676,12 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
       // options.baseItem 有值时按它等比缩放，保住上次记录里的原始数值。
       const showDetail = (food, options = {}) => {
         clear(detail);
-        const baseItem = options.baseItem || null;
-        const defaultGrams = Number(options.grams) > 0 ? clampGrams(options.grams) : pickDefaultGrams(food);
-        const unitText = food.unit ? `1 ${food.unit.name} ≈ ${food.unit.grams}g` : '';
-        const grams = el('input', { className: 'input', type: 'number', inputmode: 'decimal', min: '1', max: '2000', step: '1', value: String(defaultGrams) });
-        const preview = el('div', { className: 'muted' });
-        const itemAt = (value) => (baseItem ? rescaleItem(baseItem, value) : scaleFood(food, value));
-        const updatePreview = () => {
-          const item = itemAt(grams.value);
-          preview.textContent = `${fmtKcal(item.kcal)} kcal · 碳水 ${fmt1(item.carb)}g · 蛋白质 ${fmt1(item.protein)}g · 脂肪 ${fmt1(item.fat)}g`;
-        };
-        grams.addEventListener('input', updatePreview);
-        updatePreview();
-        const quick = [];
-        if (food.unit) {
-          quick.push(el('button', {
-            className: 'chip', text: `1 ${food.unit.name} ≈ ${food.unit.grams}g`,
-            onClick: () => { grams.value = String(food.unit.grams); updatePreview(); },
-          }));
-        }
-        if (baseItem && Number(baseItem.grams) > 0) {
-          quick.push(el('button', {
-            className: 'chip', text: `上次 ${clampGrams(baseItem.grams)}g`,
-            onClick: () => { grams.value = String(clampGrams(baseItem.grams)); updatePreview(); },
-          }));
-        }
-        quick.push(el('button', {
-          className: 'chip', text: '100g',
-          onClick: () => { grams.value = '100'; updatePreview(); },
+        detail.appendChild(renderPortionDetail(food, {
+          baseItem: options.baseItem || null,
+          grams: options.grams,
+          dishMode: isDishMode,
+          onSubmit: (item) => close({ food, item }),
         }));
-        const detailParts = [
-          el('div', { className: 'row row--between divider' },
-            el('div', { className: 'row' },
-              el('span', { className: 'strong', text: food.name }),
-              isDish(food) ? el('span', { className: 'pill pill--dish', text: '菜' }) : null,
-            ),
-            el('span', { className: 'muted', text: `每 100g ${fmtKcal(food.per100g && food.per100g.kcal)} kcal` }),
-          ),
-          el('div', { className: 'row chips' }, quick),
-          el('label', { className: 'field' }, el('span', { className: 'field__label', text: unitText ? `克数（${unitText}）` : '克数' }), grams),
-          preview,
-          el('button', {
-            className: 'btn btn--primary btn--block', text: isDishMode ? '就用这道菜' : '加入清单',
-            onClick: () => {
-              const g = Number(grams.value);
-              if (!Number.isFinite(g) || g <= 0) { toast('请填写克数', 'error'); return; }
-              close({ food, item: itemAt(g) });
-            },
-          }),
-        ];
-        for (const part of detailParts) detail.appendChild(part);
       };
 
       // 「最近吃过」：无数据整块不渲染，点一下直接进份量编辑（默认克数取上次）。
@@ -719,18 +885,26 @@ async function manualFlow(date, reload) {
 async function editMealPortion(meal, index, reload) {
   const item = meal.items[index];
   const grams = el('input', { className: 'input', type: 'number', value: String(item.grams), min: '1', max: '2000', step: '1' });
-  const preview = el('div', { className: 'muted' });
+  const preview = el('div', { className: 'muted portion-preview' });
   const update = () => {
     const next = rescaleItem(item, grams.value);
     preview.textContent = `${fmtKcal(next.kcal)} kcal · 碳水 ${fmt1(next.carb)}g · 蛋白质 ${fmt1(next.protein)}g · 脂肪 ${fmt1(next.fat)}g`;
   };
-  grams.addEventListener('input', update);
+  // 条目存的是 foodId：能对上库内食物就把它的常用单位摆出来，选中即换算克数。
+  const food = foodById(item.foodId);
+  const chipRow = renderUnitChips({ units: unitsOf(food), grams, onChange: update });
+  grams.addEventListener('input', () => {
+    update();
+    if (chipRow) chipRow.sync();
+  });
   update();
   const action = await openSheet({
     title: `修改份量 · ${item.name}`,
     content: el('div', { className: 'col' },
+      chipRow ? chipRow.node : null,
       el('label', { className: 'field' }, el('span', { className: 'field__label', text: '克数' }), grams),
       preview,
+      el('div', { className: 'portion-ref', text: PORTION_REF_TEXT }),
     ),
     actions: [{ text: '保存', value: 'save', primary: true }, { text: '取消', value: null }],
   });
@@ -777,13 +951,14 @@ function renderMealCard(meal, reload) {
   );
   const list = el('div', { className: 'list' });
   (meal.items || []).forEach((item, index) => {
+    const hint = itemUnitHint(item);
     list.appendChild(el('div', { className: 'list__item' },
       el('div', { className: 'list__item--main' },
         el('div', { className: 'row' },
           el('span', { className: 'strong', text: item.name }),
           item.confidence ? confidencePill(item.confidence) : null,
         ),
-        el('div', { className: 'list__item--meta', text: `${item.grams}g · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
+        el('div', { className: 'list__item--meta', text: `${item.grams}g${hint ? `（${hint}）` : ''} · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
       ),
       el('button', {
         className: 'btn btn--ghost btn--sm', text: '份量',

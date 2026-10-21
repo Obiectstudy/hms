@@ -12,7 +12,7 @@ import {
   analyzeFoodPhoto,
   testConnection,
 } from '../js/vision.js';
-import { FOODS, searchFoods, findFood, calibrateItems } from '../js/foods.js';
+import { FOODS, searchFoods, findFood, calibrateItems, foodUnits } from '../js/foods.js';
 
 const results = { passed: 0, failed: 0, failures: [] };
 
@@ -646,6 +646,145 @@ test('parseModelJson：解析模型新增的 kind 与 unit 提示', () => {
   const fromUnit = parseModelJson('{"items":[{"name":"红烧茄子","kind":"菜品","unit":{"name":"1 盘","grams":250},"kcal":330}]}');
   eq(fromUnit.items[0].kind, 'dish', '中文 kind');
   eq(fromUnit.items[0].grams, 250, '缺 grams 时用 unit.grams');
+});
+
+// ---------------------------------------------------------------- v1.6 食物粒度 / 份量单位 / 提示词
+
+test('v1.6：findFood("去皮鸡腿") 命中 skin=off 条目且热量明显低于带皮', () => {
+  const off = findFood('去皮鸡腿');
+  assert(off, '未命中「去皮鸡腿」');
+  assert(off.skin === 'off' || /去皮/.test(off.name), `命中项没有去皮标记：${off.name}`);
+  assert(/鸡腿/.test(off.name), `应命中鸡腿类条目，实际 ${off.name}`);
+  const on = FOODS.find((f) => f.skin === 'on' && /鸡腿/.test(f.name) && f.state === 'raw');
+  assert(on, '库内缺少带皮鸡腿（生）');
+  assert(off.per100g.kcal < on.per100g.kcal * 0.8, `去皮 ${off.per100g.kcal} 应明显低于带皮 ${on.per100g.kcal}`);
+});
+
+test('v1.6：去皮鸡腿的常见别名都落到同一条', () => {
+  const base = findFood('去皮鸡腿');
+  for (const alias of ['鸡腿去皮', '无皮鸡腿', '鸡腿肉去皮']) {
+    const hit = findFood(alias);
+    assert(hit && hit.id === base.id, `${alias} 命中了 ${hit?.name}`);
+  }
+});
+
+test('v1.6：findFood("鸡胸肉") 命中，生/熟两条能按括号名分别命中', () => {
+  const generic = findFood('鸡胸肉');
+  assert(generic, '未命中「鸡胸肉」');
+  const raw = findFood('鸡胸肉（生）');
+  const cooked = findFood('鸡胸肉（熟）');
+  assert(raw && cooked && raw.id !== cooked.id, '生/熟应是两条不同数据');
+  assert(raw.state === 'raw' && cooked.state === 'cooked', '生/熟 state 标记错误');
+  assert(cooked.per100g.kcal > raw.per100g.kcal, `熟 ${cooked.per100g.kcal} 应高于生 ${raw.per100g.kcal}`);
+});
+
+test('v1.6：foodUnits 归一化（units / 只有 unit / 都没有 / 过滤脏数据）', () => {
+  eq(foodUnits({ units: [{ name: '1 只', grams: 90 }, { name: '1 盘', grams: 200 }] }), [{ name: '1 只', grams: 90 }, { name: '1 盘', grams: 200 }], 'units 优先');
+  eq(foodUnits({ unit: { name: '1 碗', grams: 200 } }), [{ name: '1 碗', grams: 200 }], '只有 unit');
+  eq(foodUnits({ name: '无单位' }), [], '都没有返回空数组');
+  eq(foodUnits(null), [], 'null 安全');
+  eq(foodUnits({ units: [{ name: '坏', grams: 0 }, { name: '坏2', grams: Number.NaN }, { name: '好', grams: 50 }] }), [{ name: '好', grams: 50 }], '过滤非法 grams');
+  eq(foodUnits({ units: [], unit: { name: '1 盒', grams: 250 } }), [{ name: '1 盒', grams: 250 }], '空 units 回落 unit');
+  const frozen = deepFreeze({ units: [{ name: '1 个', grams: 50 }] });
+  const norm = foodUnits(frozen);
+  norm[0].grams = 1;
+  eq(frozen.units[0].grams, 50, 'foodUnits 返回副本，不修改入参');
+});
+
+test('v1.6：库内所有 units 合法（名称非空、克数 5–1000、同名不重复、unit=units[0]）', () => {
+  const bad = [];
+  let count = 0;
+  for (const food of FOODS) {
+    if (!Array.isArray(food.units)) continue;
+    count++;
+    const seen = new Set();
+    for (const unit of food.units) {
+      if (!unit || typeof unit.name !== 'string' || !unit.name.trim()) { bad.push(`${food.name}(单位名空)`); continue; }
+      if (typeof unit.grams !== 'number' || !Number.isFinite(unit.grams) || unit.grams < 5 || unit.grams > 1000) bad.push(`${food.name}(${unit.name}=${unit.grams})`);
+      if (seen.has(unit.name)) bad.push(`${food.name}(单位重名 ${unit.name})`);
+      seen.add(unit.name);
+    }
+    if (food.units.length && food.unit && (food.unit.name !== food.units[0].name || food.unit.grams !== food.units[0].grams)) bad.push(`${food.name}(unit≠units[0])`);
+  }
+  assert(count >= 200, `带 units 的食物只有 ${count} 条`);
+  eq(bad, [], '非法份量单位');
+});
+
+test('v1.6：同一食物的生/熟两条都在，熟的热量必须更高（水分流失）', () => {
+  const pairs = [
+    ['chicken-breast-raw', 'chicken-breast-cooked'],
+    ['chicken-leg-skin-off-raw', 'chicken-leg-skin-off-cooked'],
+    ['chicken-leg-skin-on-raw', 'chicken-leg-skin-on-cooked'],
+    ['pork-hind-leg-lean-raw', 'pork-hind-leg-lean-cooked'],
+    ['pork-belly-raw', 'pork-belly-cooked'],
+    ['beef-shank-raw', 'beef-shank-cooked'],
+    ['beef-brisket-raw', 'beef-brisket-cooked'],
+    ['salmon-raw', 'salmon-cooked'],
+    ['shrimp-raw', 'shrimp-cooked'],
+    ['whole-egg-raw', 'boiled-egg'],
+  ];
+  for (const [rawId, cookedId] of pairs) {
+    const raw = FOODS.find((f) => f.id === rawId);
+    const cooked = FOODS.find((f) => f.id === cookedId);
+    assert(raw && cooked, `缺少生/熟条目：${rawId} / ${cookedId}`);
+    assert(raw.state === 'raw' && cooked.state === 'cooked', `${rawId}/${cookedId} 的 state 标记不对`);
+    assert(cooked.per100g.kcal > raw.per100g.kcal, `${cooked.name}(${cooked.per100g.kcal}) 应高于 ${raw.name}(${raw.per100g.kcal})`);
+  }
+});
+
+test('v1.6：带皮/去皮是两条数据，去皮热量更低', () => {
+  const pairs = [
+    ['chicken-leg-skin-on-raw', 'chicken-leg-skin-off-raw'],
+    ['chicken-leg-skin-on-cooked', 'chicken-leg-skin-off-cooked'],
+    ['chicken-wing-skin-on-raw', 'chicken-wing-skin-off-raw'],
+  ];
+  for (const [onId, offId] of pairs) {
+    const on = FOODS.find((f) => f.id === onId);
+    const off = FOODS.find((f) => f.id === offId);
+    assert(on && off, `缺少带皮/去皮条目：${onId} / ${offId}`);
+    assert(on.skin === 'on' && off.skin === 'off', `${onId}/${offId} 的 skin 标记不对`);
+    assert(off.per100g.kcal < on.per100g.kcal * 0.85, `${off.name}(${off.per100g.kcal}) 应明显低于 ${on.name}(${on.per100g.kcal})`);
+  }
+});
+
+test('v1.6：buildPrompt 要求部位/去皮/生熟写进名字，并给份量单位与克数', () => {
+  const prompt = buildPrompt();
+  for (const token of ['部位', '去皮', '生熟', '带皮', '1 只（去皮，去骨）', '鸡腿（去皮，熟）', '油炸', '水煮']) {
+    assert(prompt.includes(token), `提示词缺少关键词：${token}`);
+  }
+  assert(/unit/.test(prompt) && /grams/.test(prompt), '缺少 unit/grams 要求');
+});
+
+test('v1.6：新增 ≥120 条高粒度数据，part/skin/state 已启用', () => {
+  const baseline = 526; // v1.5 的库容量，v1.6 起追加高粒度条目
+  assert(FOODS.length - baseline >= 120, `新增仅 ${FOODS.length - baseline} 条`);
+  const withPart = FOODS.filter((f) => typeof f.part === 'string' && f.part.trim());
+  const skinOff = FOODS.filter((f) => f.skin === 'off');
+  const skinOn = FOODS.filter((f) => f.skin === 'on');
+  const raw = FOODS.filter((f) => f.state === 'raw');
+  const cooked = FOODS.filter((f) => f.state === 'cooked');
+  assert(withPart.length >= 30, `part 只有 ${withPart.length} 条`);
+  assert(skinOff.length >= 5 && skinOn.length >= 5, `skin off/on 覆盖不足：${skinOff.length}/${skinOn.length}`);
+  assert(raw.length >= 10 && cooked.length >= 10, `生/熟覆盖不足：${raw.length}/${cooked.length}`);
+});
+
+test('v1.6：新增条目全部带 1–3 个真实份量，且不糊弄成「1 份」', () => {
+  const added = FOODS.slice(526);
+  assert(added.length >= 120, `新增仅 ${added.length} 条`);
+  const bad = added.filter((f) => !Array.isArray(f.units) || f.units.length === 0 || f.units.length > 3).map((f) => `${f.name}(${f.units ? f.units.length : '无'})`);
+  eq(bad, [], '新增条目的 units 缺失或超过 3 个');
+  const vague = added.filter((f) => f.units.every((u) => /^1 ?份$/.test(u.name))).map((f) => f.name);
+  eq(vague, [], '新增条目不应只用「1 份」');
+});
+
+test('v1.6：份量单位覆盖只/片/把/勺/盒等真实单位，不再只有碗和克重', () => {
+  const names = new Set();
+  for (const food of FOODS) for (const unit of foodUnits(food)) names.add(unit.name.replace(/\d+/g, ''));
+  const text = [...names].join(' ');
+  for (const token of ['只', '片', '把', '勺', '盒', '根', '块', '个', '碗']) {
+    assert(text.includes(token), `单位里缺少「${token}」`);
+  }
+  assert(names.size >= 20, `单位种类只有 ${names.size} 种`);
 });
 
 // ---------------------------------------------------------------- 环境边界

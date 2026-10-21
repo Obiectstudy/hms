@@ -183,8 +183,15 @@ export async function exportStatus(): Promise<{ lastExportedAt: number|null, day
 
 ```js
 export const FOODS: Food[]
-//  Food = { id, name, kind?: 'ingredient'|'dish', aliases?: string[], per100g: { kcal, carb, protein, fat, fiber?, sodium? },
-//           unit?: { name: string, grams: number } }
+//  Food = { id, name, kind?: 'ingredient'|'dish', aliases?: string[],
+//           part?: '胸'|'腿'|'翅'|'里脊'|'腩'|'五花'…,   // 部位
+//           skin?: 'on'|'off',                          // 带皮 / 去皮
+//           state?: 'raw'|'cooked',                     // 生 / 熟
+//           per100g: { kcal, carb, protein, fat, fiber?, sodium? },
+//           units?: Array<{ name: string, grams: number, note?: string }>,  // 常用份量，第一条为主单位
+//           unit?: { name: string, grams: number } }    // 兼容旧结构，必须等于 units[0]
+export function foodUnits(food): Array<{ name, grams }>
+//  units 优先 → 只有 unit 返回 [unit] → 都没有返回 []；过滤空名/非有限/≤0 的项；返回副本
 export function searchFoods(query, limit = 20): Food[]   // 空 query 返回热门前 limit 条；菜品（kind==='dish'）排在原料之前
 export function findFood(name): Food|null                // 精确 → 去修饰词 → 别名 → 包含匹配，取最相似
 export function calibrateItems(items): MealItem[]         // 见 8.3
@@ -336,6 +343,11 @@ body：
 - 每项输出 `{ name, grams, kcal, carb, protein, fat, fiber?, sodium?, confidence, kind, unit? }`，其中 `kind ∈ 'dish'|'ingredient'`、`unit` 为份量提示（如 `"1 盘"`）。
 - 成品菜按整份估算克数；无法确定时给合理估计并把 `confidence` 设为 `low`。
 - 提示词内置 **56 个高频标准菜名**（`STANDARD_DISHES`，全部取自库内），引导模型使用与本库一致的叫法，提高校准命中率。
+- **名称要写到能区分的颗粒度**：能判断「部位」（胸/腿/翅/里脊/腩/五花）、「是否去皮」、「生熟」时，必须写进食物名，
+  例如「鸡腿（去皮，熟）」「鸡胸肉（生）」「三文鱼（熟）」，不要只写笼统的「鸡腿」「鸡肉」「鱼」。判断不出就不要编。
+- **健身人群最在意三组差异**，优先判断并写进名字：瘦/肥（里脊 vs 五花）、去皮/带皮（鸡腿带皮约 181 kcal/100g，去皮约 120）、
+  水煮清蒸 vs 油炸红烧（同一种食材热量可差一倍）。
+- 每项都要给份量单位 `unit`（如 "1 只（去皮，去骨）"、"1 碗"、"1 片"、"1 个"）与该单位对应的 `grams`，而不是只给总克数。
 - 只输出 `{"items":[…]}`，不要解释文字。
 
 ### 8.3 结果校准（`calibrateItems`）
@@ -424,3 +436,15 @@ body：
   `views/food.js` 修一处 `kcal·` 空格。
 - **未改动**：任何 DOM 结构、类名、交互逻辑；所有既有测试断言原样通过。
 - **配色原则**：单一品牌绿 + 薄荷底，宏量三色（碳水橙/蛋白蓝/脂肪紫）作为唯一的多彩色块，其余保持中性。
+
+### v1.6 · 2026-10-21 · 食物粒度与份量单位
+- **背景**：用户（健身减脂）反馈「需要知道**去皮鸡腿**的营养，而不只是鸡腿」「份量只有碗和克，不够明确」。
+- **数据**：`Food` 新增 `part / skin / state / units` 四个字段，`unit` 归一为 `units[0]`；库容量 526 → **651**
+  （dish 416 / ingredient 235），**578 条**带常用份量；新增 125 条高粒度条目（鸡胸/鸡腿/鸡翅的生熟与去皮、五花、牛腱、
+  三文鱼、虾仁、蛋白蛋黄、希腊酸奶、燕麦干熟、意面干熟、蛋白粉、减脂餐…）。
+- **关键差值**（必须成立，闸门会校验）：鸡腿带皮 181 / 去皮 120 kcal·100g⁻¹；鸡胸生 118 / 熟 165；
+  三文鱼生 139 / 熟 206；虾仁生 48 / 熟 99。熟高于生是水分流失的必然结果。
+- **别名**：`findFood('去皮鸡腿'|'鸡腿去皮'|'无皮鸡腿'|'鸡腿肉去皮')` 全部命中 `chicken-leg-skin-off-raw`。
+- **提示词**：见 §8.2 新增的四条（颗粒度、健身三组差异、unit+grams）。
+- **界面**：详情层给单位 chip（名称 + 克数，点击即填克数），搜索行显示主单位，已保存条目在 ±15% 内显示「≈1 碗」参照。
+- **未验证**：本轮不发布 APK，手机端仍是旧库；详情层 chip 的像素观感需真机确认（自动化为 DOM 断言）。
