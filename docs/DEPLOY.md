@@ -92,3 +92,19 @@ git push
 - 视觉识别的 API Key 保存在**手机浏览器本地**（IndexedDB），不进代码、不进仓库；但它就在这个设备上，手机借人时注意。
 - 体重、饮食等记录只在本机，不上传。**换手机/清缓存前先导出 JSON**。
 - 每次调用识别会把照片发给阿里百炼；照片同时留一份在本地 IndexedDB（用于记录详情展示）。
+
+## 8. 推送通道（本机特有，坏的时候看这里）
+
+本机 Clash 只提供 HTTP 代理（`127.0.0.1:7897`），**不接管系统 TCP**，所以 GitHub 的 22 端口直连会超时。
+解决办法是给 SSH 挂一个 HTTP CONNECT 隧道，不依赖 Clash 的 TUN 模式：
+
+- `C:\Users\Administrator\.ssh\proxy-connect.py` —— 把 stdio 桥接到 `CONNECT host:port` 的隧道脚本
+- `C:\Users\Administrator\.ssh\config` —— `Host github.com` 下配置 `ProxyCommand python ...proxy-connect.py %h %p`
+
+排查顺序：
+1. `ssh -T git@github.com` 应回 `Hi Obiectstudy!`；
+2. 若回 `Permission denied` → 密钥没加到 GitHub 或 `~/.ssh/config` 被改；
+3. 若超时 → 代理没开（`Test-NetConnection 127.0.0.1 -Port 7897`）；
+4. 若命令卡住不返回 → 隧道脚本缺 `os._exit(0)`（服务端关闭时必须强退，否则 ssh 与子进程互相等待）。
+
+注意：不要在 `core.sshCommand` 里再写一遍 `-i` 与 `ProxyCommand`（引号会被 git 吞掉导致配置不生效），统一放在 `~/.ssh/config`。
