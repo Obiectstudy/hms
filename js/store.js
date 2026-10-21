@@ -23,6 +23,7 @@ import {
   normalizeRecord,
   normalizeMealTemplates,
   planMealTemplateSave,
+  planDayTemplateSave,
   removeMealTemplate,
   collectRecentFoodItems,
   daysSinceExport,
@@ -292,6 +293,17 @@ export async function getMealTemplates() {
 export async function saveMealTemplate({ name, slot, items } = {}) {
   const existing = await getMealTemplates();
   const { templates, template } = planMealTemplateSave(existing, { name, slot, items });
+  await db.setMeta(MEAL_TEMPLATES_KEY, templates);
+  return template;
+}
+
+/**
+ * 整日套餐（一键记一整天的多餐）。与单餐套餐共用 mealTemplates 这一个 meta 键、
+ * 同一套同名覆盖语义；meals 归一化后不足 2 餐或空名抛中文错误。
+ */
+export async function saveDayTemplate({ name, meals } = {}) {
+  const existing = await getMealTemplates();
+  const { templates, template } = planDayTemplateSave(existing, { name, meals });
   await db.setMeta(MEAL_TEMPLATES_KEY, templates);
   return template;
 }

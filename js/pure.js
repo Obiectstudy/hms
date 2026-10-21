@@ -187,16 +187,35 @@ export function planImport(store, existingRows, incomingRows) {
 // ---------- 套餐模板（meta.mealTemplates） ----------
 // 套餐存在 meta 里而不是新 object store：加 store 要抬 IDB 版本号，
 // 老设备的升级失败率远高于这点收益。脏数据一律过滤，绝不抛。
+// 两种形状共用同一个 id/name 空间：单餐 kind='meal'（slot+items），整日 kind='day'（meals ≥ 2）。
+// v1.4 之前落库的记录没有 kind，一律按单餐识别 —— 老数据不需要用户重存。
 
-/** 单条套餐：id 与 name 缺一不可，其余字段按记录契约兜底。 */
+/** 整日套餐的餐次：非法 slot 回退 snack，空 items 的餐次直接剔除。 */
+export function normalizeDayMeals(meals) {
+  const out = [];
+  for (const rec of Array.isArray(meals) ? meals : []) {
+    if (!rec || typeof rec !== 'object') continue;
+    const items = normalizeItems(rec.items);
+    if (!items.length) continue;
+    out.push({ slot: SLOTS.includes(rec.slot) ? rec.slot : 'snack', items });
+  }
+  return out;
+}
+
+/** 单条套餐：id 与 name 缺一不可；kind='day' 的 meals 归一化后不足 2 餐视为非法。 */
 export function normalizeMealTemplate(rec) {
   if (!rec || typeof rec !== 'object') return null;
   const id = rec.id == null ? '' : String(rec.id).trim();
   const name = text(rec.name);
   if (!id || !name) return null;
+  if (rec.kind === 'day') {
+    const meals = normalizeDayMeals(rec.meals);
+    return meals.length >= 2 ? { id, name, kind: 'day', meals } : null;
+  }
   return {
     id,
     name,
+    kind: 'meal',
     slot: SLOTS.includes(rec.slot) ? rec.slot : 'snack',
     items: normalizeItems(rec.items),
   };
@@ -216,7 +235,7 @@ export function normalizeMealTemplates(rows) {
 }
 
 /**
- * 保存套餐的纯逻辑（不碰 IDB）：name 去首尾空格，同名覆盖并保留原 id。
+ * 保存单餐套餐的纯逻辑（不碰 IDB）：name 去首尾空格，同名覆盖并保留原 id。
  * now 只在新建时用来生成 id（String(now)），测试可注入固定时间。
  */
 export function planMealTemplateSave(existing, input, now = Date.now()) {
@@ -229,7 +248,8 @@ export function planMealTemplateSave(existing, input, now = Date.now()) {
 
   const index = list.findIndex((t) => t.name === name);
   if (index >= 0) {
-    const template = { ...list[index], name, slot, items };
+    // 显式重建而不是展开旧对象：被同名整日套餐覆盖时不能把 meals 键留下来
+    const template = { id: list[index].id, name, kind: 'meal', slot, items };
     list[index] = template;
     return { templates: list, template: { ...template } };
   }
@@ -238,7 +258,34 @@ export function planMealTemplateSave(existing, input, now = Date.now()) {
   let stamp = Math.trunc(num(now, Date.now()));
   // 同一毫秒内连存两个新套餐时，硬撞 id 会把前一个顶掉：顺延到下一个空位
   while (used.has(String(stamp))) stamp += 1;
-  const template = { id: String(stamp), name, slot, items };
+  const template = { id: String(stamp), name, kind: 'meal', slot, items };
+  list.push(template);
+  return { templates: list, template: { ...template } };
+}
+
+/**
+ * 保存整日套餐的纯逻辑：与单餐套餐同一套名称覆盖语义（同名保留原 id）。
+ * meals 归一化后不足 2 餐（空数组、全非法、或只剩一餐）抛中文错。
+ */
+export function planDayTemplateSave(existing, input, now = Date.now()) {
+  const list = normalizeMealTemplates(existing);
+  const src = input && typeof input === 'object' ? input : {};
+  const name = text(src.name);
+  if (!name) throw new Error('套餐名称不能为空');
+  const meals = normalizeDayMeals(src.meals);
+  if (meals.length < 2) throw new Error('整日套餐至少要有一餐');
+
+  const index = list.findIndex((t) => t.name === name);
+  if (index >= 0) {
+    const template = { id: list[index].id, name, kind: 'day', meals };
+    list[index] = template;
+    return { templates: list, template: { ...template } };
+  }
+
+  const used = new Set(list.map((t) => t.id));
+  let stamp = Math.trunc(num(now, Date.now()));
+  while (used.has(String(stamp))) stamp += 1;
+  const template = { id: String(stamp), name, kind: 'day', meals };
   list.push(template);
   return { templates: list, template: { ...template } };
 }

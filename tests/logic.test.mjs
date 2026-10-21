@@ -664,6 +664,98 @@ function testMealTemplatePure() {
     deep(pure.removeMealTemplate(b.templates, a.template.id).map((t) => t.name), ['B']);
     deep(pure.removeMealTemplate(b.templates, '不存在').map((t) => t.name), ['A', 'B']);
   });
+
+  check('normalizeMealTemplates 老记录无 kind 补 meal，整日套餐按 kind=day 归一化', () => {
+    const rows = pure.normalizeMealTemplates([
+      { id: 'old1', name: '老单餐', slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+      {
+        id: 'day1',
+        name: '整日',
+        kind: 'day',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }] },
+          { slot: 'brunch', items: [{ name: '牛奶', grams: 250, kcal: 140 }] },
+          { slot: 'dinner', items: [] },
+        ],
+      },
+      { id: 'day2', name: '只剩一餐', kind: 'day', meals: [{ slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] }] },
+      { id: 'day3', name: '坏整日', kind: 'day', meals: 'oops' },
+    ]);
+    deep(rows.map((t) => t.id), ['old1', 'day1']);
+    eq(rows[0].kind, 'meal', '老记录必须归一化成单餐套餐');
+    eq(rows[0].slot, 'lunch');
+    eq(rows[0].items[0].name, '米饭');
+    eq(rows[0].items[0].grams, 150);
+    eq('meals' in rows[0], false, '单餐套餐不应带 meals 键');
+    eq(rows[1].kind, 'day');
+    deep(rows[1].meals.map((m) => m.slot), ['breakfast', 'snack'], '非法 slot 回退 snack，空 items 餐次剔除');
+    eq('slot' in rows[1], false, '整日套餐不应带单餐 slot 键');
+  });
+
+  check('normalizeDayMeals 非数组/非对象条目一律丢弃', () => {
+    deep(pure.normalizeDayMeals('oops'), []);
+    deep(pure.normalizeDayMeals(null), []);
+    deep(pure.normalizeDayMeals([null, 'x', { slot: 'lunch' }]), []);
+  });
+
+  check('planDayTemplateSave 同名覆盖保留 id，空名/不足两餐抛中文错', () => {
+    const first = pure.planDayTemplateSave(
+      [],
+      {
+        name: ' 整日减脂餐 ',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }] },
+          { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+        ],
+      },
+      3000,
+    );
+    eq(first.template.id, '3000');
+    eq(first.template.name, '整日减脂餐');
+    eq(first.template.kind, 'day');
+    deep(first.template.meals.map((m) => m.slot), ['breakfast', 'lunch']);
+    eq(first.templates.length, 1);
+
+    const second = pure.planDayTemplateSave(
+      first.templates,
+      {
+        name: '整日减脂餐',
+        meals: [
+          { slot: 'lunch', items: [{ name: '鸡胸肉', grams: 100, kcal: 133 }] },
+          { slot: 'dinner', items: [{ name: '西兰花', grams: 200, kcal: 68 }] },
+          { slot: 'brunch', items: [{ name: '酸奶', grams: 100, kcal: 72 }] },
+          { slot: 'snack', items: [] },
+        ],
+      },
+      4000,
+    );
+    eq(second.templates.length, 1, '同名不应新增第二条');
+    eq(second.template.id, '3000', '同名覆盖必须保留原 id');
+    deep(second.template.meals.map((m) => m.slot), ['lunch', 'dinner', 'snack']);
+    eq(second.template.meals[2].items[0].name, '酸奶');
+
+    for (const [input, expected] of [
+      [{ name: '   ', meals: first.template.meals }, '套餐名称不能为空'],
+      [{ name: '零餐' }, '整日套餐至少要有一餐'],
+      [{ name: '全非法', meals: [{ slot: 'lunch', items: [] }, null, 'oops'] }, '整日套餐至少要有一餐'],
+      [{ name: '只剩一餐', meals: [{ slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] }] }, '整日套餐至少要有一餐'],
+    ]) {
+      let msg = '';
+      try {
+        pure.planDayTemplateSave([], input);
+      } catch (err) {
+        msg = err.message;
+      }
+      eq(msg, expected);
+    }
+
+    // 同名覆盖是跨种类的：整日套餐用掉的名字，单餐套餐也能覆盖回来（反之亦然）
+    const asMeal = pure.planMealTemplateSave(second.templates, { name: '整日减脂餐', slot: 'dinner', items: [] }, 6000);
+    eq(asMeal.templates.length, 1);
+    eq(asMeal.template.id, '3000');
+    eq(asMeal.template.kind, 'meal');
+    eq('meals' in asMeal.template, false);
+  });
 }
 
 function testRecentFoodItemsPure() {
@@ -940,7 +1032,8 @@ const STORE_EXPORTS = [
   'logWeight', 'deleteWeight', 'logMeal', 'updateMeal', 'deleteMeal', 'logExercise', 'deleteExercise',
   'getWater', 'setWater', 'addWater', 'savePhoto', 'getPhoto', 'daySummary', 'rangeSummary',
   'recentWeights', 'exportJSON', 'importJSON', 'exportCSV', 'clearAllData',
-  'getMealTemplates', 'saveMealTemplate', 'deleteMealTemplate', 'recentFoodItems', 'markExported', 'exportStatus',
+  'getMealTemplates', 'saveMealTemplate', 'saveDayTemplate', 'deleteMealTemplate',
+  'recentFoodItems', 'markExported', 'exportStatus',
 ];
 
 async function testModules() {
@@ -1356,6 +1449,135 @@ async function testStoreMealTemplates() {
       deep(rows.map((t) => t.id), ['t1', 't3']);
       eq(rows[1].slot, 'snack');
       deep(rows[1].items, []);
+    });
+  });
+
+  await checkAsync('store: 老格式套餐(无 kind)读出补 kind=meal，slot/items 不变且可继续覆盖', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await db.setMeta('mealTemplates', [
+        { id: 'old1', name: '老套餐', slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+      ]);
+      const rows = await store.getMealTemplates();
+      eq(rows.length, 1);
+      eq(rows[0].kind, 'meal', '老记录必须被识别成单餐套餐');
+      eq(rows[0].slot, 'lunch');
+      eq(rows[0].items.length, 1);
+      eq(rows[0].items[0].name, '米饭');
+      eq(rows[0].items[0].grams, 150);
+
+      // 不重存也能继续用：同名覆盖保留老 id
+      const saved = await store.saveMealTemplate({
+        name: '老套餐',
+        slot: 'dinner',
+        items: [{ name: '面条', grams: 200, kcal: 280 }],
+      });
+      eq(saved.id, 'old1');
+      eq(saved.kind, 'meal');
+      eq((await store.getMealTemplates()).length, 1);
+    });
+  });
+
+  await checkAsync('store: saveDayTemplate 保存→读取→同名覆盖(id 不变)→删除', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      deep(await store.getMealTemplates(), []);
+
+      const day = await store.saveDayTemplate({
+        name: ' 整日三餐 ',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90, carb: 0.6, protein: 7.2, fat: 6 }] },
+          { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+        ],
+      });
+      eq(day.name, '整日三餐');
+      eq(day.kind, 'day');
+      eq(typeof day.id, 'string');
+      eq(day.meals.length, 2);
+      eq('slot' in day, false, '整日套餐不应带单餐 slot');
+
+      const list = await store.getMealTemplates();
+      eq(list.length, 1);
+      deep(list[0], day, '落库读回应与返回值一致');
+      deep(list[0].meals.map((m) => m.slot), ['breakfast', 'lunch']);
+      eq(list[0].meals[0].items[0].name, '鸡蛋');
+      eq(list[0].meals[1].items[0].kcal, 174);
+
+      const over = await store.saveDayTemplate({
+        name: '整日三餐',
+        meals: [
+          { slot: 'lunch', items: [{ name: '鸡胸肉', grams: 100, kcal: 133 }] },
+          { slot: 'brunch', items: [{ name: '酸奶', grams: 100, kcal: 72 }] },
+          { slot: 'snack', items: [] },
+        ],
+      });
+      eq(over.id, day.id, '同名覆盖必须保留原 id');
+      eq((await store.getMealTemplates()).length, 1);
+      const stored = (await store.getMealTemplates())[0];
+      deep(stored.meals.map((m) => m.slot), ['lunch', 'snack'], '非法 slot 回退 snack、空 items 餐次剔除');
+      eq(stored.meals[1].items[0].name, '酸奶');
+
+      await store.deleteMealTemplate(day.id);
+      deep(await store.getMealTemplates(), [], '应按 id 删掉整日套餐');
+    });
+  });
+
+  await checkAsync('store: saveDayTemplate 非法输入抛中文错且不落库', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const valid = [
+        { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+        { slot: 'dinner', items: [{ name: '青菜', grams: 200, kcal: 30 }] },
+      ];
+      for (const [input, expected] of [
+        [{ name: '   ', meals: valid }, '套餐名称不能为空'],
+        [{ name: '整日' }, '整日套餐至少要有一餐'],
+        [{ name: '整日', meals: [] }, '整日套餐至少要有一餐'],
+        [{ name: '整日', meals: [{ slot: 'lunch', items: [] }, 'oops'] }, '整日套餐至少要有一餐'],
+      ]) {
+        let msg = '';
+        try {
+          await store.saveDayTemplate(input);
+        } catch (err) {
+          msg = err.message;
+        }
+        eq(msg, expected);
+      }
+      deep(await store.getMealTemplates(), [], '抛错时不能把半成品写进 meta');
+    });
+  });
+
+  await checkAsync('store: 脏 meta 混入空名/重复 id/坏整日条目也绝不抛', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await db.setMeta('mealTemplates', [
+        {
+          id: 'd1',
+          name: '整日',
+          kind: 'day',
+          meals: [
+            { slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }] },
+            { slot: 'nope', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+            { slot: 'lunch', items: [] },
+          ],
+        },
+        { name: '' },
+        { id: 'd1', name: '重复 id 只留第一条' },
+        { id: 'd2', name: '坏整日', kind: 'day', meals: [] },
+        { id: 'm1', name: '老单餐' },
+      ]);
+      const rows = await store.getMealTemplates();
+      deep(rows.map((t) => t.id), ['d1', 'm1']);
+      eq(rows[0].kind, 'day');
+      deep(rows[0].meals.map((m) => m.slot), ['breakfast', 'snack']);
+      eq(rows[1].kind, 'meal');
+      eq(rows[1].slot, 'snack', '老单餐缺 slot 回退 snack');
+      // 脏数据不影响下一次保存：整日套餐与单餐套餐能共存
+      await store.saveDayTemplate({ name: '新整日', meals: [
+        { slot: 'breakfast', items: [{ name: '包子', grams: 100, kcal: 220 }] },
+        { slot: 'dinner', items: [{ name: '面条', grams: 200, kcal: 280 }] },
+      ] });
+      deep((await store.getMealTemplates()).map((t) => t.kind), ['day', 'meal', 'day']);
     });
   });
 

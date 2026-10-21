@@ -167,10 +167,13 @@ export async function clearAllData(): Promise<void>    // 业务数据 + photos�
 
 // v1.4 起：常吃套餐 / 最近吃过 / 备份时间戳
 //  套餐与备份时间戳均存 meta（键 mealTemplates / lastExportedAt），不新增 object store、不做 IDB 版本迁移
-//  Template = { id: string, name: string, slot, items: MealItem[] }
-export async function getMealTemplates(): Promise<Template[]>       // 脏数据过滤，绝不抛
+//  Template 归一化形状（v1.7）：
+//    { id, name, kind: 'meal'|'day', slot?, items?, meals?: [{ slot, items }] }
+//    kind='meal' 走 slot+items；kind='day' 走 meals（≥2 餐，用于「整日一键」）
+export async function getMealTemplates(): Promise<Template[]>       // 脏数据过滤，绝不抛；老数据（无 kind）归一为 kind='meal'
 export async function saveMealTemplate({ name, slot, items }): Promise<Template>  // 同名覆盖并保留 id；空名抛「套餐名称不能为空」
-export async function deleteMealTemplate(id): Promise<void>
+export async function saveDayTemplate({ name, meals }): Promise<Template>         // 整日套餐：meals 少于 2 餐抛「整日套餐至少要有一餐」
+export async function deleteMealTemplate(id): Promise<void>                       // 通吃两种
 export async function recentFoodItems(limit = 12): Promise<Array<{ name, lastDate, slot, item }>>
 //  只取最近 200 条 meals；按 item.name（trim 后）去重，保留最后一次出现的信息；limit 在去重后生效
 export async function markExported(): Promise<void>
@@ -448,3 +451,14 @@ body：
 - **提示词**：见 §8.2 新增的四条（颗粒度、健身三组差异、unit+grams）。
 - **界面**：详情层给单位 chip（名称 + 克数，点击即填克数），搜索行显示主单位，已保存条目在 ±15% 内显示「≈1 碗」参照。
 - **未验证**：本轮不发布 APK，手机端仍是旧库；详情层 chip 的像素观感需真机确认（自动化为 DOM 断言）。
+
+### v1.7 · 2026-10-21 · 整日套餐与三处交互收敛
+- **数据**：`Template` 增加 `kind: 'meal' | 'day'`；`kind='day'` 用 `meals: [{ slot, items }]`（≥2 餐）。
+  新增 `saveDayTemplate({ name, meals })`；`getMealTemplates()` 把老数据（只有 slot/items）归一为 `kind='meal'`，
+  用户不需要重存。`deleteMealTemplate` 通吃两种。
+- **交互**（用户反馈）：
+  1. 手动添加弹层：**搜索框移到最上**，「最近吃过」默认折叠成一行 `最近吃过 (8)`，点开才展开；
+  2. 今日页「今日餐次」默认**折叠成一行**（`今日餐次 · N 餐 X kcal`），点开才展开逐餐；
+  3. 饮食页「常吃套餐」同时展示单餐与整日两类：整日 chip 点一下把每一餐都记入当天；
+     新增「把今天存为整日套餐」（按当天已有餐次分组保存，不足 2 餐时给提示）。
+- **未改动**：单餐套餐的既有行为、`recentFoodItems` 语义、食物库结构。
