@@ -7,13 +7,16 @@
 
 | 项 | 值 |
 | --- | --- |
-| APK（当前） | `C:\Users\Administrator\Desktop\hms-release\HMS-健康-1.1.0.apk` |
-| 大小 | 1,700,824 字节（1.62 MB） |
-| sha256 | `7b4da6064ffc9e24615802bb8d51d8371d46582ee4edae57ac3240235b5df92a` |
-| 包名 / 版本 | `com.obiectstudy.hms` / `1.1.0` (versionCode 2) |
+| APK（当前） | `C:\Users\Administrator\Desktop\hms-release\HMS-健康-1.2.0.apk` |
+| 大小 | 1,709,645 字节（1.63 MB） |
+| sha256 | `cf0e72c0a5a42714ff7bda4119c25b7b3a2b53dbd3f5e64aa57e0cfd5abf8311` |
+| 包名 / 版本 | `com.obiectstudy.hms` / `1.2.0` (versionCode 3) |
 | sdk | minSdk 24，targetSdk 34，compileSdk 34 |
 | 签名 | v1 (JAR) + v2，RSA 2048，CN=HMS Health |
-| 上一版（保留回退） | `HMS-健康-1.0.0.apk`，1,677,701 字节，versionCode 1 |
+| 回退版本 | `HMS-健康-1.1.0.apk`（1,700,824 字节，code 2）、`HMS-健康-1.0.0.apk`（1,677,701 字节，code 1） |
+
+注：内嵌站点资源在 APK 里走 deflate，所以 `js/foods.js` 原始 112,622 字节在包内只占 ~22KB —— APK 体积增长远小于源码增长。
+1.1.0 那份是 2026-10-21 从提交 `9b2fef3` 重新构建的（原始文件被我误覆盖），站点资源逐文件哈希与该提交一致、包大小 1,700,824 完全相同，只有签名时间戳不同。
 
 `build.ps1` 从 `app/build.gradle` 读 `versionName` 来命名产物，改版本只需改一处，APK 文件名不会和清单漂移。
 
