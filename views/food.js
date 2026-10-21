@@ -783,7 +783,7 @@ function renderMealCard(meal, reload) {
           el('span', { className: 'strong', text: item.name }),
           item.confidence ? confidencePill(item.confidence) : null,
         ),
-        el('div', { className: 'list__item--meta', text: `${item.grams}g · ${fmtKcal(item.kcal)} kcal· 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
+        el('div', { className: 'list__item--meta', text: `${item.grams}g · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
       ),
       el('button', {
         className: 'btn btn--ghost btn--sm', text: '份量',

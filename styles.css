@@ -2,24 +2,30 @@
    变量之外的颜色只允许出现在 :root 里，视图层不得写死颜色。 */
 
 :root {
-  --bg: #F6F8F7;
+  --bg: #F2F7F4;
+  --bg-top: #E4F4EC;
   --surface: #FFFFFF;
-  --surface-2: #EEF3F1;
-  --text: #16211E;
-  --text-2: #6B7A75;
-  --line: #E3EAE7;
-  --brand: #0FA37F;
-  --brand-2: #0B8A6B;
+  --surface-2: #EAF2EE;
+  --text: #14201C;
+  --text-2: #6A7A74;
+  --line: #DFE9E4;
+  --brand: #10A37F;
+  --brand-2: #0A8065;
+  --brand-3: #2FC08E;
   --brand-soft: #E4F5EF;
+  --leaf: #5FBF7E;
+  --card-line: rgba(16, 163, 127, .10);
+  --ring-track: #E8F1ED;
+  --warn-ink: #8A6A12;
   --warn: #E0A106;
   --danger: #D9534F;
   --carb: #F2A33C;
   --protein: #3C8DF2;
   --fat: #B07CF0;
   --water: #38B6E0;
-  --radius: 18px;
-  --radius-sm: 12px;
-  --shadow: 0 2px 10px rgba(16, 33, 30, .06);
+  --radius: 20px;
+  --radius-sm: 14px;
+  --shadow: 0 6px 20px rgba(13, 52, 42, .07);
 
   /* 以下为派生变量：保持色值仍然集中在这里，视图与组件只引用变量。 */
   --on-brand: #FFFFFF;
@@ -29,6 +35,7 @@
   /* 备份提醒条（--warn 系）的浅底与描边：色值仍然只在这里出现。 */
   --warn-soft: rgba(224, 161, 6, .14);
   --warn-line: rgba(224, 161, 6, .38);
+  --danger-line: rgba(217, 83, 79, .26);
   --tabbar-h: 58px;
 }
 
@@ -38,7 +45,9 @@ html, body {
   margin: 0;
   padding: 0;
   min-height: 100%;
-  background: var(--bg);
+  background:
+    radial-gradient(1200px 420px at 50% -160px, var(--bg-top) 0%, rgba(228, 244, 236, 0) 62%),
+    var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
   font-size: 15px;
@@ -82,6 +91,7 @@ a { color: var(--brand-2); text-decoration: none; }
 
 .card {
   background: var(--surface);
+  border: 1px solid var(--card-line);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: 16px;
@@ -101,7 +111,22 @@ a { color: var(--brand-2); text-decoration: none; }
   margin-bottom: 12px;
 }
 
-.card__title { font-size: 15px; font-weight: 600; }
+.card__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .2px;
+}
+.card__title::before {
+  content: "";
+  width: 3px;
+  height: 13px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--brand-3), var(--brand-2));
+  flex: none;
+}
 
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .row--between { justify-content: space-between; }
@@ -180,9 +205,18 @@ a { color: var(--brand-2); text-decoration: none; }
 }
 .btn:active { transform: scale(.98); background: var(--surface-2); }
 .btn:disabled { opacity: .55; }
-.btn--primary { background: var(--brand); border-color: transparent; color: var(--on-brand); }
+.btn--primary {
+  background: linear-gradient(135deg, var(--brand-3) 0%, var(--brand-2) 100%);
+  border-color: transparent;
+  color: var(--on-brand);
+  box-shadow: 0 6px 16px var(--brand-glow);
+}
 .btn--primary:active { background: var(--brand-2); }
-.btn--ghost { background: transparent; border-color: var(--line); color: var(--brand-2); }
+.btn--ghost {
+  background: var(--surface);
+  border-color: var(--brand-soft);
+  color: var(--brand-2);
+}
 .btn--danger { color: var(--danger); }
 .btn--block { display: flex; width: 100%; }
 .btn--sm { min-height: 34px; padding: 0 11px; font-size: 13px; }
@@ -249,7 +283,7 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 }
 .list__item:last-child { border-bottom: none; }
 .list__item--main { min-width: 0; flex: 1; }
-.list__item--meta { font-size: 12px; color: var(--text-2); margin-top: 2px; overflow-wrap: anywhere; }
+.list__item--meta { font-size: 12px; color: var(--text-2); margin-top: 3px; letter-spacing: .1px; overflow-wrap: anywhere; }
 
 .empty { text-align: center; padding: 16px 8px; color: var(--text-2); font-size: 13px; }
 .empty__text { margin-bottom: 10px; }
@@ -274,7 +308,7 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   pointer-events: none;
 }
 .ring__num { font-size: 34px; font-weight: 700; letter-spacing: -1.2px; font-variant-numeric: tabular-nums; line-height: 1.1; }
-.ring__unit { font-size: 12px; color: var(--text-2); }
+.ring__unit { font-size: 12px; color: var(--text-2); letter-spacing: .3px; }
 .ring__label { font-size: 12px; color: var(--text-2); margin-top: 2px; }
 
 .bar {
@@ -331,11 +365,12 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 }
 .tpl-chip {
   display: flex;
-  align-items: stretch;
+  align-items: center;
   flex: none;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--surface-2);
+  border: 1px solid var(--brand-soft);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgba(13, 52, 42, .05);
   overflow: hidden;
 }
 .tpl-chip__main {
@@ -356,13 +391,14 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 .tpl-chip__name { font-weight: 600; white-space: nowrap; }
 .tpl-chip__kcal { font-size: 11px; color: var(--text-2); white-space: nowrap; }
 .tpl-chip__del {
-  min-width: 36px;
-  min-height: 44px;
+  min-width: 30px;
+  min-height: 30px;
+  margin: 0 7px 0 2px;
   border: none;
-  border-left: 1px solid var(--line);
-  background: transparent;
+  border-radius: 999px;
+  background: var(--surface-2);
   color: var(--text-2);
-  font-size: 16px;
+  font-size: 14px;
   line-height: 1;
   cursor: pointer;
 }
@@ -434,7 +470,13 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   font-weight: 700;
 }
 .backup-bar__actions { display: flex; align-items: center; gap: 6px; flex: none; }
-.backup-bar__btn { min-height: 34px; background: var(--surface); border-color: var(--warn); color: var(--warn); }
+.backup-bar__btn {
+  min-height: 34px;
+  background: var(--surface);
+  border-color: var(--warn-line);
+  color: var(--warn-ink);
+  box-shadow: none;
+}
 .backup-bar__close {
   width: 32px;
   height: 32px;
@@ -576,6 +618,7 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   background: var(--surface);
   border-top: 1px solid var(--line);
   padding-bottom: env(safe-area-inset-bottom);
+  box-shadow: 0 -6px 22px rgba(13, 52, 42, .05);
 }
 .tabbar__inner {
   max-width: 520px;
@@ -589,10 +632,12 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   align-items: center;
   justify-content: center;
   gap: 3px;
-  height: var(--tabbar-h);
+  height: calc(var(--tabbar-h) - 10px);
+  margin: 5px 5px;
+  border-radius: 16px;
   color: var(--text-2);
   font-size: 11px;
-  transition: color .15s ease;
+  transition: color .15s ease, background-color .15s ease;
 }
 .tab svg {
   width: 22px;
@@ -604,7 +649,7 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   stroke-linejoin: round;
 }
 .tab:active { background: var(--tap); }
-.tab--active { color: var(--brand-2); font-weight: 600; }
+.tab--active { color: var(--brand-2); font-weight: 700; background: var(--brand-soft); }
 
 /* ---------- 体重刻度尺（SPEC §7 体重） ---------- */
 
@@ -664,7 +709,9 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   height: 68px;
   overflow: hidden;
   border-radius: var(--radius-sm);
-  background: var(--surface-2);
+  background: linear-gradient(180deg, var(--surface-2) 0%, var(--surface) 100%);
+  border: 1px solid var(--line);
+  box-shadow: inset 0 2px 6px rgba(13, 52, 42, .05);
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
@@ -677,11 +724,12 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   position: absolute;
   top: 26px;
   left: 50%;
-  width: 2px;
-  height: 24px;
-  margin-left: -1px;
-  border-radius: 1px;
-  background: var(--brand);
+  width: 3px;
+  height: 26px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--brand-3), var(--brand-2));
+  box-shadow: 0 0 0 3px var(--brand-glow);
   z-index: 2;
 }
 .ruler__strip {
@@ -698,7 +746,7 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   height: 12px;
   background: var(--line);
 }
-.ruler__tick--major { top: 30px; height: 20px; background: var(--text-2); opacity: .55; }
+.ruler__tick--major { top: 30px; height: 20px; background: var(--text-2); opacity: .75; }
 .ruler__tick--label { top: 28px; height: 24px; opacity: .8; }
 .ruler__label {
   position: absolute;

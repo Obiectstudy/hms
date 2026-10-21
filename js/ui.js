@@ -210,13 +210,16 @@ export function ring({ value = 0, max = 1, label = '', unit = '', color = 'var(-
   const dash = circumference * pct;
   const svgNode = svg('svg', { viewBox: '0 0 120 120', class: 'ring__svg', 'aria-hidden': 'true' },
     svg('circle', { cx: 60, cy: 60, r, fill: 'none', 'stroke-width': 12, class: 'ring__track' }),
-    svg('circle', {
-      cx: 60, cy: 60, r, fill: 'none', 'stroke-width': 12, 'stroke-linecap': 'round',
-      class: 'ring__value',
-      'stroke-dasharray': `${dash} ${circumference}`,
-      transform: 'rotate(-90 60 60)',
-      style: `stroke:${color}`,
-    }),
+    // pct 为 0 时圆头会留下一个孤立圆点，看起来像坏掉的小圆——0 值直接不画。
+    pct > 0
+      ? svg('circle', {
+        cx: 60, cy: 60, r, fill: 'none', 'stroke-width': 12, 'stroke-linecap': 'round',
+        class: 'ring__value',
+        'stroke-dasharray': `${dash} ${circumference}`,
+        transform: 'rotate(-90 60 60)',
+        style: `stroke:${color}`,
+      })
+      : null,
   );
   return el('div', { className: 'ring' },
     svgNode,

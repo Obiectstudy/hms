@@ -12,7 +12,8 @@ import {
 // 一格刻度对应的像素：kg（0.1/格）→ 80px/1kg，斤（0.2/格）→ 40px/1斤。
 const PX_PER_STEP = 8;
 // 数字标签间隔：kg 每 5 格一个（5kg），斤每 25 格一个（5斤）。
-const LABEL_EVERY = { kg: 50, jin: 25 };
+// 标签间距按"每 1kg 一个"给：刻度 8px/格，kg 10 格 = 1kg = 80px，斤 10 格 = 2 斤 = 80px。
+const LABEL_EVERY = { kg: 10, jin: 10 };
 
 /* ---------- 7 日均线叠加 ----------
    ui.lineChart 只画一条线（js/ui.js 不在本文件可写范围），
@@ -245,6 +246,15 @@ export async function render(root) {
     const label = unitLabel();
     const target = Number(goals.weightTargetKg) || null;
 
+    // 只展示真实存在的对比窗口，没有数据就明说，不摆一个「—」占位。
+    const deltaText = () => {
+      const signed = (v) => (v > 0 ? '+' : '') + fmt1(show(v));
+      const parts = [];
+      if (stats.delta7 != null) parts.push(`7 天 ${signed(stats.delta7)}`);
+      if (stats.delta30 != null) parts.push(`30 天 ${signed(stats.delta30)}`);
+      return parts.length ? `${parts.join(' · ')} ${label}` : '暂无历史对比';
+    };
+
     const latestCard = el('div', { className: 'card col' },
       el('div', { className: 'card__head', style: { marginBottom: '0' } },
         el('div', { className: 'card__title', text: '最新' }),
@@ -263,11 +273,8 @@ export async function render(root) {
           el('div', { className: 'stat__label', text: '当前体重' }),
         ),
         el('div', { className: 'col align-end' },
-          el('div', { className: 'label', text: '较 7 天 / 30 天' }),
-          el('div', {
-            className: 'strong',
-            text: `${stats.delta7 == null ? '—' : (stats.delta7 > 0 ? '+' : '') + fmt1(show(stats.delta7))} / ${stats.delta30 == null ? '—' : (stats.delta30 > 0 ? '+' : '') + fmt1(show(stats.delta30))} ${label}`,
-          }),
+          el('div', { className: 'label', text: '变化' }),
+          el('div', { className: 'strong', text: deltaText() }),
         ),
       ));
 

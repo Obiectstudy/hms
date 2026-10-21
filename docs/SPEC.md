@@ -267,13 +267,21 @@ window.HMS = { navigate, refresh }    // 视图之间跳转与刷新统一走它
 CSS 变量（`styles.css` 顶部定义，视图只用变量，禁止写死颜色）：
 
 ```css
---bg:#F6F8F7; --surface:#FFFFFF; --surface-2:#EEF3F1;
---text:#16211E; --text-2:#6B7A75; --line:#E3EAE7;
---brand:#0FA37F; --brand-2:#0B8A6B; --brand-soft:#E4F5EF;
---warn:#E0A106; --danger:#D9534F;
+/* v1.5 视觉层（2026-10-21）：更"健康"但不花哨——薄荷底 + 单一品牌绿 + 三色宏量 */
+--bg:#F2F7F4; --bg-top:#E4F4EC; --surface:#FFFFFF; --surface-2:#EAF2EE;
+--text:#14201C; --text-2:#6A7A74; --line:#DFE9E4;
+--brand:#10A37F; --brand-2:#0A8065; --brand-3:#2FC08E; --brand-soft:#E4F5EF; --leaf:#5FBF7E;
+--card-line:rgba(16,163,127,.10); --ring-track:#E8F1ED;
+--warn:#E0A106; --warn-soft:rgba(224,161,6,.14); --warn-line:rgba(224,161,6,.38); --warn-ink:#8A6A12;
+--danger:#D9534F; --danger-line:rgba(217,83,79,.26);
 --carb:#F2A33C; --protein:#3C8DF2; --fat:#B07CF0; --water:#38B6E0;
---radius:18px; --radius-sm:12px; --shadow:0 2px 10px rgba(16,33,30,.06);
+--radius:20px; --radius-sm:14px; --shadow:0 6px 20px rgba(13,52,42,.07);
 ```
+
+- 页面底色 = 顶部一层极淡薄荷径向渐变 + `--bg`；卡片为白底 + `--card-line` 细描边 + 柔阴影。
+- `.card__title` 用 `::before` 画一条品牌色竖条（3×13px 渐变），这是"健康色"的主要来源，不新增 DOM。
+- 主按钮为 `linear-gradient(135deg, --brand-3, --brand-2)`；底部导航活动项为 `--brand-soft` 圆角药丸。
+- 色值只允许出现在 `:root`，组件与视图一律引用变量（`tests/...` 与 grep 均可核对）。
 
 - 移动优先，最大内容宽度 `520px` 居中；安全区 `env(safe-area-inset-bottom)` 留给底部 tabbar。
 - 数字是本产品的主角：关键数值 ≥ 28px，单位小字灰色紧跟其后。
@@ -409,3 +417,10 @@ body：
   **不新增 object store、不做 IndexedDB 版本迁移**——升级失败的风险大于这点设计洁癖。
 - **注意**：`movingAverage` 的第二形参命名为 `size` 而非 `window`（旧测试里有「纯模块源码不得出现 window」
   的守卫，参数名会被误判）；**位置参数语义不变**。
+
+### v1.5 · 2026-10-21 · 视觉刷新（不改结构，只改令牌与组件样式）
+- **范围**：`styles.css` 设计令牌与组件样式；`js/ui.js` 的 `ring()` 在 0 值时不画圆头（原本会留下一个孤立圆点）；
+  `views/weight.js` 的「变化」文案按真实数据呈现（不再出现「—」占位）、刻度标签密度改为每 1kg/2斤；
+  `views/food.js` 修一处 `kcal·` 空格。
+- **未改动**：任何 DOM 结构、类名、交互逻辑；所有既有测试断言原样通过。
+- **配色原则**：单一品牌绿 + 薄荷底，宏量三色（碳水橙/蛋白蓝/脂肪紫）作为唯一的多彩色块，其余保持中性。
