@@ -1,9 +1,9 @@
 {
-    "versionCode":  6,
-    "versionName":  "1.5.0",
+    "versionCode":  7,
+    "versionName":  "1.5.1",
     "apkUrl":  "https://obiectstudy.github.io/hms/dist/HMS-latest.apk",
-    "sha256":  "d3ee19b2807ebbaafd7f8c4102be6fc7ce902164fe4851a7731cca7cdae02ce4",
-    "size":  1731713,
-    "notes":  "食物库扩到 651 条：支持「去皮/带皮」「生/熟」「部位」区分（如鸡腿去皮 120 kcal 与带皮 181 的差别），并给 578 条食物加了真实份量单位（1 只/1 碗/1 片/1 把…，点一下就按份量填克数）。",
+    "sha256":  "6f6cb8a227e4d98c11cac57d360f275cb4d66e41a8400b55abd334b872d6c89c",
+    "size":  1732602,
+    "notes":  "修复：升级后首次打开可能仍显示旧界面（APK 内不再使用 Service Worker 缓存）。设置页新增「检查更新」与真实版本号，更新失败会直接提示原因。",
     "publishedAt":  "2026-10-21"
 }
