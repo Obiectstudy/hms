@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Only used for the user-triggered DashScope vision API call. -->
+    <!-- Only used for the user-triggered DashScope vision API call and the update check. -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Required to hand the downloaded APK to the system installer (ACTION_VIEW). On API 26+
+         the user still has to grant "install unknown apps" for this package explicitly. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- No CAMERA permission on purpose: capture is delegated to the system camera app through
          ACTION_IMAGE_CAPTURE, so no runtime grant (and no SecurityException) is involved. -->

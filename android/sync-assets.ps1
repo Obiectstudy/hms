@@ -2,9 +2,10 @@
 # The expected list is parsed from sw.js PRECACHE, so the APK payload and the service worker
 # cache can never drift apart. Fails hard (exit 1) if anything is missing.
 #
-# Note on the file count: the site is 23 distinct files. sw.js PRECACHE declares 23 entries as well,
-# but './' (the navigation fallback) is the same file as './index.html' and a service worker never
-# precaches itself, so the two lists differ by exactly one swap: alias -> sw.js.
+# Note on the file count: sw.js PRECACHE lists both './' (the navigation fallback) and './index.html',
+# which are the same file, and a service worker never precaches itself, so the payload holds one
+# fewer file than PRECACHE plus sw.js. The count is derived from sw.js, never pinned to a literal:
+# pinning it made every build fail as soon as the site legitimately gained a file (js/update.js).
 $ErrorActionPreference = 'Stop'
 
 $android = $PSScriptRoot
@@ -18,7 +19,7 @@ $block = [regex]::Match($sw, '(?s)const\s+PRECACHE\s*=\s*\[(.*?)\];')
 if (-not $block.Success) { throw 'PRECACHE array not found in sw.js' }
 
 $entries = @([regex]::Matches($block.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
-if ($entries.Count -ne 23) { throw "sw.js PRECACHE should list 23 entries, found $($entries.Count)" }
+if ($entries.Count -lt 1) { throw 'sw.js PRECACHE is empty' }
 
 $files = New-Object System.Collections.Generic.List[string]
 foreach ($e in $entries) {
@@ -59,8 +60,8 @@ foreach ($f in $files) {
 }
 
 $disk = @(Get-ChildItem -LiteralPath $dest -Recurse -File)
+# The payload must be exactly the derived list: nothing missing, nothing extra on disk.
 if ($disk.Count -ne $files.Count) { throw "expected $($files.Count) files in assets/www, found $($disk.Count)" }
-if ($disk.Count -ne 23) { throw "expected 23 distinct site files, found $($disk.Count)" }
 
 foreach ($m in @('index.html', 'sw.js', 'js/store.js', 'views/food.js', 'icons/icon-512.png')) {
     if ($files -notcontains $m) { throw "required file not in payload: $m" }

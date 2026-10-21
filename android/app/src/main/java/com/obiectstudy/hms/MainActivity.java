@@ -36,6 +36,7 @@ public class MainActivity extends Activity {
     private static final int REQ_FILE_CHOOSER = 1001;
 
     private WebView webView;
+    private HmsBridge bridge;
     private ValueCallback<Uri[]> filePathCallback;
     private Uri cameraOutputUri;
 
@@ -80,6 +81,11 @@ public class MainActivity extends Activity {
                 return startFileChooser(callback, params);
             }
         });
+
+        // window.HmsBridge: checkUpdate()/installUpdate(json)/version(). The object must be
+        // registered before the first page load, otherwise the page sees an undefined global.
+        bridge = new HmsBridge(this);
+        webView.addJavascriptInterface(bridge, HmsBridge.JS_NAME);
 
         setContentView(webView);
         if (savedInstanceState == null) {
@@ -196,6 +202,20 @@ public class MainActivity extends Activity {
         cameraOutputUri = null;
     }
 
+    /** {@link HmsBridge} needs the live view to deliver callbacks; null once onDestroy ran. */
+    WebView getWebView() {
+        return webView;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (bridge != null) {
+            // Returning from the "install unknown apps" settings page: retry the pending install.
+            bridge.onResume();
+        }
+    }
+
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
@@ -215,6 +235,11 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (bridge != null) {
+            // Cancels the manifest fetch / download and aborts a blocked socket read.
+            bridge.shutdown();
+            bridge = null;
+        }
         if (webView != null) {
             webView.destroy();
             webView = null;

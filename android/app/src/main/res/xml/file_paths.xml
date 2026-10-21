@@ -2,4 +2,7 @@
 <paths>
     <!-- Camera captures are written here; see MainActivity.startFileChooser. -->
     <cache-path name="camera" path="camera/" />
+    <!-- Update APK is downloaded here; see HmsBridge.runInstall (the installer needs a
+         content:// URI, a raw file:// path would be rejected on API 24+). -->
+    <cache-path name="update" path="update/" />
 </paths>
