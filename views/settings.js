@@ -413,9 +413,55 @@ export async function render(root) {
   // ---- 关于 ----
   root.appendChild(el('div', { className: 'card col' },
     el('div', { className: 'card__title', text: '关于' }),
-    el('div', { className: 'row row--between' }, el('span', { className: 'label', text: '版本' }), el('span', { className: 'muted', text: 'v1.0.0' })),
+    el('div', { className: 'row row--between' }, el('span', { className: 'label', text: '版本' }), el('span', { className: 'muted', text: buildVersionLabel() })),
+    el('button', { className: 'btn btn--ghost btn--block', text: '检查更新', onClick: checkUpdateNow }),
     el('div', { className: 'divider' }),
     el('div', { className: 'muted', text: '隐私说明：所有健康数据只保存在本机浏览器的 IndexedDB，不上传任何服务器。只有使用拍照识别时，照片会直接发送到你配置的阿里百炼接口。' }),
     el('div', { className: 'muted', text: '建议定期在「数据」里导出 JSON 备份；清除浏览器数据会丢失记录。' }),
   ));
+}
+
+/**
+ * 版本号：APK 里取原生桥的真实版本；PWA 里没有构建号，直接标网页版。
+ */
+function buildVersionLabel() {
+  try {
+    if (typeof window !== 'undefined' && window.HmsBridge && typeof window.HmsBridge.version === 'function') {
+      const info = JSON.parse(window.HmsBridge.version());
+      if (info && info.versionName) return 'v' + info.versionName + '（' + info.versionCode + '）';
+    }
+  } catch { /* 桥坏了不该影响设置页渲染 */ }
+  return '网页版（自动更新）';
+}
+
+/**
+ * 手动检查更新：把结果直接告诉用户，避免"没反应"这种无法诊断的状态。
+ * 原生回调走 window.__hmsUpdate，这里临时接管，用完立刻还原给今日页的提示条逻辑。
+ */
+function checkUpdateNow() {
+  if (typeof window === 'undefined' || !window.HmsBridge || typeof window.HmsBridge.checkUpdate !== 'function') {
+    toast('网页版会自动更新，不需要手动检查');
+    return;
+  }
+  const previous = window.__hmsUpdate;
+  let settled = false;
+  const restore = () => { window.__hmsUpdate = previous; };
+  window.__hmsUpdate = (raw) => {
+    if (settled) return;
+    settled = true;
+    restore();
+    let info = null;
+    try { info = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { info = null; }
+    if (!info) { toast('检查失败：返回内容无法解析'); return; }
+    if (info.ok) toast('发现新版本 ' + info.versionName + '，回今日页点「立即更新」');
+    else toast(info.error || '已是最新版本');
+  };
+  try { window.HmsBridge.checkUpdate(); }
+  catch (error) { settled = true; restore(); toast('检查失败：' + (error && error.message ? error.message : '未知错误')); return; }
+  setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    restore();
+    toast('检查超时，请确认网络后重试');
+  }, 15000);
 }

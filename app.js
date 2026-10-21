@@ -115,6 +115,9 @@ async function probeStorage() {
 }
 
 function registerServiceWorker() {
+  // APK 内资源本来就在安装包里，Service Worker 没有收益，反而会：升级 APK 后
+  // 首次打开仍由旧 SW 提供旧页面（缓存优先），导致新代码要等第二次启动才生效。
+  if (window.HmsBridge) return;
   if (!('serviceWorker' in navigator)) return;
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./sw.js').catch((error) => {
