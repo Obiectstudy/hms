@@ -2062,6 +2062,558 @@ export async function run() {
         assert.ok(root.childNodes.length > 0, `${name} 空数据时白屏`);
       }
     });
+
+    // ---- 5. iOS 安装引导（Safari → 分享 → 添加到主屏幕）与存储持久化 ----
+    // 每个用例都 import 一份新的 app.js（query 不同 → 独立模块实例）：模块内「只挂一次」的引用不跨用例串味，
+    // 否则「standalone 下不出现」可能因为上一层已经挂过而假通过。
+    let iosSeq = 0;
+    const freshApp = () => import('../app.js?iosCase=' + (iosSeq += 1));
+    const hintNodes = () => dom.body.childNodes.filter((n) => String(n.className).split(/\s+/).includes('ios-hint'));
+    const clearHints = () => { for (const n of [...hintNodes()]) n.remove(); };
+    const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
+    const MAC_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15';
+
+    /** 假 UA / 假 matchMedia / 假 localStorage：注入 → 断言 → 无条件还原（含 Node 只读的 navigator 描述符）。 */
+    const withIosEnv = async (fn) => {
+      const win = globalThis.window;
+      const prevNav = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+      const prevStorage = globalThis.localStorage;
+      const prevMatchMedia = win.matchMedia;
+      const prevNavOnWin = win.navigator;
+      const prevBridge = win.HmsBridge;
+      const bag = new Map();
+      const setNav = (value) => Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true });
+      const setUa = (ua, extra = {}) => { const nav = { userAgent: ua, ...extra }; setNav(nav); win.navigator = nav; return nav; };
+      globalThis.localStorage = {
+        getItem: (key) => (bag.has(key) ? bag.get(key) : null),
+        setItem: (key, value) => { bag.set(key, String(value)); },
+        removeItem: (key) => { bag.delete(key); },
+      };
+      win.matchMedia = () => ({ matches: false });
+      try {
+        return await fn({ win, bag, setUa });
+      } finally {
+        clearHints();
+        if (prevBridge === undefined) delete win.HmsBridge; else win.HmsBridge = prevBridge;
+        if (prevMatchMedia === undefined) delete win.matchMedia; else win.matchMedia = prevMatchMedia;
+        if (prevNavOnWin === undefined) delete win.navigator; else win.navigator = prevNavOnWin;
+        if (prevNav) Object.defineProperty(globalThis, 'navigator', prevNav);
+        if (prevStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = prevStorage;
+      }
+    };
+
+    await checkAsync('iOS 安装引导：iPhone Safari 非 standalone 下出现在页面最顶部', async () => {
+      await withIosEnv(async ({ setUa }) => {
+        const app = await freshApp(); // import 时环境是中性桌面 UA，boot() 自己不会弹提示
+        setUa(IPHONE_UA);
+        assert.equal(app.shouldShowIosHint(), true, 'iPhone Safari 非 standalone 应显示安装引导');
+        const hint = app.setupIosInstallHint();
+        assert.ok(hint, 'setupIosInstallHint 没有返回提示条节点');
+        assert.equal(hintNodes().length, 1, '提示条应恰好插入一个');
+        assert.equal(dom.body.childNodes[0], hint, '提示条应插在文档最前面（顶部通栏）');
+        assert.ok(hint.textOf().includes('添加到主屏幕'), '提示文案不对：' + hint.textOf());
+        assert.ok(hint.textOf().includes('分享'), '提示条没有告诉用户点「分享」');
+        assert.ok(findButton(hint, '×'), '提示条缺少关闭按钮');
+        assert.equal(app.setupIosInstallHint(), null, '已经挂上时不应重复插入');
+        assert.equal(hintNodes().length, 1, '重复调用后提示条数量应仍为 1');
+      });
+    });
+
+    await checkAsync('iOS 安装引导：standalone（display-mode / navigator.standalone）下绝不出现', async () => {
+      await withIosEnv(async ({ win, setUa }) => {
+        const app = await freshApp();
+        setUa(IPHONE_UA);
+        win.matchMedia = () => ({ matches: true });
+        assert.equal(app.shouldShowIosHint(), false, 'display-mode: standalone 下不应显示');
+        assert.equal(app.setupIosInstallHint(), null, 'display-mode: standalone 下不应插入提示条');
+        assert.equal(hintNodes().length, 0, 'standalone 下页面里不应有提示条');
+        win.matchMedia = () => ({ matches: false });
+        win.navigator = { userAgent: IPHONE_UA, standalone: true };
+        assert.equal(app.shouldShowIosHint(), false, 'navigator.standalone 下不应显示');
+        assert.equal(app.setupIosInstallHint(), null, 'navigator.standalone 下不应插入提示条');
+        assert.equal(hintNodes().length, 0, 'navigator.standalone 下页面里不应有提示条');
+      });
+    });
+
+    await checkAsync('iOS 安装引导：点关闭后记住，重开页面也不再出现', async () => {
+      await withIosEnv(async ({ bag, setUa }) => {
+        const app = await freshApp();
+        setUa(IPHONE_UA);
+        const hint = app.setupIosInstallHint();
+        assert.ok(hint, '前置：iPhone Safari 非 standalone 应先出现提示条');
+        fireClick(findButton(hint, '×'));
+        assert.equal(bag.get('hms.ios.hint.dismissed'), '1', '关闭没有把标记写进 localStorage');
+        assert.equal(hintNodes().length, 0, '关闭后提示条没有从页面上移除');
+        assert.equal(app.shouldShowIosHint(), false, '关闭后不应再显示');
+        assert.equal(app.setupIosInstallHint(), null, '关闭后不应再插入提示条');
+
+        // 刷新 = 另起一份实例，但标记还在：依然不能出现
+        const reopened = await freshApp();
+        assert.equal(reopened.shouldShowIosHint(), false, '重开页面后（标记还在）不应再显示');
+        assert.equal(reopened.setupIosInstallHint(), null, '重开页面后不应插入提示条');
+        assert.equal(hintNodes().length, 0, '重开页面后页面里不应出现提示条');
+      });
+    });
+
+    await checkAsync('iOS 安装引导：非 iOS 与 APK 内不出现（iPadOS 桌面 UA 仍算 iOS）', async () => {
+      await withIosEnv(async ({ win, setUa }) => {
+        const app = await freshApp();
+        for (const ua of [
+          'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Mobile Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36',
+          MAC_UA,
+        ]) {
+          setUa(ua);
+          assert.equal(app.shouldShowIosHint(), false, '非 iOS 不应显示引导：' + ua.slice(0, 40));
+        }
+        assert.equal(app.setupIosInstallHint(), null, '非 iOS 不应插入提示条');
+        assert.equal(hintNodes().length, 0, '非 iOS 页面里不应有提示条');
+        // iPadOS 13+ 默认发桌面 UA，靠多点触控与真 Mac 区分
+        setUa(MAC_UA, { maxTouchPoints: 5 });
+        assert.equal(app.shouldShowIosHint(), true, 'iPadOS 桌面 UA（多点触控）应显示引导');
+        // APK 内走原生桥，不做 Web 安装引导
+        win.HmsBridge = {};
+        assert.equal(app.shouldShowIosHint(), false, 'APK 内不应显示 Web 安装引导');
+        assert.equal(app.setupIosInstallHint(), null, 'APK 内不应插入提示条');
+      });
+    });
+
+    await checkAsync('存储持久化：调用 navigator.storage.persist()，不可用或失败都不抛异常', async () => {
+      await withIosEnv(async () => {
+        const app = await freshApp();
+        const calls = [];
+        const setNav = (value) => Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true });
+        setNav({ storage: { persist: async () => { calls.push(1); return true; } } });
+        assert.equal(await app.requestPersistentStorage(), true, 'persist() 返回 true 时应回报已授予');
+        assert.equal(calls.length, 1, 'persist() 没有被调用');
+        // Safari 不一定有 storage.persist：静默跳过，不能抛
+        setNav({ storage: {} });
+        assert.equal(await app.requestPersistentStorage(), false, '没有 persist 时应静默返回 false');
+        setNav({});
+        assert.equal(await app.requestPersistentStorage(), false, '没有 navigator.storage 时应静默返回 false');
+        // 拒绝 / 抛异常都不能冒泡出去（否则会打断启动）
+        setNav({ storage: { persist: async () => { throw new Error('persist 被拒绝'); } } });
+        assert.equal(await app.requestPersistentStorage(), false, 'persist() 抛错时应吞掉并返回 false');
+      });
+    });
+
+    // ---- 6. 本地多账号：启动就绪 / 账号页 / 切换 / 新建 / 改名 / 删除 ----
+    // 账号目录在 localStorage，账号数据在各自的 IndexedDB 库。每个用例给一份干净的
+    // localStorage 并在结束后还原，避免目录跨用例串味。
+    const accountsMod = await import('../js/accounts.js');
+    const accountView = await import('../views/account.js');
+
+    const makeStorage = (bag) => ({
+      getItem: (key) => (bag.has(key) ? bag.get(key) : null),
+      setItem: (key, value) => { bag.set(key, String(value)); },
+      removeItem: (key) => { bag.delete(key); },
+      clear: () => { bag.clear(); },
+      key: (index) => [...bag.keys()][index] ?? null,
+      get length() { return bag.size; },
+    });
+
+    const withStorage = async (fn) => {
+      const previous = globalThis.localStorage;
+      const bag = new Map();
+      globalThis.localStorage = makeStorage(bag);
+      try {
+        return await fn(bag);
+      } finally {
+        if (previous === undefined) delete globalThis.localStorage;
+        else globalThis.localStorage = previous;
+      }
+    };
+
+    /** 清掉上一用例留下的 toast / 弹层：让「提示了什么」的断言只看本用例。 */
+    const clearOverlays = () => {
+      dom.body.childNodes = dom.body.childNodes.filter((n) => !/^(toast|sheet-backdrop|modal-backdrop)(\s|$)/.test(String(n.className)));
+    };
+    const overlays = (className) => dom.body.walk().filter((n) => String(n.className).split(/\s+/).includes(className));
+    const toasts = () => overlays('toast').map((n) => n.textOf());
+    const latestOverlay = (className) => overlays(className).pop() || null;
+    const buttonsWithText = (root2, label) => root2.walk().filter((n) => n.tagName === 'button' && n.textOf() === label);
+    const accountRow = (root2, needle) => byClass(root2, 'account-row').find((row) => row.textOf().includes(needle)) || null;
+    const rowButton = (row, label) => (row ? buttonsWithText(row, label)[0] || null : null);
+
+    await checkAsync('账号启动：首屏渲染前账号就绪，老用户升级后数据仍在（升级无感）', async () => {
+      await withStorage(async (bag) => {
+        clearOverlays();
+        assert.equal(accountsMod.listAccounts().length, 0, '前置：目录里不该有账号');
+
+        // 老用户：老库 hms 里已经有档案与体重记录（升级前就存在）
+        await store.logWeight({ date: '2001-01-01', weightKg: 70 });
+        const profileBefore = await store.getProfile();
+        assert.ok(profileBefore && profileBefore.nickname, '前置：老库里应该有档案');
+        const openedBefore = fakeIdb.opened.length;
+
+        // app.js 第一次向 document 要渲染宿主的那一刻，看它看到的库名与账号是什么
+        const originalGetById = dom.doc.getElementById;
+        const seen = [];
+        dom.doc.getElementById = (id) => {
+          if (id === 'view') seen.push({ dbName: db.getDbName(), active: accountsMod.getActiveAccount() });
+          return originalGetById(id);
+        };
+        try {
+          const app = await freshApp(); // 导入即 boot()
+          await app.boot();             // 同一个幂等流程，等到它结束再看
+          await tick();
+
+          assert.ok(seen.length >= 1, 'boot 从没走到首屏渲染');
+          assert.ok(seen[0].active, '首屏渲染时账号还没就绪');
+          assert.equal(seen[0].dbName, 'hms', '首屏渲染时库名不是老库：' + seen[0].dbName);
+          assert.equal(seen[0].active.dbName, 'hms', '老用户应该认领老库 hms');
+
+          const account = accountsMod.getActiveAccount();
+          assert.equal(accountsMod.listAccounts().length, 1, '升级后应恰好登记一个账号');
+          assert.equal(db.getDbName(), account.dbName, '库名没有指向当前账号');
+          assert.equal(fakeIdb.opened.length, openedBefore, '老用户升级不该重开数据库（重开就看不到老数据了）');
+
+          assert.deepEqual(await store.getProfile(), profileBefore, '升级后档案变了');
+          assert.ok((await db.dumpAll()).weights.some((w) => w.date === '2001-01-01'), '升级后历史记录丢了');
+
+          assert.ok(bag.has(accountsMod.CATALOG_KEY), '账号目录没有写进 localStorage');
+          assert.equal(bag.get(accountsMod.ACTIVE_KEY), account.id, '当前账号没有写进 localStorage');
+        } finally {
+          dom.doc.getElementById = originalGetById;
+        }
+      });
+    });
+
+    await checkAsync('账号启动：账号库打不开时降级回老库继续渲染，且只提示一次', async () => {
+      await withStorage(async (bag) => {
+        clearOverlays();
+        // 当前账号指向一个打不开的库（模拟账号库损坏）
+        bag.set(accountsMod.CATALOG_KEY, JSON.stringify([
+          { id: 'legacy-1', name: '本机', dbName: 'hms', createdAt: 1 },
+          { id: 'broken-1', name: '家人', dbName: 'hms-u-broken', createdAt: 2 },
+        ]));
+        bag.set(accountsMod.ACTIVE_KEY, 'broken-1');
+
+        // 上一次会话把库名钉在了别的账号上（不是当前账号的库），启动时这一步必须失败
+        await db.setDbName('hms-u-stale');
+        const previousIdb = globalThis.indexedDB;
+        globalThis.indexedDB = { open() { throw new Error('模拟账号库打不开'); } };
+        const originalGetById = dom.doc.getElementById;
+        let viewAsked = 0;
+        dom.doc.getElementById = (id) => {
+          if (id === 'view') viewAsked += 1;
+          return originalGetById(id);
+        };
+        try {
+          const app = await freshApp(); // 导入即 boot()：这一条链自己就该降级
+          await app.boot();
+          await app.boot();
+          await tick(50);
+          assert.ok(viewAsked > 0, '降级后没有继续渲染首屏（白屏）');
+          assert.equal(db.getDbName(), 'hms', '降级后库名没有回到老库：' + db.getDbName());
+          assert.equal(toasts().filter((t) => t.includes('账号初始化失败')).length, 1, '降级提示应该恰好一次');
+          // 前面的调用都已结束，再单独跑一次账号流程：结论必须还是「打不开就降级」
+          assert.equal(await app.prepareAccounts(), null, '账号库打不开时应降级并返回 null');
+          assert.equal(db.getDbName(), 'hms', '降级后库名没有回到老库：' + db.getDbName());
+          await app.prepareAccounts();
+          assert.equal(toasts().filter((t) => t.includes('账号初始化失败')).length, 1, '重复启动不该重复提示');
+        } finally {
+          dom.doc.getElementById = originalGetById;
+          globalThis.indexedDB = previousIdb;
+        }
+        await assert.doesNotReject(() => store.getProfile(), '存储恢复后仍应能继续读写');
+      });
+    });
+
+    await checkAsync('账号页：渲染当前账号与账号列表，行数 = listAccounts().length', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const second = await accountsMod.createAccount({ name: '家人' });
+        assert.notEqual(second.dbName, accountsMod.LEGACY_DB_NAME, '前置：新账号不该认领老库');
+
+        await store.logWeight({ date: '2001-02-01', weightKg: 71 });
+        const expectedWeights = (await db.dumpAll()).weights.length;
+
+        const root = await renderView('account');
+        const text = nodeText(root);
+        assert.ok(root.childNodes.length > 0, '账号页白屏');
+        assertNoLeak(text, 'account');
+        assert.equal(byClass(root, 'account-row').length, accountsMod.listAccounts().length, '列表行数与 listAccounts() 不一致');
+        assert.equal(byClass(root, 'account-row').length, 2, '应该是「本机 + 家人」两行');
+        assert.ok(text.includes('本机'), '没有显示当前账号名');
+        assert.ok(text.includes('本机老数据'), '当前账号缺少「本机老数据」标识');
+        assert.ok(text.includes('新建的账号'), '新账号缺少「新建的账号」标识');
+        assert.ok(text.includes('数据只存在这台设备'), '缺少「数据只存在这台设备」');
+        assert.ok(accountRow(root, '家人'), '列表里少了第二个账号');
+
+        // 数据规模：4 个统计格，取得到就是真条数，取不到才是「—」
+        const stats = byClass(root, 'stat');
+        assert.equal(stats.length, 4, '数据规模应有 4 项');
+        for (const node of stats) assert.ok(/^(\d+|—)/.test(node.textOf()), '数据规模不是条数也不是「—」：' + node.textOf());
+        const weightStat = stats.find((node) => node.textOf().includes('体重'));
+        assert.equal((weightStat.textOf().match(/^\d+/) || [])[0], String(expectedWeights), '体重条数不对：' + weightStat.textOf());
+      });
+    });
+
+    await checkAsync('账号页：点另一个账号 → 切换生效 → 整页重渲染且当前账号变了', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const second = await accountsMod.createAccount({ name: '家人' });
+
+        const win = globalThis.window;
+        const previousRefresh = win.HMS.refresh;
+        let renders = 0;
+        let latest = null;
+        const root = new dom.FakeNode('div');
+        // app.js 的 refresh() 会换一个全新的 .page 重画：这里按同样的语义重画一份
+        win.HMS.refresh = async () => {
+          renders += 1;
+          latest = new dom.FakeNode('div');
+          await accountView.render(latest);
+        };
+        try {
+          await accountView.render(root);
+          const row = accountRow(root, '家人');
+          assert.ok(row, '列表里没有「家人」这一行');
+          fireClick(byClass(row, 'account-row__main')[0]);
+          await tick(120);
+
+          assert.equal(renders, 1, '切换后没有走 app.js 的整页重新渲染');
+          assert.equal(accountsMod.getActiveAccount().id, second.id, '当前账号没有切过去');
+          assert.equal(db.getDbName(), second.dbName, '库名没有跟着账号切：' + db.getDbName());
+          assert.ok(latest, '重新渲染没有产出新页面');
+          const activeRow = byClass(latest, 'account-row--active');
+          assert.equal(activeRow.length, 1, '重渲染后没有唯一的「当前账号」行');
+          assert.ok(activeRow[0].textOf().includes('家人'), '重渲染后当前账号不是「家人」：' + activeRow[0].textOf());
+          assert.ok(toasts().some((t) => t.includes('已切换到 家人')), '没有提示「已切换到 家人」：' + toasts().join(' | '));
+        } finally {
+          win.HMS.refresh = previousRefresh;
+        }
+      });
+    });
+
+    await checkAsync('账号页：新建账号走弹层，空名报中文错，成功后自动切过去', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const root = await renderView('account'); // 首次渲染顺便认领老库
+        assert.equal(accountsMod.listAccounts().length, 1, '前置：先只有本机账号');
+
+        fireClick(findButton(root, '新建账号'));
+        await tick(30);
+        const sheet = latestOverlay('sheet-backdrop');
+        assert.ok(sheet, '点「新建账号」没有弹出输入名称的弹层');
+        const input = sheet.walk().find((n) => n.tagName === 'input');
+        assert.ok(input, '弹层里没有名称输入框');
+
+        // 空名：中文报错原样显示，弹层不关，也不该建出账号
+        input.value = '   ';
+        fireClick(buttonsWithText(sheet, '创建并切换')[0]);
+        await tick(40);
+        assert.ok(toasts().some((t) => t.includes('账号名称不能为空')), '空名没有显示「账号名称不能为空」：' + toasts().join(' | '));
+        assert.equal(accountsMod.listAccounts().length, 1, '空名不该建出账号');
+        assert.ok(latestOverlay('sheet-backdrop'), '空名后弹层被关掉了，用户没法改名字');
+
+        // 正常名字：建号 → 自动切过去 → 提示从空数据开始
+        input.value = '家人';
+        fireClick(buttonsWithText(sheet, '创建并切换')[0]);
+        await tick(200);
+        const list = accountsMod.listAccounts();
+        assert.equal(list.length, 2, '没有建出账号 [' + toasts().join(' | ') + ']');
+        const created = list.find((a) => a.name === '家人');
+        assert.ok(created, '目录里没有「家人」');
+        assert.equal(accountsMod.getActiveAccount().id, created.id, '新建后没有自动切过去');
+        assert.equal(db.getDbName(), created.dbName, '新账号的库名没有生效：' + db.getDbName());
+        assert.ok(toasts().some((t) => t.includes('新账号从空数据开始')), '缺少「新账号从空数据开始」：' + toasts().join(' | '));
+        assert.equal(latestOverlay('sheet-backdrop'), null, '建号成功后弹层没有关掉');
+      });
+    });
+
+    await checkAsync('账号页：认领 hms 的老账号删除按钮禁用，并给出原因文案', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const root = await renderView('account');
+        const row = accountRow(root, '本机老数据');
+        assert.ok(row, '没有渲染出认领老库的账号行');
+        const removeBtn = rowButton(row, '删除');
+        assert.ok(removeBtn, '老账号没有删除按钮');
+        assert.equal(removeBtn.disabled, true, '老账号的删除按钮没有禁用');
+        assert.equal(removeBtn.getAttribute('aria-disabled'), 'true', '禁用的删除按钮缺少 aria-disabled');
+        assert.ok(row.textOf().includes('本机数据所在账号不能删除'), '缺少禁用原因文案：' + row.textOf());
+        // 数据层也拦得住：按钮被绕过也删不掉本机数据所在的账号
+        await assert.rejects(() => accountsMod.removeAccount(accountsMod.getActiveAccount().id), /本机数据所在账号不能删除/);
+        assert.equal(accountsMod.listAccounts().length, 1, '删除被拒绝后目录不该变');
+      });
+    });
+
+    await checkAsync('账号页：登录入口是禁用占位 + 「下一阶段」说明，不是假表单', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const root = await renderView('account');
+        const login = buttonsWithText(root, '登录 / 注册')[0];
+        assert.ok(login, '没有「登录 / 注册」入口占位');
+        assert.equal(login.disabled, true, '登录入口不是禁用状态');
+        assert.equal(login.getAttribute('aria-disabled'), 'true', '禁用的登录入口缺少 aria-disabled');
+        assert.ok(nodeText(root).includes('下一阶段开放'), '缺少「下一阶段开放」说明');
+        assert.equal(root.walk().some((n) => n.tagName === 'form'), false, '登录占位不该是假表单');
+        assert.equal(root.walk().filter((n) => n.tagName === 'input').length, 0, '登录占位不该有输入框');
+      });
+    });
+
+    await checkAsync('账号页：改名 —— 空名报中文错，成功后列表与当前账号都换新名字', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const root = await renderView('account');
+        const row = accountRow(root, '本机');
+        fireClick(rowButton(row, '改名'));
+        await tick(30);
+        const sheet = latestOverlay('sheet-backdrop');
+        assert.ok(sheet, '点「改名」没有弹出弹层');
+        const input = sheet.walk().find((n) => n.tagName === 'input');
+        assert.equal(input.value, '本机', '改名弹层没有带出当前名字');
+
+        input.value = '';
+        fireClick(buttonsWithText(sheet, '保存名称')[0]);
+        await tick(40);
+        assert.ok(toasts().some((t) => t.includes('账号名称不能为空')), '空名没有报「账号名称不能为空」');
+        assert.equal(accountsMod.getActiveAccount().name, '本机', '空名不该改掉名字');
+
+        input.value = '家里';
+        fireClick(buttonsWithText(sheet, '保存名称')[0]);
+        await tick(60);
+        assert.equal(accountsMod.getActiveAccount().name, '家里', '改名没有生效 [' + toasts().join(' | ') + ']');
+        assert.ok(toasts().some((t) => t.includes('已改名为 家里')), '没有提示改名成功：' + toasts().join(' | '));
+
+        const again = await renderView('account');
+        const names = byClass(again, 'account-row__name').map((n) => n.textOf());
+        assert.deepEqual(names, ['家里'], '重渲染后列表没有用新名字：' + names.join(' | '));
+      });
+    });
+
+    await checkAsync('账号页：删除走二次确认，删掉当前账号后自动切回本机账号', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const legacy = await accountsMod.ensureDefaultAccount();
+        const second = await accountsMod.createAccount({ name: '家人' });
+        await store.switchAccount(second.id); // 当前账号 = 家人
+        const root = await renderView('account');
+        fireClick(rowButton(accountRow(root, '家人'), '删除'));
+        await tick(30);
+
+        const dialog = latestOverlay('modal-backdrop');
+        assert.ok(dialog, '点删除没有二次确认');
+        assert.ok(dialog.textOf().includes('该账号的数据会从本机删除，且无法恢复'), '确认文案没说清后果：' + dialog.textOf());
+
+        // 先取消：账号必须还在
+        fireClick(buttonsWithText(dialog, '取消')[0]);
+        await tick(40);
+        assert.equal(accountsMod.listAccounts().length, 2, '取消删除后账号不该消失');
+        assert.equal(latestOverlay('modal-backdrop'), null, '取消后确认框没有关掉');
+
+        fireClick(rowButton(accountRow(root, '家人'), '删除'));
+        await tick(30);
+        fireClick(buttonsWithText(latestOverlay('modal-backdrop'), '删除')[0]);
+        await tick(120);
+        assert.equal(accountsMod.listAccounts().length, 1, '删除后目录里还剩账号');
+        assert.equal(accountsMod.getActiveAccount().id, legacy.id, '删掉当前账号后没有自动切回本机账号');
+        assert.equal(db.getDbName(), 'hms', '自动切回后库名不是老库：' + db.getDbName());
+        assert.ok(toasts().some((t) => t.includes('已切回')), '没有提示已切回哪个账号：' + toasts().join(' | '));
+      });
+    });
+
+    await checkAsync('账号页：localStorage 不可用时仍能渲染（空目录走引导，不白屏）', async () => {
+      clearOverlays();
+      const previousStorage = globalThis.localStorage;
+      delete globalThis.localStorage;
+      try {
+        const root = await renderView('account');
+        const text = nodeText(root);
+        assertNoLeak(text, 'account(无 localStorage)');
+        assert.equal(accountsMod.listAccounts().length, 0, '前置：没有 localStorage 时目录为空');
+        assert.equal(byClass(root, 'account-row').length, 0, '目录为空时不该有账号行');
+        assert.ok(text.includes('还没有可切换的账号'), '空目录缺少引导文案');
+        assert.ok(text.includes('本机'), '没有 localStorage 时当前账号应回落本机');
+      } finally {
+        if (previousStorage !== undefined) globalThis.localStorage = previousStorage;
+      }
+    });
+
+    await checkAsync('账号页：数据规模取不到时显示「—」，不白屏也不漏 NaN', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const previousIdb = globalThis.indexedDB;
+        db.resetDbConnection(); // 丢掉缓存的连接，下一次读必须真的去开库
+        globalThis.indexedDB = { open() { throw new Error('模拟数据库打不开'); } };
+        try {
+          const root = await renderView('account');
+          const text = nodeText(root);
+          assertNoLeak(text, 'account(统计失败)');
+          const stats = byClass(root, 'stat');
+          assert.equal(stats.length, 4, '数据规模应有 4 项');
+          for (const node of stats) assert.equal(node.textOf().slice(0, 1), '—', '取不到条数时应显示「—」：' + node.textOf());
+          assert.ok(text.includes('本机'), '统计失败也不该丢掉当前账号名');
+        } finally {
+          globalThis.indexedDB = previousIdb;
+        }
+      });
+    });
+
+    await checkAsync('设置页账号入口：显示当前账号名，点击跳 #/account', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        accountsMod.renameAccount(accountsMod.getActiveAccount().id, '家里');
+
+        const win = globalThis.window;
+        const previousNavigate = win.HMS.navigate;
+        const navigated = [];
+        win.HMS.navigate = (hash) => { navigated.push(hash); };
+        try {
+          const root = await renderView('settings');
+          const entry = byClass(root, 'account-entry')[0];
+          assert.ok(entry, '设置页没有账号入口');
+          assert.ok(entry.textOf().includes('账号'), '入口缺少「账号」字样');
+          assert.ok(entry.textOf().includes('家里'), '入口右侧没有显示当前账号名：' + entry.textOf());
+          fireClick(entry);
+          assert.deepEqual(navigated, ['#/account'], '账号入口没有跳到 #/account');
+
+          // 原有内容一条都不能少（这行入口不能挤掉老断言）
+          const text = nodeText(root);
+          assertNoLeak(text, 'settings(账号入口)');
+          for (const needle of ['个人档案', '每日目标', '视觉识别', '导出 JSON', '清空所有健康数据']) {
+            assert.ok(text.includes(needle), '设置页原有内容丢了：' + needle);
+          }
+        } finally {
+          win.HMS.navigate = previousNavigate;
+        }
+      });
+    });
+
+    await checkAsync('路由：ROUTES 里有 account、不进底部 tab，refresh() 能把 #/account 渲染出来', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const win = globalThis.window;
+        const view = new dom.FakeNode('div');
+        const originalGetById = dom.doc.getElementById;
+        const previousHash = win.location.hash;
+        dom.doc.getElementById = (id) => (id === 'view' ? view : originalGetById(id));
+        win.location.hash = '#/account';
+        try {
+          const app = await freshApp();
+          assert.equal(typeof app.ROUTES.account, 'function', 'ROUTES 里没有 account 路由');
+          assert.equal(app.TAB_ROUTES.includes('account'), false, 'account 不该占底部 tab');
+          await app.refresh();
+          await tick(60);
+          await app.refresh();
+          await tick(60);
+          const text = nodeText(view);
+          assert.ok(text.includes('账号'), 'refresh() 没有渲染出账号页：' + text.slice(0, 120));
+          assert.ok(byClass(view, 'account-row').length >= 1, '渲染出来的账号页里没有账号行');
+        } finally {
+          dom.doc.getElementById = originalGetById;
+          win.location.hash = previousHash;
+        }
+      });
+    });
+
+
   } finally {
     if (urlSnapshot) {
       if (typeof urlSnapshot.create === 'function') URL.createObjectURL = urlSnapshot.create;

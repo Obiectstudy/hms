@@ -14,6 +14,8 @@ const MODULES = [
   'app.js',
   'js/nutrition.js',
   'js/pure.js',
+  'js/accounts.js',
+  'js/sync.js',
   'js/db.js',
   'js/store.js',
   'js/foods.js',
@@ -26,6 +28,7 @@ const MODULES = [
   'views/exercise.js',
   'views/water.js',
   'views/settings.js',
+  'views/account.js',
   'views/debug.js',
 ];
 

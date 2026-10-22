@@ -3,7 +3,7 @@ import { el, toast, confirmDialog, fmt1 } from '../js/ui.js';
 import { localDateStr } from '../js/nutrition.js';
 import {
   getProfile, saveProfile, getGoals, saveGoals, computeDefaultGoals,
-  getSettings, saveSettings,
+  getSettings, saveSettings, currentAccount,
   exportJSON, exportCSV, importJSON, clearAllData, exportStatus,
 } from '../js/store.js';
 import { testConnection, MODEL_CANDIDATES, DEFAULT_BASE_URL, DEFAULT_MODEL } from '../js/vision.js';
@@ -70,7 +70,11 @@ export function backupStatusText(status) {
 }
 
 export async function render(root) {
-  const [profileRaw, goals, settings] = await Promise.all([getProfile(), getGoals(), getSettings()]);
+  const [profileRaw, goals, settings, account] = await Promise.all([
+    getProfile(), getGoals(), getSettings(),
+    // 账号名只用来显示；取不到也不该让整页渲染失败
+    currentAccount().catch(() => null),
+  ]);
   const profile = profileRaw || {};
   const currentSettings = settings || {};
 
@@ -80,6 +84,15 @@ export async function render(root) {
       el('div', { className: 'muted', text: '数据只保存在本机浏览器' }),
     ),
     el('button', { className: 'btn btn--ghost btn--sm', text: '返回今日', onClick: () => go('#/') }),
+  ));
+
+  // ---- 账号（本机多账号的入口，右侧显示当前是谁） ----
+  root.appendChild(el('div', { className: 'card' },
+    el('button', { className: 'account-entry', onClick: () => go('#/account') },
+      el('span', { className: 'account-entry__label', text: '账号' }),
+      el('span', { className: 'account-entry__value', text: account && account.name ? account.name : '本机' }),
+      el('span', { className: 'account-entry__caret', text: '›' }),
+    ),
   ));
 
   // ---- 个人档案 ----

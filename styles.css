@@ -75,7 +75,7 @@ a { color: var(--brand-2); text-decoration: none; }
 .page {
   max-width: 520px;
   margin: 0 auto;
-  padding: 16px 14px calc(var(--tabbar-h) + 24px + env(safe-area-inset-bottom));
+  padding: calc(16px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) calc(var(--tabbar-h) + 24px + env(safe-area-inset-bottom)) calc(14px + env(safe-area-inset-left));
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -85,12 +85,56 @@ a { color: var(--brand-2); text-decoration: none; }
   position: sticky;
   top: 0;
   z-index: 40;
-  padding: 10px 14px;
+  padding: calc(10px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) 10px calc(14px + env(safe-area-inset-left));
   background: var(--danger);
   color: var(--on-brand);
   font-size: 13px;
   text-align: center;
 }
+
+/* ---------- iOS 安装引导（Safari 分享 → 添加到主屏幕，仅非 standalone 出现）---------- */
+
+.ios-hint {
+  position: sticky;
+  top: 0;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px calc(12px + env(safe-area-inset-left));
+  background: var(--brand-soft);
+  border-bottom: 1px solid var(--brand-glow);
+  color: var(--text);
+}
+.ios-hint__icon {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: var(--brand-2);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ios-hint__text { flex: 1; min-width: 0; }
+.ios-hint__title { font-size: 13px; font-weight: 600; color: var(--brand-2); }
+.ios-hint__sub { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+.ios-hint__close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin-right: -6px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 20px;
+  line-height: 1;
+}
+.ios-hint__close:active { background: var(--tap); }
 
 /* ---------- 卡片与文本 ---------- */
 
@@ -701,7 +745,7 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   flex-direction: column;
   background: var(--surface);
   border-radius: var(--radius) var(--radius) 0 0;
-  padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+  padding: 14px calc(16px + env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
   animation: sheet-in .2s ease-out both;
 }
 @keyframes sheet-in { from { transform: translateY(18px); opacity: .6; } to { transform: none; opacity: 1; } }
@@ -746,6 +790,8 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   background: var(--surface);
   border-top: 1px solid var(--line);
   padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
   box-shadow: 0 -6px 22px rgba(13, 52, 42, .05);
 }
 .tabbar__inner {
@@ -1009,6 +1055,77 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 }
 
 .bmi-hint { font-size: 12px; line-height: 1.5; color: var(--text-2); }
+
+
+/* ---------- 账号（设置页入口 + 账号页） ---------- */
+
+/* 设置页一行入口：整行可点，右侧是当前账号名。 */
+.account-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.account-entry__label { font-weight: 600; }
+.account-entry__value { flex: 1; min-width: 0; text-align: right; color: var(--text-2); font-size: 13px; overflow-wrap: anywhere; }
+.account-entry__caret { flex: none; color: var(--text-2); font-size: 16px; }
+
+.account-name { font-size: 18px; font-weight: 700; letter-spacing: -.2px; overflow-wrap: anywhere; }
+.account-stats { margin: 2px 0; }
+.account-new { margin-top: 4px; }
+
+.account-list { display: flex; flex-direction: column; }
+
+.account-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.account-row:last-child { border-bottom: none; }
+.account-row--active { background: var(--brand-soft); border-radius: var(--radius-sm); padding: 6px 8px; }
+
+/* 点一下切换：主按钮占满剩余宽度，点击区 44px 起。 */
+.account-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 44px;
+  padding: 6px 4px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.account-row__name { font-weight: 600; overflow-wrap: anywhere; }
+.account-row__meta { font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
+
+.account-row__acts { display: flex; flex: none; gap: 6px; }
+.account-row__btn {
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--brand-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--brand-2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.account-row__btn--danger { border-color: var(--danger-line); color: var(--danger); }
+.account-row__btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.account-row__note { flex-basis: 100%; font-size: 12px; color: var(--text-2); }
 
 @media (max-width: 359px) {
   .bmi-value__num { font-size: 34px; }

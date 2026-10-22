@@ -7,7 +7,9 @@
  * 直接执行本文件（node tests/logic.test.mjs）也会自己跑一遍。
  *
  * 覆盖面：nutrition.js 全部导出 + 边界（含 kg/斤 换算、移动平均）、pure.js 的整形/去重/聚合/CSV/
- * 套餐模板/最近吃过/导出天数，以及「导出→清空→导入」的纯逻辑往返一致性。
+ * 套餐模板/最近吃过/导出天数，以及「导出→清空→导入」的纯逻辑往返一致性；
+ * 文件末尾另有一段「本地多账号」用例：账号目录本身、切换账号后的库名与连接、以及
+ * A/B 两库的物理隔离（持久化假 IDB + 假 localStorage）。
  * IndexedDB 路径：Node 没有 indexedDB，默认只能断言「不可用时抛中文错误」；
  * 唯一例外是 store 的 settings / 套餐 / 导出状态，用文件末尾的最小假 IDB 真跑一遍后立即清理。
  */
@@ -20,6 +22,8 @@ import * as nutrition from '../js/nutrition.js';
 import * as pure from '../js/pure.js';
 import * as db from '../js/db.js';
 import * as store from '../js/store.js';
+import * as accounts from '../js/accounts.js';
+import * as sync from '../js/sync.js';
 
 const IDB_MSG = '当前浏览器禁用了本地存储，数据无法保存';
 
@@ -1239,6 +1243,12 @@ function testPurity() {
 const DB_EXPORTS = [
   'openDb', 'getAll', 'get', 'put', 'del', 'getOneByIndex', 'getAllByIndex',
   'deleteAll', 'getMeta', 'setMeta', 'dumpAll', 'loadAll', 'clearBusinessData',
+  // 多账号：库名可切换，否则账号切换对存储层无效
+  'getDbName', 'setDbName', 'resetDbConnection', 'prepareDatabase',
+];
+const ACCOUNT_EXPORTS = [
+  'listAccounts', 'getActiveAccount', 'setActiveAccount', 'createAccount',
+  'renameAccount', 'removeAccount', 'ensureDefaultAccount', 'dbNameForAccount',
 ];
 const STORE_EXPORTS = [
   'getProfile', 'saveProfile', 'getGoals', 'saveGoals', 'computeDefaultGoals', 'getSettings', 'saveSettings',
@@ -1247,6 +1257,9 @@ const STORE_EXPORTS = [
   'recentWeights', 'exportJSON', 'importJSON', 'exportCSV', 'clearAllData',
   'getMealTemplates', 'saveMealTemplate', 'saveDayTemplate', 'deleteMealTemplate',
   'recentFoodItems', 'markExported', 'exportStatus',
+  'currentAccount', 'switchAccount',
+  // 云同步的纯数据面（网络在阶段 3 的适配器里）
+  'getSyncState', 'setSyncState', 'clearSyncState', 'getSyncPayload',
 ];
 
 async function testModules() {
@@ -1362,8 +1375,16 @@ async function testModules() {
  * 用完必须把 dbPromise 缓存也清掉（调 db 实例的 onversionchange），
  * 否则后面的「IDB 不可用」断言会拿到这个假库而假通过。
  */
-function createFakeIndexedDb() {
+function createFakeIndexedDb(options = {}) {
+  // persistent：同名库在多次 open 之间保留数据（真浏览器就是这样），账号隔离用例必须用它
+  // deleteBlocked：deleteDatabase 永远 onblocked，模拟别的标签页占着不让删
+  const persistent = !!options.persistent;
+  const deleteBlocked = !!options.deleteBlocked;
   const databases = [];
+  const byName = new Map();
+  const opened = [];
+  const deleted = [];
+  const closes = [];
   const clone = (v) => (typeof structuredClone === 'function' ? structuredClone(v) : JSON.parse(JSON.stringify(v)));
 
   class FakeRequest {
@@ -1478,6 +1499,7 @@ function createFakeIndexedDb() {
       this.stores = new Map();
       this.objectStoreNames = { contains: (n) => this.stores.has(n) };
       this.onversionchange = null;
+      this.closed = 0;
     }
     createObjectStore(name, options = {}) {
       const store = new FakeStore(name, options);
@@ -1493,13 +1515,21 @@ function createFakeIndexedDb() {
       }
       return new FakeTransaction(scoped, mode);
     }
-    close() {}
+    close() {
+      this.closed += 1;
+      closes.push(this.name);
+    }
   }
 
   const indexedDB = {
     open(name, version) {
-      const database = new FakeDb(name, version);
-      databases.push(database);
+      opened.push(name);
+      let database = persistent ? byName.get(name) : null;
+      if (!database) {
+        database = new FakeDb(name, version);
+        if (persistent) byName.set(name, database);
+        databases.push(database);
+      }
       const request = { result: database, error: null, onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null };
       setTimeout(() => {
         try {
@@ -1513,9 +1543,28 @@ function createFakeIndexedDb() {
       }, 0);
       return request;
     },
+    deleteDatabase(name) {
+      deleted.push(name);
+      const request = { error: null, onsuccess: null, onerror: null, onblocked: null };
+      setTimeout(() => {
+        if (deleteBlocked) {
+          if (request.onblocked) request.onblocked();
+          return;
+        }
+        // 真浏览器先给已打开的连接发 versionchange，让它们自己让路
+        for (const database of databases.filter((d) => d.name === name)) {
+          try { if (database.onversionchange) database.onversionchange(); } catch { /* 忽略 */ }
+        }
+        byName.delete(name);
+        const at = databases.findIndex((d) => d.name === name);
+        if (at >= 0) databases.splice(at, 1);
+        if (request.onsuccess) request.onsuccess();
+      }, 0);
+      return request;
+    },
   };
 
-  return { indexedDB, databases };
+  return { indexedDB, databases, opened, deleted, closes, db: (name) => byName.get(name) };
 }
 
 async function testStoreSettings() {
@@ -1981,6 +2030,944 @@ async function testStoreExerciseLog() {
   });
 }
 
+// ---------- 本地多账号：目录 / 切换 / 两库物理隔离 ----------
+
+/**
+ * 账号用例的舞台：同名 open 拿到同一份数据的假 IDB（真浏览器行为）+ 假 localStorage。
+ * 既有的 withFakeIdb 每次 open 都是空库，只够单库场景，证明不了「两个账号不串库」。
+ */
+async function withFakeAccounts(fn, options = {}) {
+  const fake = createFakeIndexedDb({ persistent: true, ...options });
+  const bag = new Map();
+  const prevIdb = globalThis.indexedDB;
+  const prevStorage = globalThis.localStorage;
+  globalThis.indexedDB = fake.indexedDB;
+  globalThis.localStorage = {
+    getItem: (key) => (bag.has(key) ? bag.get(key) : null),
+    setItem: (key, value) => { bag.set(key, String(value)); },
+    removeItem: (key) => { bag.delete(key); },
+  };
+  try {
+    return await fn(fake);
+  } finally {
+    // 与 withFakeIdb 同样的收尾：别把假库的单例或全局漏给后面的套件
+    for (const database of fake.databases) {
+      try { if (database.onversionchange) database.onversionchange(); } catch { /* 忽略 */ }
+    }
+    try { await db.setDbName(accounts.LEGACY_DB_NAME); } catch { /* 没有 IDB 就忽略 */ }
+    db.resetDbConnection();
+    if (prevIdb === undefined) delete globalThis.indexedDB; else globalThis.indexedDB = prevIdb;
+    if (prevStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = prevStorage;
+  }
+}
+
+function catalogRaw() {
+  return JSON.parse(globalThis.localStorage.getItem(accounts.CATALOG_KEY));
+}
+
+function activeRaw() {
+  return globalThis.localStorage.getItem(accounts.ACTIVE_KEY);
+}
+
+async function testAccountsContract() {
+  check('accounts.js 导出契约与常量完整', () => {
+    eq(accounts.CATALOG_KEY, 'hms.accounts');
+    eq(accounts.ACTIVE_KEY, 'hms.activeAccount');
+    eq(accounts.LEGACY_DB_NAME, 'hms');
+    eq(accounts.MAX_ACCOUNTS, 8);
+    for (const name of ACCOUNT_EXPORTS) eq(typeof accounts[name], 'function', "accounts." + name + " 缺失");
+  });
+
+  check('accounts.js 只认 localStorage / indexedDB 两个入口，不碰 DOM 与网络', () => {
+    const src = sourceOf('accounts.js');
+    for (const token of ['document', 'window', 'fetch(']) ok(!src.includes(token), "accounts.js 不应出现 " + token);
+  });
+
+  await checkAsync('db.setDbName 在没有 indexedDB 时抛中文错误（不让调用方以为切库成功了）', async () => {
+    if (!IDB_ABSENT) return;
+    let msg = '';
+    try {
+      await db.setDbName('hms-u-x');
+    } catch (err) {
+      msg = err.message;
+    }
+    eq(msg, IDB_MSG);
+    db.resetDbConnection();
+  });
+}
+
+async function testAccountsCatalog() {
+  await checkAsync('accounts: ensureDefaultAccount 首次运行认领老库 hms 并设为当前', async () => {
+    await withFakeAccounts(async (fake) => {
+      deep(accounts.listAccounts(), [], '还没有账号时目录是空的');
+      eq(accounts.getActiveAccount(), null);
+
+      const a = await accounts.ensureDefaultAccount();
+      eq(a.dbName, 'hms', '第一个账号必须认领老库，不搬迁任何数据');
+      eq(a.name, '本机');
+      eq(typeof a.id, 'string');
+      ok(a.id.length > 0, 'id 不能为空');
+      ok(a.createdAt > 0, 'createdAt 要有效');
+      eq(accounts.getActiveAccount().id, a.id, '第一个账号要成为当前账号');
+      eq(activeRaw(), a.id);
+      eq(catalogRaw().length, 1);
+      deep(accounts.listAccounts()[0], a);
+      deep(fake.opened, [], '登记账号不该顺手打开数据库');
+
+      const again = await accounts.ensureDefaultAccount();
+      eq(again.id, a.id, '重复调用必须是同一个账号');
+      eq(catalogRaw().length, 1);
+      eq(accounts.listAccounts().length, 1);
+    });
+  });
+
+  await checkAsync('accounts: ensureDefaultAccount 幂等，坏目录也能自愈且不重复建', async () => {
+    await withFakeAccounts(async () => {
+      const a = await accounts.ensureDefaultAccount();
+      for (let i = 0; i < 3; i += 1) eq((await accounts.ensureDefaultAccount()).id, a.id);
+      eq(accounts.listAccounts().length, 1);
+
+      // 有账号但当前账号丢了（手改/清键）：认最早的，不新建
+      const b = await accounts.createAccount({ name: '爸爸' });
+      globalThis.localStorage.removeItem(accounts.ACTIVE_KEY);
+      eq(accounts.getActiveAccount(), null);
+      eq((await accounts.ensureDefaultAccount()).id, a.id, '没有当前账号时认最早的账号');
+      eq(accounts.listAccounts().length, 2, '自愈不该多建账号');
+      ok(catalogRaw().some((row) => row.id === b.id), '另一个账号不能被自愈冲掉');
+    });
+  });
+
+  await checkAsync('accounts: createAccount 建出 hms-u-<id> 的独立库并建全 store / 索引', async () => {
+    await withFakeAccounts(async (fake) => {
+      const a = await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '  爸爸 ' });
+      eq(b.name, '爸爸', '名称应去掉首尾空白');
+      eq(b.dbName, 'hms-u-' + b.id);
+      ok(b.dbName !== 'hms' && b.dbName !== a.dbName, '新账号必须有自己的库');
+      eq(catalogRaw().length, 2);
+      deep(accounts.listAccounts().map((x) => x.dbName), ['hms', b.dbName], '目录按创建顺序升序');
+
+      ok(fake.opened.includes(b.dbName), 'createAccount 应该把新库建出来');
+      const created = fake.db(b.dbName);
+      ok(created, '新库不存在');
+      for (const storeName of ['meta', 'weights', 'meals', 'exercises', 'waters', 'photos']) {
+        ok(created.stores.has(storeName), "新库缺 object store：" + storeName);
+      }
+      for (const entry of [['weights', 'by_date'], ['meals', 'by_date'], ['exercises', 'by_date'], ['waters', 'by_date']]) {
+        ok(created.stores.get(entry[0]).indexes.has(entry[1]), "新库缺索引：" + entry.join('.'));
+      }
+      ok(created.closed >= 1, '建库的临时连接要关掉，不能占着');
+      eq(db.getDbName(), 'hms', '建别人的库不该动当前连接');
+
+      const c = await accounts.createAccount('妈妈');
+      eq(c.name, '妈妈', '直接传名字也要能用');
+      eq(accounts.listAccounts().length, 3);
+    });
+  });
+
+  await checkAsync('accounts: 超过 MAX_ACCOUNTS 抛「最多只能建 8 个账号」', async () => {
+    await withFakeAccounts(async () => {
+      await accounts.ensureDefaultAccount();
+      for (let i = 1; i < accounts.MAX_ACCOUNTS; i += 1) await accounts.createAccount({ name: "账号" + i });
+      eq(accounts.listAccounts().length, 8);
+      let msg = '';
+      try { await accounts.createAccount({ name: '第九个' }); } catch (err) { msg = err.message; }
+      eq(msg, '最多只能建 8 个账号');
+      eq(accounts.listAccounts().length, 8, '被拒绝时不能留下半个账号');
+      eq(catalogRaw().length, 8);
+    });
+  });
+
+  await checkAsync('accounts: createAccount / renameAccount 空名抛「账号名称不能为空」', async () => {
+    await withFakeAccounts(async () => {
+      const a = await accounts.ensureDefaultAccount();
+      for (const bad of ['', '   ', null, undefined, 42, {}, []]) {
+        let msg = '';
+        try { await accounts.createAccount({ name: bad }); } catch (err) { msg = err.message; }
+        eq(msg, '账号名称不能为空', "createAccount 空名应报错：" + JSON.stringify(bad));
+        msg = '';
+        try { accounts.renameAccount(a.id, bad); } catch (err) { msg = err.message; }
+        eq(msg, '账号名称不能为空', "renameAccount 空名应报错：" + JSON.stringify(bad));
+      }
+      eq(accounts.listAccounts().length, 1);
+      eq(accounts.listAccounts()[0].name, '本机');
+    });
+  });
+
+  await checkAsync('accounts: renameAccount 改名不换库；setActiveAccount 只认目录里的 id', async () => {
+    await withFakeAccounts(async () => {
+      const a = await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '爸爸' });
+
+      const renamed = accounts.renameAccount(b.id, ' 老爸 ');
+      eq(renamed.id, b.id);
+      eq(renamed.name, '老爸');
+      eq(renamed.dbName, b.dbName, '改名不能换库');
+      eq(accounts.listAccounts().find((x) => x.id === b.id).name, '老爸');
+      eq(catalogRaw().find((x) => x.id === b.id).name, '老爸');
+      eq(accounts.listAccounts().find((x) => x.id === a.id).name, '本机', '改名不能碰到别人');
+
+      let msg = '';
+      try { accounts.renameAccount('nope', '谁'); } catch (err) { msg = err.message; }
+      eq(msg, '账号不存在');
+
+      eq(accounts.setActiveAccount(b.id).id, b.id);
+      eq(accounts.getActiveAccount().id, b.id);
+      eq(activeRaw(), b.id);
+      for (const bad of ['nope', '', '   ', null, undefined, 42, {}, a.id + 'x', b.dbName]) {
+        eq(accounts.setActiveAccount(bad), null, "setActiveAccount 传不存在的 id 应返回 null：" + JSON.stringify(bad));
+      }
+      eq(accounts.getActiveAccount().id, b.id, '找不到的 id 不能改当前账号');
+      eq(activeRaw(), b.id);
+      eq(accounts.setActiveAccount(a.id).id, a.id);
+      eq(accounts.getActiveAccount().id, a.id);
+    });
+  });
+}
+
+async function testAccountsDirtyStorage() {
+  await checkAsync('accounts: 脏 localStorage 一律安全降级（坏 JSON / 非数组 / 缺字段）', async () => {
+    await withFakeAccounts(async () => {
+      const dirty = [
+        '{oops', 'null', '"x"', '123', '{"a":1}', '[1,2,3]', '[null]',
+        '[{"name":"没有id"}]', '[{"id":"x"}]', '[{"id":"","name":"空id"}]',
+        '[{"id":"x","name":"   "}]', '[{"id":1,"name":2}]',
+      ];
+      for (const raw of dirty) {
+        globalThis.localStorage.setItem(accounts.CATALOG_KEY, raw);
+        deep(accounts.listAccounts(), [], "脏目录应返回 []：" + raw);
+        eq(accounts.getActiveAccount(), null, "脏目录下不该有当前账号：" + raw);
+      }
+
+      // 缺 dbName 的记录按 id 推库名：绝不能都回落到老库，否则两个账号会串
+      globalThis.localStorage.setItem(accounts.CATALOG_KEY, JSON.stringify([{ id: 'u1', name: '爸爸', createdAt: 1 }]));
+      globalThis.localStorage.setItem(accounts.ACTIVE_KEY, 'u1');
+      const repaired = accounts.getActiveAccount();
+      eq(repaired.id, 'u1');
+      eq(repaired.dbName, 'hms-u-u1');
+      eq(accounts.dbNameForAccount(repaired), 'hms-u-u1');
+      eq(accounts.dbNameForAccount(null), 'hms', '取不到账号时回落老库名');
+      eq(accounts.dbNameForAccount({}), 'hms');
+      eq(accounts.dbNameForAccount({ dbName: '   ' }), 'hms');
+
+      // 同一个库被两个账号认领（目录被改坏）：只认先出现的那个
+      globalThis.localStorage.setItem(
+        accounts.CATALOG_KEY,
+        JSON.stringify([{ id: 'a', name: '甲', dbName: 'hms' }, { id: 'b', name: '乙', dbName: 'hms' }]),
+      );
+      eq(accounts.listAccounts().length, 1, '同一个库只能有一个账号');
+
+      // 目录被写坏时还能自愈出一个可用账号，且自愈本身也幂等
+      globalThis.localStorage.setItem(accounts.CATALOG_KEY, '{oops');
+      globalThis.localStorage.setItem(accounts.ACTIVE_KEY, 'u1');
+      const healed = await accounts.ensureDefaultAccount();
+      eq(healed.dbName, 'hms');
+      eq(accounts.listAccounts().length, 1);
+      eq((await accounts.ensureDefaultAccount()).id, healed.id);
+    });
+  });
+
+  await checkAsync('accounts: localStorage 被禁用 / 不存在时照样降级，不白屏', async () => {
+    const fake = createFakeIndexedDb({ persistent: true });
+    const prevIdb = globalThis.indexedDB;
+    const prevStorage = globalThis.localStorage;
+    globalThis.indexedDB = fake.indexedDB;
+    globalThis.localStorage = {
+      getItem() { throw new Error('SecurityError'); },
+      setItem() { throw new Error('SecurityError'); },
+      removeItem() { throw new Error('SecurityError'); },
+    };
+    try {
+      deep(accounts.listAccounts(), []);
+      eq(accounts.getActiveAccount(), null);
+      eq(accounts.setActiveAccount('x'), null);
+
+      const a = await accounts.ensureDefaultAccount();
+      eq(a.dbName, 'hms', '存不进去也要给一个能跑起来的账号');
+      eq(accounts.listAccounts().length, 0, '写不进去时目录只能是空的');
+
+      let msg = '';
+      try { await accounts.createAccount({ name: '爸爸' }); } catch (err) { msg = err.message; }
+      eq(msg, '本地存储不可用，无法保存账号', '写不进去要明说，不能假装建好了');
+      msg = '';
+      try { accounts.renameAccount('x', '谁'); } catch (err) { msg = err.message; }
+      eq(msg, '账号不存在');
+
+      // 连 localStorage 对象都没有（老 WebView）
+      delete globalThis.localStorage;
+      deep(accounts.listAccounts(), []);
+      eq(accounts.getActiveAccount(), null);
+      deep(fake.deleted, []);
+    } finally {
+      db.resetDbConnection();
+      if (prevIdb === undefined) delete globalThis.indexedDB; else globalThis.indexedDB = prevIdb;
+      if (prevStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = prevStorage;
+    }
+  });
+}
+
+async function testAccountsIsolation() {
+  await checkAsync('db: 还没有任何账号时默认还是老库 hms（老用户开箱即用）', async () => {
+    await withFakeAccounts(async (fake) => {
+      eq(accounts.listAccounts().length, 0);
+      eq(db.getDbName(), 'hms');
+      await db.setMeta('probe', '老数据');
+      eq(await db.getMeta('probe'), '老数据');
+      ok(fake.opened.includes('hms'), '老用户读写必须落在 hms 库上');
+    });
+  });
+
+  await checkAsync('accounts: 隔离——A 写的体重切到 B 读不到，切回 A 还在（两库物理分开）', async () => {
+    await withFakeAccounts(async (fake) => {
+      const a = await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '爸爸' });
+      const date = nutrition.localDateStr();
+
+      await store.switchAccount(a.id);
+      eq(db.getDbName(), 'hms');
+      await store.logWeight({ date, weightKg: 70.5 });
+
+      await store.switchAccount(b.id);
+      eq(db.getDbName(), b.dbName, '切账号后读写目标库必须跟着变');
+      eq((await db.getAll('weights')).length, 0, '切到 B 不能读到 A 的体重');
+      eq(await store.getWater(date), 0);
+      await store.logWeight({ date, weightKg: 61 });
+      eq((await db.getAll('weights')).length, 1);
+
+      await store.switchAccount(a.id);
+      eq(db.getDbName(), 'hms');
+      const rows = await db.getAll('weights');
+      eq(rows.length, 1, '切回 A 后 A 的数据必须还在');
+      eq(rows[0].weightKg, 70.5);
+      eq(rows[0].date, date);
+
+      // 不是同一份数据加了过滤，而是两个独立的库各存各的
+      const dbA = fake.db('hms');
+      const dbB = fake.db(b.dbName);
+      ok(dbA && dbB && dbA !== dbB, 'A / B 必须是两个不同的库');
+      eq(dbA.stores.get('weights').data.size, 1);
+      eq(dbB.stores.get('weights').data.size, 1);
+      eq(dbA.stores.get('weights').get(1).weightKg, 70.5);
+      eq(dbB.stores.get('weights').get(1).weightKg, 61);
+      eq(dbB.stores.get('meals').data.size, 0);
+      eq(dbB.stores.get('meta').data.size, 0, 'B 的 meta 也是空的');
+    });
+  });
+
+  await checkAsync('db: 切换账号会关掉旧连接，不会把 A 的写入落到 B', async () => {
+    await withFakeAccounts(async (fake) => {
+      const a = await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '爸爸' });
+
+      await store.switchAccount(a.id);
+      const connA = fake.db('hms');
+      eq(fake.closes.includes('hms'), false, '切走之前 A 的连接该是活的');
+
+      await store.switchAccount(b.id);
+      eq(accounts.getActiveAccount().id, b.id);
+      eq(db.getDbName(), b.dbName);
+      ok(fake.closes.includes('hms'), '切走时旧连接必须被关掉，否则 A 的写入会落到 B');
+      ok(connA.closed >= 1);
+
+      await store.switchAccount(a.id);
+      eq(db.getDbName(), 'hms');
+      ok(fake.closes.includes(b.dbName), '切回时 B 的连接也要关掉');
+      eq((await store.currentAccount()).id, a.id);
+      ok(fake.opened.filter((name) => name === 'hms').length >= 2, '单例被重置后才可能重开同名库');
+    });
+  });
+
+  await checkAsync('db: setDbName / resetDbConnection 语义（切库真的换库、只清单例不换库）', async () => {
+    await withFakeAccounts(async (fake) => {
+      const a = await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '爸爸' });
+      await store.switchAccount(a.id);
+      await db.setMeta('probe', 'A');
+
+      await db.setDbName(b.dbName);
+      eq(db.getDbName(), b.dbName);
+      eq(await db.getMeta('probe'), null, '换库后读到的是 B 的空库');
+      await db.setMeta('probe', 'B');
+
+      db.resetDbConnection();
+      eq(db.getDbName(), b.dbName, '只清单例，不改库名');
+      eq(await db.getMeta('probe'), 'B', '重开后还是同一个库');
+
+      await store.switchAccount(a.id);
+      eq(db.getDbName(), 'hms');
+      eq(await db.getMeta('probe'), 'A', '切回 A 必须读到 A 自己的数据');
+
+      const c = await accounts.createAccount({ name: '妈妈' });
+      eq(db.getDbName(), 'hms', '建别人的库不该动当前连接');
+      ok(fake.db(c.dbName).stores.has('photos'), 'prepareDatabase 要把新库建全');
+
+      await db.setDbName('hms-u-不存在的库');
+      eq(db.getDbName(), 'hms-u-不存在的库', 'setDbName 钉住的库名优先');
+      eq(await db.getMeta('probe'), null);
+    });
+  });
+}
+
+async function testAccountsRemoval() {
+  await checkAsync('accounts: removeAccount 删账号 + 删库，数据随之消失', async () => {
+    await withFakeAccounts(async (fake) => {
+      const a = await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '爸爸' });
+      const date = nutrition.localDateStr();
+      await store.switchAccount(b.id);
+      await store.logWeight({ date, weightKg: 61 });
+      eq(fake.db(b.dbName).stores.get('weights').data.size, 1);
+
+      await accounts.removeAccount(b.id);
+      ok(fake.deleted.includes(b.dbName), '必须调用 indexedDB.deleteDatabase');
+      ok(fake.closes.includes(b.dbName), '删库前要先关掉这条连接，否则 onblocked 自锁');
+      eq(accounts.listAccounts().length, 1);
+      eq(accounts.listAccounts()[0].id, a.id);
+      eq(accounts.getActiveAccount().id, a.id, '删掉当前账号后目录应指向剩下的账号');
+      eq(catalogRaw().length, 1);
+      eq(fake.db(b.dbName), undefined, '删掉的库不该还留在盘上');
+
+      // 数据真的没了：重新打开这个名字只能是空库
+      await db.setDbName(b.dbName);
+      eq((await db.getAll('weights')).length, 0, '删库后不该还能读到 B 的体重');
+    });
+  });
+
+  await checkAsync('accounts: 认领 hms 的账号禁止删除（「本机数据所在账号不能删除」）', async () => {
+    await withFakeAccounts(async (fake) => {
+      const a = await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '爸爸' });
+      eq(a.dbName, 'hms');
+
+      let msg = '';
+      try { await accounts.removeAccount(a.id); } catch (err) { msg = err.message; }
+      eq(msg, '本机数据所在账号不能删除');
+      eq(accounts.listAccounts().length, 2, '拒绝时目录不能被改');
+      eq(accounts.getActiveAccount().id, a.id, '拒绝时当前账号不能被改');
+      deep(fake.deleted, [], '拒绝时不能删任何库');
+
+      // 删不存在的账号：幂等，什么都不做
+      await accounts.removeAccount('nope');
+      await accounts.removeAccount(null);
+      await accounts.removeAccount('');
+      eq(accounts.listAccounts().length, 2);
+
+      await accounts.removeAccount(b.id);
+      eq(accounts.listAccounts().length, 1);
+      ok(fake.deleted.includes(b.dbName));
+      eq(accounts.getActiveAccount().id, a.id);
+    });
+  });
+
+  await checkAsync('accounts: removeAccount 遇到 onblocked 也绝不永远挂着（超时兜底后照常结束）', async () => {
+    await withFakeAccounts(async (fake) => {
+      await accounts.ensureDefaultAccount();
+      const b = await accounts.createAccount({ name: '爸爸' });
+      const started = Date.now();
+      await accounts.removeAccount(b.id);
+      const cost = Date.now() - started;
+      ok(fake.deleted.includes(b.dbName), 'deleteDatabase 仍要被调用');
+      ok(cost < 3000, "被 blocked 时也要兜底结束，实际用了 " + cost + "ms");
+      eq(accounts.listAccounts().length, 1);
+    }, { deleteBlocked: true });
+  });
+
+  await checkAsync('store: currentAccount 没账号时自动认领老库，switchAccount 只认目录里的 id', async () => {
+    await withFakeAccounts(async () => {
+      deep(accounts.listAccounts(), []);
+      const a = await store.currentAccount();
+      eq(a.dbName, 'hms');
+      eq(accounts.listAccounts().length, 1);
+      eq((await store.currentAccount()).id, a.id, '第二次调用不该再建账号');
+
+      const b = await accounts.createAccount({ name: '爸爸' });
+      eq((await store.switchAccount(b.id)).id, b.id);
+      eq((await store.currentAccount()).id, b.id);
+      eq(db.getDbName(), b.dbName);
+
+      let msg = '';
+      try { await store.switchAccount('nope'); } catch (err) { msg = err.message; }
+      eq(msg, '账号不存在');
+      eq(accounts.getActiveAccount().id, b.id, '失败时不能改当前账号');
+      eq(db.getDbName(), b.dbName, '失败时不能切库');
+    });
+  });
+}
+
+// ---------- 云同步纯函数层（js/sync.js） ----------
+
+const SYNC_EXPORTS = [
+  'SNAPSHOT_VERSION', 'SYNC_STATE_KEY', 'checksum', 'buildSnapshot', 'parseSnapshot',
+  'planSync', 'makeConflictBackup', 'isConflictBackup', 'createDebouncer', 'snapshotSummary',
+];
+
+const SNAP_PAYLOAD = {
+  app: 'hms',
+  weights: [{ date: '2026-01-01', weightKg: 70 }],
+  meals: [{ date: '2026-01-01', slot: 'lunch' }],
+  exercises: [],
+  waters: [{ date: '2026-01-01', ml: 500 }],
+};
+
+/** 可控假时钟 + 定时器队列：注入 now/setTimer/clearTimer 后时间可确定性推进。 */
+function fakeClock(start = 0) {
+  let time = start;
+  let seq = 0;
+  const tasks = new Map();
+  const calls = { set: 0, clear: 0 };
+  return {
+    now: () => time,
+    setTimer: (fn, ms) => {
+      calls.set += 1;
+      const id = (seq += 1);
+      tasks.set(id, { at: time + ms, fn });
+      return id;
+    },
+    clearTimer: (id) => {
+      calls.clear += 1;
+      tasks.delete(id);
+    },
+    live: () => tasks.size,
+    calls,
+    advance(ms) {
+      const target = time + ms;
+      for (;;) {
+        const due = [...tasks.entries()].filter((entry) => entry[1].at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        tasks.delete(due[0]);
+        time = due[1].at;
+        due[1].fn(); // 到期时刻先落到 time 上，再触发，waited 才是确定值
+      }
+      time = target;
+    },
+  };
+}
+
+function testSyncPure() {
+  check('sync.js 导出契约完整（阶段 3 的适配器按这些名字调用）', () => {
+    eq(sync.SNAPSHOT_VERSION, 1);
+    eq(sync.SYNC_STATE_KEY, 'syncState');
+    for (const name of SYNC_EXPORTS) ok(name in sync, 'sync.' + name + ' 缺失');
+    for (const name of SYNC_EXPORTS.slice(2)) eq(typeof sync[name], 'function', name + ' 应是函数');
+  });
+
+  check('sync.js 源码零网络零 DOM（纯函数层，不许自己发请求）', () => {
+    const src = sourceOf('sync.js');
+    for (const token of ['fetch(', 'XMLHttpRequest', 'WebSocket', 'sendBeacon', 'document', 'window', 'localStorage', 'indexedDB', 'import']) {
+      ok(!src.includes(token), 'sync.js 不应出现 ' + token);
+    }
+  });
+
+  // ----- checksum -----
+
+  check('checksum: 同样的数据永远得同一个值，且是 8 位十六进制', () => {
+    const a = sync.checksum({ weights: [{ date: '2026-01-01', weightKg: 70 }], meals: [] });
+    const b = sync.checksum({ weights: [{ date: '2026-01-01', weightKg: 70 }], meals: [] });
+    eq(a, b);
+    ok(/^[0-9a-f]{8}$/.test(a), '不是 8 位十六进制：' + a);
+  });
+
+  check('checksum: 对象键顺序不影响（含嵌套对象）', () => {
+    eq(sync.checksum({ a: 1, b: 2 }), sync.checksum({ b: 2, a: 1 }));
+    eq(sync.checksum({ x: { a: 1, b: { c: 3, d: 4 } } }), sync.checksum({ x: { b: { d: 4, c: 3 }, a: 1 } }));
+  });
+
+  check('checksum: 数组顺序影响（顺序变了就算本地有改动）', () => {
+    ok(sync.checksum({ list: [1, 2, 3] }) !== sync.checksum({ list: [3, 2, 1] }));
+    ok(sync.checksum([1, 2]) !== sync.checksum([2, 1]));
+    eq(sync.checksum({ list: [1, 2, 3] }), sync.checksum({ list: [1, 2, 3] }));
+  });
+
+  check('checksum: 值变了校验和就变（数字 / 字符串 / 多一个键）', () => {
+    ok(sync.checksum({ v: 1 }) !== sync.checksum({ v: 2 }));
+    ok(sync.checksum({ v: '1' }) !== sync.checksum({ v: 1 }));
+    ok(sync.checksum({ a: 1 }) !== sync.checksum({ a: 1, b: 0 }));
+  });
+
+  check('checksum: 中文字符串可用，不同中文不同值', () => {
+    const a = sync.checksum({ note: '早餐吃了两个鸡蛋' });
+    ok(/^[0-9a-f]{8}$/.test(a), '中文输入也要出十六进制：' + a);
+    ok(a !== sync.checksum({ note: '午餐吃了两个鸡蛋' }));
+    eq(a, sync.checksum({ note: '早餐吃了两个鸡蛋' }));
+  });
+
+  check('checksum: 异常输入（函数 / Symbol / BigInt / 循环引用）不抛，兜底值稳定', () => {
+    const circular = { name: '环' };
+    circular.self = circular;
+    const values = [() => {}, Symbol('s'), 10n, circular, { deep: circular }].map((input) => sync.checksum(input));
+    for (const value of values) ok(/^[0-9a-f]{8}$/.test(value), '兜底值格式不对：' + value);
+    eq(new Set(values).size, 1, '异常输入的兜底值必须稳定且相同');
+  });
+
+  check('checksum: 与 JSON.stringify 语义一致（undefined/函数值的键被丢弃、Date 走 toJSON、过一遍 JSON 不变）', () => {
+    eq(sync.checksum({ a: 1, b: () => {}, c: undefined }), sync.checksum({ a: 1 }));
+    eq(sync.checksum({ d: new Date(0) }), sync.checksum({ d: '1970-01-01T00:00:00.000Z' }));
+    const payload = { meta: { z: 1, a: { b: [1, 2, { c: '中' }] } }, weights: [3, 1, 2] };
+    eq(sync.checksum(payload), sync.checksum(JSON.parse(JSON.stringify(payload))), '过一遍 JSON 不能改校验和');
+  });
+
+  // ----- buildSnapshot / parseSnapshot -----
+
+  check('buildSnapshot: 正常构造（账号去空格、rev/savedAt 保留、payload 原样引用）', () => {
+    const snap = sync.buildSnapshot({ accountId: ' u_1 ', rev: 7, savedAt: 1700000000000, payload: SNAP_PAYLOAD });
+    eq(snap.v, 1);
+    eq(snap.accountId, 'u_1');
+    eq(snap.rev, 7);
+    eq(snap.savedAt, 1700000000000);
+    eq(snap.payload, SNAP_PAYLOAD, 'payload 应原样带过去，不做深拷贝');
+  });
+
+  check('buildSnapshot: rev/savedAt 缺省时回落（rev=0、savedAt 用当前时间）', () => {
+    const before = Date.now();
+    const snap = sync.buildSnapshot({ accountId: 'u_1', payload: {} });
+    eq(snap.rev, 0);
+    ok(snap.savedAt >= before && snap.savedAt <= Date.now(), 'savedAt 应回落到当前时间：' + snap.savedAt);
+  });
+
+  check('buildSnapshot: 账号标识为空抛「快照缺少账号标识」', () => {
+    for (const accountId of ['', '   ', undefined, null, 42]) {
+      let msg = '';
+      try { sync.buildSnapshot({ accountId, payload: {} }); } catch (err) { msg = err.message; }
+      eq(msg, '快照缺少账号标识', 'accountId=' + String(accountId) + ' 时应抛中文错误');
+    }
+  });
+
+  check('buildSnapshot: payload 不是对象抛「快照缺少数据体」', () => {
+    for (const payload of [undefined, null, 'x', 42, [], () => {}]) {
+      let msg = '';
+      try { sync.buildSnapshot({ accountId: 'u_1', payload }); } catch (err) { msg = err.message; }
+      eq(msg, '快照缺少数据体', 'payload=' + String(payload) + ' 时应抛中文错误');
+    }
+  });
+
+  check('parseSnapshot: buildSnapshot 的产物能原样解析回来（含过一遍 JSON）', () => {
+    const snap = sync.buildSnapshot({ accountId: 'u_1', rev: 3, savedAt: 1000, payload: SNAP_PAYLOAD });
+    deep(sync.parseSnapshot(snap), snap);
+    deep(sync.parseSnapshot(JSON.parse(JSON.stringify(snap))), snap);
+  });
+
+  check('parseSnapshot: 非对象一律 null，绝不抛', () => {
+    for (const raw of [null, undefined, 0, 1, true, 'v1', '{}', [], () => {}, Symbol('s')]) {
+      eq(sync.parseSnapshot(raw), null, String(raw) + ' 应返回 null');
+    }
+  });
+
+  check('parseSnapshot: 版本不符 / 缺 v 一律 null', () => {
+    const base = { accountId: 'u_1', rev: 0, savedAt: 1000, payload: {} };
+    for (const v of [undefined, null, 0, 2, '1']) {
+      eq(sync.parseSnapshot({ ...base, v }), null, 'v=' + String(v) + ' 应返回 null');
+    }
+  });
+
+  check('parseSnapshot: rev 负数 / 非整数一律 null', () => {
+    const base = { v: 1, accountId: 'u_1', savedAt: 1000, payload: {} };
+    for (const rev of [-1, 1.5, '1', NaN, Infinity, null, undefined]) {
+      eq(sync.parseSnapshot({ ...base, rev }), null, 'rev=' + String(rev) + ' 应返回 null');
+    }
+  });
+
+  check('parseSnapshot: 缺 accountId（空串 / 纯空白 / 非字符串）一律 null', () => {
+    const base = { v: 1, rev: 0, savedAt: 1000, payload: {} };
+    for (const accountId of [undefined, null, '', '   ', 42]) {
+      eq(sync.parseSnapshot({ ...base, accountId }), null, 'accountId=' + String(accountId) + ' 应返回 null');
+    }
+  });
+
+  check('parseSnapshot: 缺 payload（null / 字符串 / 数组）一律 null', () => {
+    const base = { v: 1, accountId: 'u_1', rev: 0, savedAt: 1000 };
+    for (const payload of [undefined, null, 'x', 42, []]) {
+      eq(sync.parseSnapshot({ ...base, payload }), null, 'payload=' + String(payload) + ' 应返回 null');
+    }
+  });
+
+  check('parseSnapshot: savedAt 缺失或非法一律 null', () => {
+    const base = { v: 1, accountId: 'u_1', rev: 0, payload: {} };
+    for (const savedAt of [undefined, null, 0, -1, 'x', NaN, Infinity]) {
+      eq(sync.parseSnapshot({ ...base, savedAt }), null, 'savedAt=' + String(savedAt) + ' 应返回 null');
+    }
+  });
+
+  // ----- planSync：六条规则逐条钉死 -----
+
+  check('planSync 1/6: remote 为 null → push（首次上传）', () => {
+    const direct = sync.planSync({ localRev: 0, localChecksum: 'aaaa0000', syncedChecksum: null, remote: null });
+    eq(direct.action, 'push');
+    eq(direct.reason, '远端没有可用的快照，上传本机数据');
+    eq(sync.planSync({ remote: null }).action, 'push');
+  });
+
+  check('planSync 2/6: 本地无改动且 remote.rev === localRev → none', () => {
+    const r = sync.planSync({ localRev: 4, localChecksum: 'abcd1234', syncedChecksum: 'abcd1234', remote: { rev: 4 } });
+    eq(r.action, 'none');
+    eq(r.reason, '本地无改动且远端版本一致，无需同步');
+  });
+
+  check('planSync 3/6: 本地无改动且 remote.rev > localRev → pull（别的设备更新过）', () => {
+    const r = sync.planSync({ localRev: 4, localChecksum: 'abcd1234', syncedChecksum: 'abcd1234', remote: { rev: 9 } });
+    eq(r.action, 'pull');
+    eq(r.reason, '本地无改动，远端版本更新，拉取远端');
+  });
+
+  check('planSync 4/6: 本地有改动且 remote.rev === localRev → push', () => {
+    const r = sync.planSync({ localRev: 4, localChecksum: 'ffff0000', syncedChecksum: 'abcd1234', remote: { rev: 4 } });
+    eq(r.action, 'push');
+    eq(r.reason, '本地有改动，远端版本一致，上传本机数据');
+  });
+
+  check('planSync 5/6: 本地有改动且 remote.rev > localRev → conflict-pull（不静默丢数据）', () => {
+    const r = sync.planSync({ localRev: 4, localChecksum: 'ffff0000', syncedChecksum: 'abcd1234', remote: { rev: 9 } });
+    eq(r.action, 'conflict-pull');
+    eq(r.reason, '本地与远端都有改动，先备份本机数据再拉取远端');
+  });
+
+  check('planSync 6/6: remote.rev < localRev（远端倒退，异常）→ push 纠正', () => {
+    const r = sync.planSync({ localRev: 9, localChecksum: 'abcd1234', syncedChecksum: 'abcd1234', remote: { rev: 4 } });
+    eq(r.action, 'push');
+    eq(r.reason, '远端版本落后于本机，上传本机数据纠正远端');
+    // 远端倒退 + 本地也改过：仍然是 push，不能被误判成 pull 把本地改动冲掉
+    eq(sync.planSync({ localRev: 9, localChecksum: 'ffff0000', syncedChecksum: 'abcd1234', remote: { rev: 4 } }).action, 'push');
+  });
+
+  check('planSync: 从没同步过（syncedChecksum=null）一律算本地有改动，绝不静默丢数据', () => {
+    eq(sync.planSync({ localRev: 0, localChecksum: 'x1', syncedChecksum: null, remote: { rev: 0 } }).action, 'push');
+    eq(sync.planSync({ localRev: 0, localChecksum: 'x1', syncedChecksum: null, remote: { rev: 3 } }).action, 'conflict-pull');
+    eq(sync.planSync({ localRev: 0, localChecksum: 'x1', syncedChecksum: null, remote: null }).action, 'push');
+  });
+
+  check('planSync: 远端脏数据（非对象 / rev 不是非负整数）按「没有可用快照」处理 → push', () => {
+    for (const remote of [{}, { rev: 'x' }, { rev: -1 }, { rev: 1.5 }, 'oops', 5, []]) {
+      const r = sync.planSync({ localRev: 2, localChecksum: 'aaaa0000', syncedChecksum: 'aaaa0000', remote });
+      eq(r.action, 'push', 'remote=' + JSON.stringify(remote) + ' 应变通为首次上传');
+    }
+  });
+
+  // ----- 冲突副本 -----
+
+  check('makeConflictBackup / isConflictBackup: 正例（savedAt + payload，可过 JSON）', () => {
+    const backup = sync.makeConflictBackup({ payload: SNAP_PAYLOAD, savedAt: 1700000000000 });
+    deep(backup, { savedAt: 1700000000000, payload: SNAP_PAYLOAD });
+    eq(sync.isConflictBackup(backup), true);
+    eq(sync.isConflictBackup(JSON.parse(JSON.stringify(backup))), true);
+  });
+
+  check('makeConflictBackup: savedAt 缺省时回落到当前时间', () => {
+    const before = Date.now();
+    const backup = sync.makeConflictBackup({ payload: { a: 1 } });
+    ok(backup.savedAt >= before && backup.savedAt <= Date.now(), 'savedAt 不在当前时间附近：' + backup.savedAt);
+    eq(sync.isConflictBackup(backup), true);
+  });
+
+  check('isConflictBackup: 反例（只有半个形状 / 类型错 / 根本不是对象）', () => {
+    const bad = [null, undefined, 0, 'x', true, [], {}, { savedAt: 1 }, { payload: {} }, { savedAt: 0, payload: {} },
+      { savedAt: 'x', payload: {} }, { savedAt: 1, payload: [] }, { savedAt: 1, payload: 'x' }];
+    for (const raw of bad) eq(sync.isConflictBackup(raw), false, String(raw) + ' 不是冲突副本');
+  });
+
+  check('isConflictBackup: 正式快照不算副本（副本不带 v/accountId/rev）', () => {
+    const snap = sync.buildSnapshot({ accountId: 'u_1', rev: 1, savedAt: 1000, payload: {} });
+    eq(sync.isConflictBackup(snap), false);
+    eq('v' in sync.makeConflictBackup({ payload: {}, savedAt: 1 }), false, '副本不该带 v');
+    eq('rev' in sync.makeConflictBackup({ payload: {}, savedAt: 1 }), false, '副本不该带 rev');
+  });
+
+  // ----- 防抖调度 -----
+
+  check('createDebouncer: 连续 schedule 只 fire 一次，reason 取最后一次，计时被重置', () => {
+    const clock = fakeClock();
+    const fired = [];
+    const d = sync.createDebouncer({ delayMs: 5000, onFire: (reason, waited) => fired.push([reason, waited]), now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+
+    d.schedule('第一次改动');
+    clock.advance(1000);
+    d.schedule('第二次改动'); // 距第一次到期还有 4000ms
+    clock.advance(4000);
+    eq(fired.length, 0, '还没到第二次的窗口，不该 fire');
+    eq(d.pending(), true);
+    clock.advance(1000);
+    eq(fired.length, 1, '连续 schedule 只能触发一次');
+    deep(fired[0], ['第二次改动', 5000], 'onFire 应收到最后一次 reason 与真实等待时长');
+    eq(d.pending(), false);
+    eq(clock.live(), 0, 'fire 之后不该留下计时器');
+  });
+
+  check('createDebouncer: cancel 后不 fire，并且还能重新 schedule', () => {
+    const clock = fakeClock();
+    const fired = [];
+    const d = sync.createDebouncer({ delayMs: 5000, onFire: (reason) => fired.push(reason), now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+
+    d.schedule('被取消');
+    clock.advance(2000);
+    d.cancel();
+    eq(d.pending(), false);
+    eq(clock.live(), 0, 'cancel 应把计时器清掉');
+    clock.advance(60000);
+    eq(fired.length, 0, 'cancel 之后不能再 fire');
+
+    d.schedule('第二次');
+    eq(d.pending(), true);
+    clock.advance(5000);
+    deep(fired, ['第二次'], 'cancel 之后重新 schedule 要能正常触发');
+  });
+
+  check('createDebouncer: flush 立即 fire、清零计时、只触发一次', () => {
+    const clock = fakeClock();
+    const fired = [];
+    const d = sync.createDebouncer({ delayMs: 5000, onFire: (reason, waited) => fired.push([reason, waited]), now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+
+    d.schedule('手动同步');
+    d.flush();
+    deep(fired, [['手动同步', 0]], 'flush 必须同步触发，且 waited=0');
+    eq(d.pending(), false);
+    eq(clock.live(), 0, 'flush 应把计时器清掉');
+    clock.advance(60000);
+    eq(fired.length, 1, 'flush 之后旧窗口不能再补一枪');
+    d.flush();
+    eq(fired.length, 1, '没有未决触发时 flush 是空操作');
+  });
+
+  check('createDebouncer: 触发后回到空闲，可以再次被 schedule 触发', () => {
+    const clock = fakeClock();
+    const fired = [];
+    const d = sync.createDebouncer({ delayMs: 5000, onFire: (reason) => fired.push(reason), now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+    d.schedule('a');
+    clock.advance(5000);
+    d.schedule('b');
+    clock.advance(4999);
+    eq(fired.length, 1);
+    clock.advance(1);
+    deep(fired, ['a', 'b']);
+  });
+
+  check('createDebouncer: 注入的假时钟/定时器真的被用上，默认 delayMs=5000', () => {
+    const seen = [];
+    let ticks = 0;
+    const d = sync.createDebouncer({
+      onFire: () => {},
+      now: () => { ticks += 1; return 100; },
+      setTimer: (fn, ms) => { seen.push(['set', ms]); return 'id-1'; },
+      clearTimer: (id) => seen.push(['clear', id]),
+    });
+    d.schedule('x');
+    ok(ticks > 0, '注入的 now 必须被调用');
+    deep(seen, [['set', 5000]], '默认 delayMs 是 5000');
+    d.schedule('y');
+    deep(seen, [['set', 5000], ['clear', 'id-1'], ['set', 5000]], '再次 schedule 要先清掉旧计时再重排');
+    d.cancel();
+    deep(seen[seen.length - 1], ['clear', 'id-1']);
+    eq(d.pending(), false);
+  });
+
+  check('createDebouncer: 什么都不注入也能构造（默认 Date.now/setTimeout）', () => {
+    const d = sync.createDebouncer();
+    eq(d.pending(), false);
+    d.flush();  // 没有未决触发 → 空操作，不抛
+    d.cancel();
+    eq(d.pending(), false);
+  });
+
+  // ----- 摘要 -----
+
+  check('snapshotSummary: records 合计 weights+meals+exercises+waters，bytes>0', () => {
+    const snap = sync.buildSnapshot({ accountId: 'u_1', rev: 1, savedAt: 1700000000000, payload: SNAP_PAYLOAD });
+    const sum = sync.snapshotSummary(snap);
+    eq(sum.records, 3, 'weights 1 + meals 1 + waters 1 = 3');
+    eq(sum.savedAt, 1700000000000);
+    eq(sum.bytes, JSON.stringify(SNAP_PAYLOAD).length);
+    ok(sum.bytes > 0);
+  });
+
+  check('snapshotSummary: 缺数组字段按 0 条算，payload 为空对象时 bytes 仍 > 0', () => {
+    const snap = sync.buildSnapshot({ accountId: 'u_1', payload: { app: 'hms' } });
+    const sum = sync.snapshotSummary(snap);
+    eq(sum.records, 0);
+    ok(sum.bytes > 0, 'bytes=' + sum.bytes);
+  });
+
+  check('snapshotSummary: 非法输入一律 null', () => {
+    const bad = [null, undefined, 42, 'x', [], { v: 2 }, { v: 1, accountId: 'u_1', rev: 0, savedAt: 1 }, { v: 1, accountId: '', rev: 0, savedAt: 1, payload: {} }];
+    for (const raw of bad) eq(sync.snapshotSummary(raw), null, String(raw) + ' 应返回 null');
+  });
+}
+
+// ---------- store 的同步锚点与数据体（最小假 IDB，跑完清 db.js 单例） ----------
+
+async function testSyncStore() {
+  await checkAsync('store: getSyncState 默认值 { rev:0, savedAt:null, checksum:null }', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      deep(await store.getSyncState(), { rev: 0, savedAt: null, checksum: null });
+    });
+  });
+
+  await checkAsync('store: setSyncState / getSyncState 往返，落在 meta.syncState，非法值归一化', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.setSyncState({ rev: 3, savedAt: 1700000000000, checksum: 'abcd1234' });
+      deep(await store.getSyncState(), { rev: 3, savedAt: 1700000000000, checksum: 'abcd1234' });
+      // 键名必须就是 sync.js 的 SYNC_STATE_KEY（store 里写的是字面量，靠这条钉死不许漂）
+      deep(await db.getMeta(sync.SYNC_STATE_KEY, null), { rev: 3, savedAt: 1700000000000, checksum: 'abcd1234' });
+
+      await store.setSyncState({ rev: -1, savedAt: 'x', checksum: 42 });
+      deep(await store.getSyncState(), { rev: 0, savedAt: null, checksum: null });
+      await store.setSyncState();
+      deep(await store.getSyncState(), { rev: 0, savedAt: null, checksum: null });
+    });
+  });
+
+  await checkAsync('store: clearSyncState 删掉 meta.syncState（不是写 null）后回到默认值', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.setSyncState({ rev: 2, savedAt: 1, checksum: 'ff' });
+      await store.clearSyncState();
+      deep(await store.getSyncState(), { rev: 0, savedAt: null, checksum: null });
+      eq(await db.getMeta(sync.SYNC_STATE_KEY, null), null);
+    });
+  });
+
+  await checkAsync('store: getSyncPayload 复用 exportJSON，抹掉易变字段后连续两次校验和一致', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.logWeight({ date: '2026-01-01', weightKg: 70 });
+      const p1 = await store.getSyncPayload();
+      const p2 = await store.getSyncPayload();
+
+      eq(p1.app, 'hms');
+      ok(p1.schemaVersion >= 1);
+      eq(typeof p1.photoCount, 'number');
+      deep(p1.weights.map((w) => w.date), ['2026-01-01']);
+      for (const key of ['meals', 'exercises', 'waters']) ok(Array.isArray(p1[key]), key + ' 应是数组');
+      eq(sync.checksum(p1), sync.checksum(p2), '同一次数据算两次必须同值，否则永远算「有改动」');
+
+      // 三个每次导出/同步都会变的字段必须抹掉
+      eq('exportedAt' in p1, false, '顶层 exportedAt 每次都变');
+      eq('syncState' in p1.meta, false, 'meta.syncState 写锚点时会变');
+      eq('lastExportedAt' in p1.meta, false, 'meta.lastExportedAt 每次 exportJSON 都会变');
+
+      // 真有改动 → 校验和必须变
+      await store.logWeight({ date: '2026-01-02', weightKg: 71 });
+      const p3 = await store.getSyncPayload();
+      ok(sync.checksum(p3) !== sync.checksum(p1), '写了新记录，校验和必须变');
+
+      // 写同步锚点不能把自己算成「有改动」（否则同步完立刻又是脏的）
+      await store.setSyncState({ rev: 1, savedAt: 1700000000000, checksum: sync.checksum(p3) });
+      const p4 = await store.getSyncPayload();
+      eq(sync.checksum(p4), sync.checksum(await store.getSyncPayload()), '锚点变化不算本地改动');
+
+      // 端到端串一次决策：刚同步过 + 远端同版本 → none
+      const state = await store.getSyncState();
+      const plan = sync.planSync({ localRev: state.rev, localChecksum: sync.checksum(p4), syncedChecksum: state.checksum, remote: { rev: state.rev } });
+      eq(plan.action, 'none', '刚同步完应判「无需同步」，实际：' + JSON.stringify(plan));
+    });
+  });
+
+  await checkAsync('store: 假 IDB 撤走后 getSyncState 仍抛中文错误（单例确实清了）', async () => {
+    if (!IDB_ABSENT) return;
+    let msg = '';
+    try { await store.getSyncState(); } catch (err) { msg = err.message; }
+    eq(msg, IDB_MSG);
+  });
+}
+
 // ---------- 入口 ----------
 
 export async function run() {
@@ -2000,6 +2987,7 @@ export async function run() {
   testAggregate();
   testRoundTrip();
   testPurity();
+  testSyncPure();
   await testModules();
   // 放最后：它会临时注入假 indexedDB 并清理，不干扰上面的「IDB 不可用」断言
   await testStoreSettings();
@@ -2007,6 +2995,13 @@ export async function run() {
   await testStoreMealTemplates();
   await testStoreExerciseLog();
   await testStoreExportStatus();
+  await testSyncStore();
+  // 账号用例放最后：注入持久化假 IDB + 假 localStorage，每段都在 finally 里把单例与全局还原
+  await testAccountsContract();
+  await testAccountsCatalog();
+  await testAccountsDirtyStorage();
+  await testAccountsIsolation();
+  await testAccountsRemoval();
 
   const result = { passed, failed: failures.length, failures };
   console.log(`[logic.test] passed=${result.passed} failed=${result.failed}`);

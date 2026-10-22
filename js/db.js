@@ -4,8 +4,8 @@
  */
 
 import { normalizeRecord, planImport, BUSINESS_STORES } from './pure.js';
+import { getActiveAccount, dbNameForAccount, connectDb, LEGACY_DB_NAME } from './accounts.js';
 
-const DB_NAME = 'hms';
 const DB_VERSION = 1;
 const ALL_STORES = ['meta', ...BUSINESS_STORES, 'photos'];
 // 导入时只恢复档案与目标：API Key 属于设备本地凭据，不该被一份备份文件悄悄装进来
@@ -14,6 +14,67 @@ const IMPORTABLE_META = ['profile', 'goals'];
 export const IDB_UNAVAILABLE_MESSAGE = '当前浏览器禁用了本地存储，数据无法保存';
 
 let dbPromise = null;
+// connName：dbPromise 对应的库名（打开中或已打开）；pinnedName：setDbName 显式钉住的库名
+let connName = null;
+let pinnedName = null;
+let hooked = false;
+
+/** 当前该连的库名：显式钉住的优先，否则跟随当前账号（拿不到就回落老库名）。 */
+function desiredDbName() {
+  return pinnedName || dbNameForAccount(getActiveAccount());
+}
+
+function normalizeDbName(name) {
+  const value = typeof name === 'string' ? name.trim() : '';
+  return value || LEGACY_DB_NAME;
+}
+
+/** 丢掉旧连接：已经打开的关掉，正在打开的等它回来再关。 */
+function dropConnection() {
+  const pending = dbPromise;
+  dbPromise = null;
+  connName = null;
+  if (!pending) return;
+  pending.then(
+    (db) => {
+      try {
+        db?.close?.();
+      } catch {
+        /* 关不掉也无所谓 */
+      }
+    },
+    () => {
+      /* 打开失败本来就没有连接 */
+    },
+  );
+}
+
+/** 每次取连接前核对库名：账号一换就丢掉旧连接，绝不让 A 的写入落到 B 上。 */
+function syncDbName() {
+  const want = desiredDbName();
+  if (dbPromise && connName === want) return want;
+  if (dbPromise) dropConnection();
+  return want;
+}
+
+/**
+ * 惰性注册账号切换通知（第一次打开数据库时注册，模块顶层因此没有副作用）：
+ * 账号目录一变就放掉钉住的库名与旧连接。
+ */
+function ensureSwitchHook() {
+  if (hooked) return;
+  hooked = true;
+  try {
+    connectDb({
+      onSwitch: () => {
+        pinnedName = null;
+        if (desiredDbName() !== connName) dropConnection();
+      },
+    });
+  } catch {
+    /* 通知失败也不影响正确性：每次 openDb 都会重新核对库名 */
+  }
+}
 
 function unavailable() {
   return new Error(IDB_UNAVAILABLE_MESSAGE);
@@ -50,10 +111,18 @@ function buildSchema(db) {
   if (!db.objectStoreNames.contains('photos')) db.createObjectStore('photos', { keyPath: 'id' });
 }
 
-/** 幂等单例。失败后不缓存，下一次调用可以重试（隐私模式切换、用户重开标签页等）。 */
+/**
+ * 幂等单例，按当前账号对应的库名打开。失败后不缓存，下一次调用可以重试
+ * （隐私模式切换、用户重开标签页等）。
+ *
+ * 每次取连接前先核对库名：账号一换就丢掉旧连接，所以任何一次读写都不可能落到别的账号的库上。
+ */
 export function openDb() {
+  ensureSwitchHook();
+  const name = syncDbName();
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
+
+  const promise = new Promise((resolve, reject) => {
     const idb = globalThis.indexedDB;
     if (!idb) {
       reject(unavailable());
@@ -61,8 +130,8 @@ export function openDb() {
     }
     let req;
     try {
-      req = idb.open(DB_NAME, DB_VERSION);
-    } catch (err) {
+      req = idb.open(name, DB_VERSION);
+    } catch {
       reject(unavailable());
       return;
     }
@@ -75,23 +144,103 @@ export function openDb() {
     };
     req.onsuccess = () => {
       const db = req.result;
+      // 迟到的连接：这条请求已经被下一次切换丢掉了，用完就关，不许顶替新单例
+      if (dbPromise !== promise) {
+        try {
+          db.close();
+        } catch {
+          /* 忽略 */
+        }
+        return;
+      }
       db.onversionchange = () => {
         try {
           db.close();
         } catch {
           /* 关不掉也无所谓，下一次 openDb 会重开 */
         }
-        dbPromise = null;
+        if (dbPromise === promise) {
+          dbPromise = null;
+          connName = null;
+        }
       };
       resolve(db);
     };
     req.onerror = () => reject(toDbError(req.error));
     req.onblocked = () => reject(new Error('数据库被其他标签页占用，请关闭其他 HMS 页面后重试'));
   });
-  dbPromise.catch(() => {
-    dbPromise = null;
+
+  dbPromise = promise;
+  connName = name;
+  promise.catch(() => {
+    if (dbPromise === promise) {
+      dbPromise = null;
+      connName = null;
+    }
   });
-  return dbPromise;
+  return promise;
+}
+
+/** 当前连接的库名（也就是下一次读写会落到哪个库）。 */
+export function getDbName() {
+  return desiredDbName();
+}
+
+/**
+ * 切库：关旧连接 → 清 dbPromise 单例 → 按新名字打开。
+ * 账号切换走 store.switchAccount（先 setActiveAccount 再调这里）；单独调用也成立，
+ * 钉住的库名只在账号目录变化时才让位。
+ */
+export async function setDbName(name) {
+  ensureSwitchHook();
+  pinnedName = normalizeDbName(name);
+  dropConnection();
+  await openDb();
+}
+
+/** 只清单例（导入等场景）：下一次读写重新打开当前账号的库。 */
+export function resetDbConnection() {
+  dropConnection();
+}
+
+/**
+ * 按 dbName 把库建全（全部 object store 与索引），但不占用当前连接。
+ * 供 js/accounts.js 新建账号时调用：schema 只有 buildSchema 一份，不复制。
+ */
+export async function prepareDatabase(name) {
+  const target = normalizeDbName(name);
+  if (target === desiredDbName()) {
+    await openDb();
+    return;
+  }
+  const idb = globalThis.indexedDB;
+  if (!idb) throw unavailable();
+  await new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = idb.open(target, DB_VERSION);
+    } catch {
+      reject(unavailable());
+      return;
+    }
+    req.onupgradeneeded = () => {
+      try {
+        buildSchema(req.result);
+      } catch (err) {
+        reject(toDbError(err));
+      }
+    };
+    req.onsuccess = () => {
+      try {
+        req.result?.close?.();
+      } catch {
+        /* 忽略 */
+      }
+      resolve();
+    };
+    req.onerror = () => reject(toDbError(req.error));
+    req.onblocked = () => reject(new Error('数据库被其他标签页占用，请关闭其他 HMS 页面后重试'));
+  });
 }
 
 function reqP(request) {

@@ -5,6 +5,7 @@
  */
 
 import * as db from './db.js';
+import * as accounts from './accounts.js';
 import {
   localDateStr,
   daysAgo,
@@ -56,6 +57,11 @@ const ACTIVITIES = ['sedentary', 'light', 'moderate', 'active', 'very_active'];
 // 套餐与导出时间都放 meta：不新增 object store，就不需要抬 IDB 版本号
 const MEAL_TEMPLATES_KEY = 'mealTemplates';
 const LAST_EXPORTED_KEY = 'lastExportedAt';
+// 与 js/sync.js 的 SYNC_STATE_KEY 必须一致（logic.test.mjs 有用例钉死）。
+// 这里写字面量而不是 import：不给 store.js 添一条新的跨模块依赖。
+const SYNC_STATE_KEY = 'syncState';
+// 每次导出/同步都会变的 meta 字段：留在同步数据体里会让内容校验和永远算成「有改动」
+const SYNC_VOLATILE_META_KEYS = [SYNC_STATE_KEY, LAST_EXPORTED_KEY];
 
 function num(v, fallback = 0) {
   const n = Number(v);
@@ -73,6 +79,26 @@ function text(v) {
 function todayOf(date) {
   const s = text(date);
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : localDateStr();
+}
+
+// ---------- 账号（本地多账号隔离：一个账号一个库） ----------
+
+/** 视图层取「当前是谁」的唯一入口：一次都没建过账号时先认领老库。 */
+export async function currentAccount() {
+  const active = accounts.getActiveAccount();
+  if (active) return active;
+  return accounts.ensureDefaultAccount();
+}
+
+/**
+ * 切账号：目录先改（db 层收到通知就放掉旧连接），再按新账号的库名重新打开。
+ * 库名只来自账号目录，所以切换后任何读写都不可能触到上一个账号的数据。
+ */
+export async function switchAccount(id) {
+  const account = accounts.setActiveAccount(id);
+  if (!account) throw new Error('账号不存在');
+  await db.setDbName(accounts.dbNameForAccount(account));
+  return account;
 }
 
 // ---------- 档案 / 目标 / 设置 ----------
@@ -470,4 +496,47 @@ export async function exportCSV() {
 /** 业务数据 + photos 清空，保留 profile / goals / settings。 */
 export async function clearAllData() {
   await db.clearBusinessData();
+}
+
+// ---------- 云同步（阶段 2 的纯数据面；网络在阶段 3 的适配器里） ----------
+
+const DEFAULT_SYNC_STATE = { rev: 0, savedAt: null, checksum: null };
+
+/** 脏数据/旧数据一律归一化：rev 非负整数、savedAt 正数或 null、checksum 非空字符串或 null。 */
+function normalizeSyncState(raw) {
+  const src = raw && typeof raw === 'object' ? raw : DEFAULT_SYNC_STATE;
+  const rev = Number.isInteger(src.rev) && src.rev >= 0 ? src.rev : 0;
+  const at = Number(src.savedAt);
+  const savedAt = Number.isFinite(at) && at > 0 ? at : null;
+  const checksum = typeof src.checksum === 'string' && src.checksum ? src.checksum : null;
+  return { rev, savedAt, checksum };
+}
+
+/** 上次成功推/拉时的锚点。从未同步过 = { rev: 0, savedAt: null, checksum: null }。 */
+export async function getSyncState() {
+  return normalizeSyncState(await db.getMeta(SYNC_STATE_KEY, null));
+}
+
+/** 记录一次成功同步的锚点。字段缺失/非法一律回落默认值，不抛。 */
+export async function setSyncState({ rev, savedAt, checksum } = {}) {
+  await db.setMeta(SYNC_STATE_KEY, normalizeSyncState({ rev, savedAt, checksum }));
+}
+
+/** 清掉锚点（切账号后由调用方决定是否清）：下一次同步按「从没同步过」处理。 */
+export async function clearSyncState() {
+  await db.del('meta', SYNC_STATE_KEY);
+}
+
+/**
+ * 同步用的数据体：复用 exportJSON（全量 dump + 记导出时间），只抹掉三个每次都变的字段——
+ * 顶层 exportedAt、meta.syncState、meta.lastExportedAt。
+ * 不抹的话 checksum() 每次都不同，「本地有没有改动」就永远是「有」，同步退化成每次全量对推。
+ */
+export async function getSyncPayload() {
+  const payload = await exportJSON();
+  const meta = { ...payload.meta };
+  for (const key of SYNC_VOLATILE_META_KEYS) delete meta[key];
+  const out = { ...payload, meta };
+  delete out.exportedAt;
+  return out;
 }

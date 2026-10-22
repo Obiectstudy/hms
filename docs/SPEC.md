@@ -496,3 +496,72 @@ body：
 - **饮食**：修掉「整日套餐入口对全新用户不可达」——当天已有 ≥2 餐但零套餐时，卡片仍渲染（标题「整日套餐」），
   只显示「把今天存为整日套餐」；零套餐且当天 <2 餐时整块不渲染（维持原行为）。
 - **文案修正**：整日套餐的错误串由「至少要有一餐」改为「**至少要两餐**」（规则本就是归一化后 ≥2 餐）。
+
+## 14. 账号与数据隔离（v1.9 起）
+
+### 14.1 架构决定：每用户一个 IndexedDB
+```
+账号目录（localStorage）          数据（IndexedDB）
+  hms.accounts  = [{ id, name, dbName, createdAt, email?, serverId? }, ...]
+  hms.activeAccount = '<id>'
+                                   hms            ← 老数据所在库，第一个账号「认领」它
+                                   hms-u-<id>     ← 之后新建的账号
+```
+- **隔离靠数据库名，不靠过滤**：切换账号 = 关闭旧连接 → 清 `db.js` 的单例 → 按新名字打开。
+  这样任何读写都不可能触到另一个账号的数据（不依赖每个查询都记得加过滤条件）。
+- **零迁移**：用户手机上已有的数据在库 `hms` 里，第一个账号直接认领，不做任何搬迁；认领了 `hms` 的账号禁止删除。
+- 账号目录只是**缓存**；**服务器才是身份的权威** —— 本机目录被清空时，用账号密码登录即可拿回 `serverId`，
+  从而重新打开 `hms-u-<serverId>`，数据就在那里。这条让"清除浏览器数据"不再是数据死刑。
+- 未登录也可正常使用（本地优先）；登录是可选的，只为跨设备复原。
+
+### 14.2 接口
+```js
+// js/accounts.js
+export const CATALOG_KEY = 'hms.accounts';
+export const ACTIVE_KEY = 'hms.activeAccount';
+export const LEGACY_DB_NAME = 'hms';
+export const MAX_ACCOUNTS = 8;
+export function listAccounts(): Account[]          // 脏数据一律降级为 []，绝不抛
+export function getActiveAccount(): Account | null
+export function setActiveAccount(id): Account | null
+export async function createAccount({ name }): Promise<Account>
+export function renameAccount(id, name): Account
+export async function removeAccount(id): Promise<void>
+export async function ensureDefaultAccount(): Promise<Account>   // 幂等
+export function dbNameForAccount(account): string
+// js/db.js 追加
+export function getDbName(): string
+export async function setDbName(name): Promise<void>
+export function resetDbConnection(): void
+// js/store.js 追加
+export async function currentAccount(): Promise<Account>
+export async function switchAccount(id): Promise<Account>
+```
+
+### 14.3 冲突与边界
+- 删除账号 = 删它的数据库（`indexedDB.deleteDatabase`），必须先关连接，否则 `onblocked` 会永远挂着。
+- 最多 8 个账号（手机上一屏能切完）；空名报「账号名称不能为空」。
+- localStorage 被禁用或内容损坏 → 所有账号函数安全降级，**绝不白屏**。
+
+## 15. 云同步：整库快照（v1.9 起）
+
+### 15.1 为什么不做逐条增量
+家庭场景是"一个人的几台设备、几乎不会同时编辑"。逐条同步要给每条记录加 uuid + `updatedAt` + 墓碑删除，
+改遍所有读写路径，还要写合并算法——代价高一个数量级。**整库快照**同样满足需求，实现量小得多。
+
+### 15.2 协议
+```
+服务器每账号一条记录：{ accountId, rev, savedAt, blob }
+  blob = exportJSON() 的产物（服务端加密：服务器能解密，可帮你重置密码）
+  rev  = 每次成功上传 +1 的整数
+```
+- **上传**：本地任何写操作后**防抖 5 秒**触发；也可手动「立即同步」。上传前先比 rev，避免用旧包覆盖新包。
+- **下载**：登录时、以及手动同步时。远端 rev 更高 → 覆盖本地。
+- **冲突**：本机有未上传改动、同时远端 rev 又变高了 → **不静默丢数据**：先把落败的那份写进
+  `meta.conflictBackup`（带时间戳），再让新者胜出，并在界面上提示"存在冲突副本"。
+- **离线优先**：断网、服务器挂了都不影响记录；同步失败只排队重试，不阻塞任何界面操作。
+
+### 15.3 待定（需要用户决定后才能实施）
+- **后端选型**：实测（直连、不走代理）`leancloud.cn` 通、`supabase.co` 通、`workers.dev` 断、`vercel.app` 断、`api.github.com` 断。
+  浏览器里的 PWA 还额外要求后端发 CORS 头 —— 这两条一起排除了 WebDAV/网盘方案。
+  候选：LeanCloud 国内版（家人手机无梯子也能用，需实名）/ Supabase（邮箱注册与密码重置开箱即用，国内访问不稳）/ 腾讯云开发。

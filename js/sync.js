@@ -1,0 +1,272 @@
+/**
+ * 云同步的纯函数层：整库快照的打包 / 解析 / 同步决策 / 冲突副本 / 防抖调度。
+ *
+ * 这个文件里没有任何网络调用——真实的上传下载由阶段 3 的适配器接入（后端选型见 SPEC §15.3）。
+ * 这里只提供可测试的决策核心：所有函数要么是纯输入输出，要么把时钟与定时器作为参数注入。
+ *
+ * 「本地有没有改动」不用脏标记（写路径漏标一次就是静默的不同步），而是同步时现算内容校验和，
+ * 与 meta.syncState.checksum（上次成功推/拉时的锚点）比较：不等就是有改动。
+ */
+
+export const SNAPSHOT_VERSION = 1;
+export const SYNC_STATE_KEY = 'syncState';
+
+/** 无法稳定序列化（函数 / BigInt / 循环引用 …）时的固定兜底校验和。 */
+const CHECKSUM_FALLBACK = '00000000';
+// 32 位 FNV-1a：短、快、对「内容变了」足够敏感，而且不需要 crypto
+const FNV_OFFSET = 0x811c9dc5;
+const FNV_PRIME = 16777619;
+
+function fnv1a(text) {
+  let hash = FNV_OFFSET;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, FNV_PRIME) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+/**
+ * 稳定序列化：对象键排序、数组保序；其余语义与 JSON.stringify 一致
+ * （值为 undefined / 函数 / Symbol 的键被丢弃，数组项变成 null，Date 走 toJSON）。
+ * 返回 undefined 表示「这个值本身进不了 JSON」。
+ */
+function stableStringify(value, seen) {
+  if (value === null) return 'null';
+  switch (typeof value) {
+    case 'string':
+      return JSON.stringify(value);
+    case 'number':
+      return Number.isFinite(value) ? String(value) : 'null';
+    case 'boolean':
+      return value ? 'true' : 'false';
+    case 'bigint':
+      throw new Error('bigint 无法稳定序列化');
+    default:
+      break;
+  }
+  if (typeof value !== 'object') return undefined;
+  if (typeof value.toJSON === 'function') return stableStringify(value.toJSON(), seen);
+  if (seen.has(value)) throw new Error('循环引用无法稳定序列化');
+
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const items = value.map((item) => stableStringify(item, seen) ?? 'null');
+      return `[${items.join(',')}]`;
+    }
+    const parts = [];
+    for (const key of Object.keys(value).sort()) {
+      const text = stableStringify(value[key], seen);
+      if (text === undefined) continue;
+      parts.push(`${JSON.stringify(key)}:${text}`);
+    }
+    return `{${parts.join(',')}}`;
+  } finally {
+    // 同一个对象在兄弟位置重复出现是合法的，只有「自己包含自己」才算循环
+    seen.delete(value);
+  }
+}
+
+/** 确定性校验和：同样的数据永远得同一个值。用于判断「本地是否改过」。 */
+export function checksum(value) {
+  let text;
+  try {
+    text = stableStringify(value, new Set());
+  } catch {
+    return CHECKSUM_FALLBACK;
+  }
+  return typeof text === 'string' ? fnv1a(text) : CHECKSUM_FALLBACK;
+}
+
+// ---------- 快照 ----------
+
+function isDataObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeRev(rev) {
+  return Number.isInteger(rev) && rev >= 0 ? rev : 0;
+}
+
+function normalizeTime(savedAt, fallback) {
+  const at = Number(savedAt);
+  return Number.isFinite(at) && at > 0 ? Math.floor(at) : fallback;
+}
+
+/** 打包一条整库快照。校验失败抛中文错误，交给调用方决定怎么提示。 */
+export function buildSnapshot({ accountId, rev, savedAt, payload } = {}) {
+  const id = typeof accountId === 'string' ? accountId.trim() : '';
+  if (!id) throw new Error('快照缺少账号标识');
+  if (!isDataObject(payload)) throw new Error('快照缺少数据体');
+  return {
+    v: SNAPSHOT_VERSION,
+    accountId: id,
+    rev: normalizeRev(rev),
+    savedAt: normalizeTime(savedAt, Date.now()),
+    payload,
+  };
+}
+
+/**
+ * 解析一条快照。脏数据（版本不符 / 缺字段 / 类型不对 / 根本不是对象）一律 null，绝不抛：
+ * 远端返回什么都不能把同步流程炸掉。
+ */
+export function parseSnapshot(raw) {
+  if (!isDataObject(raw)) return null;
+  if (raw.v !== SNAPSHOT_VERSION) return null;
+  const accountId = typeof raw.accountId === 'string' ? raw.accountId.trim() : '';
+  if (!accountId) return null;
+  if (!Number.isInteger(raw.rev) || raw.rev < 0) return null;
+  if (!isDataObject(raw.payload)) return null;
+  const savedAt = normalizeTime(raw.savedAt, 0);
+  if (!savedAt) return null;
+  return { v: SNAPSHOT_VERSION, accountId, rev: raw.rev, savedAt, payload: raw.payload };
+}
+
+// ---------- 同步决策 ----------
+
+function usableRemote(remote) {
+  return isDataObject(remote) && Number.isInteger(remote.rev) && remote.rev >= 0;
+}
+
+/**
+ * 给定本地与远端状态，返回该做什么。conflict-pull 的含义是：
+ * 两边都动过 —— 调用方必须先 makeConflictBackup 存下本机数据，再拉远端覆盖，绝不静默丢数据。
+ */
+export function planSync({ localRev = 0, localChecksum, syncedChecksum, remote = null } = {}) {
+  const rev = normalizeRev(localRev);
+  if (!usableRemote(remote)) {
+    return { action: 'push', reason: '远端没有可用的快照，上传本机数据' };
+  }
+  const remoteRev = remote.rev;
+  // syncedChecksum 为 null/undefined = 从没成功同步过：本地一律按「有改动」处理
+  const dirty = syncedChecksum == null || localChecksum !== syncedChecksum;
+
+  if (remoteRev < rev) {
+    return { action: 'push', reason: '远端版本落后于本机，上传本机数据纠正远端' };
+  }
+  if (remoteRev > rev) {
+    return dirty
+      ? { action: 'conflict-pull', reason: '本地与远端都有改动，先备份本机数据再拉取远端' }
+      : { action: 'pull', reason: '本地无改动，远端版本更新，拉取远端' };
+  }
+  return dirty
+    ? { action: 'push', reason: '本地有改动，远端版本一致，上传本机数据' }
+    : { action: 'none', reason: '本地无改动且远端版本一致，无需同步' };
+}
+
+// ---------- 冲突副本 ----------
+
+/**
+ * 把落败的那份数据包一层，存进 meta.conflictBackup（SPEC §15.2）。
+ * 包装体只有 savedAt + payload 两个字段，不带 v/accountId/rev —— 正是靠这一点与正式快照区分。
+ */
+export function makeConflictBackup({ payload, savedAt } = {}) {
+  return { savedAt: normalizeTime(savedAt, Date.now()), payload };
+}
+
+/** 只认 { savedAt > 0, payload 是对象 } 这一种形状；正式快照（带 v/rev/accountId）不算副本。 */
+export function isConflictBackup(raw) {
+  if (!isDataObject(raw)) return false;
+  if ('v' in raw || 'accountId' in raw || 'rev' in raw) return false;
+  if (!normalizeTime(raw.savedAt, 0)) return false;
+  return isDataObject(raw.payload);
+}
+
+// ---------- 防抖调度 ----------
+
+/**
+ * 防抖调度：本地改动后延迟触发一次上传，窗口内的连续 schedule 合并成一次（并重置计时）。
+ * now / setTimer / clearTimer 默认用 Date.now / setTimeout / clearTimeout，注入假实现后可确定性推进。
+ * onFire(reason, waitedMs)：waitedMs 是这次触发实际等了多少毫秒（flush 立即触发时为 0）。
+ */
+export function createDebouncer({ delayMs = 5000, onFire, now, setTimer, clearTimer } = {}) {
+  const clock = typeof now === 'function' ? now : () => Date.now();
+  const arm = typeof setTimer === 'function' ? setTimer : (fn, ms) => setTimeout(fn, ms);
+  const disarm = typeof clearTimer === 'function' ? clearTimer : (id) => clearTimeout(id);
+  const fire = typeof onFire === 'function' ? onFire : () => {};
+  const delay = Number.isFinite(delayMs) && delayMs > 0 ? delayMs : 0;
+
+  let timer = null;
+  let scheduledAt = 0;
+  let armed = false;
+  let reason = null;
+  let generation = 0;
+
+  function trigger() {
+    if (!armed) return;
+    const waitedMs = Math.max(0, clock() - scheduledAt);
+    const text = reason;
+    armed = false;
+    timer = null;
+    generation += 1; // 还在路上的定时器就此作废
+    reason = null;
+    fire(text, waitedMs);
+  }
+
+  return {
+    schedule(nextReason) {
+      reason = nextReason === undefined ? null : nextReason;
+      if (timer !== null) {
+        disarm(timer);
+        timer = null;
+      }
+      scheduledAt = clock();
+      armed = true;
+      generation += 1;
+      const mine = generation;
+      timer = arm(() => {
+        if (mine !== generation) return; // 已经被 cancel / flush / 再次 schedule 换掉
+        timer = null;
+        trigger();
+      }, delay);
+    },
+    cancel() {
+      if (timer !== null) {
+        disarm(timer);
+        timer = null;
+      }
+      armed = false;
+      generation += 1;
+      reason = null;
+    },
+    pending() {
+      return armed;
+    },
+    flush() {
+      if (timer !== null) {
+        disarm(timer);
+        timer = null;
+      }
+      trigger();
+    },
+  };
+}
+
+// ---------- 摘要 ----------
+
+function countRows(rows) {
+  return Array.isArray(rows) ? rows.length : 0;
+}
+
+/** 列表页/调试页要的一行摘要：存于何时、多少条记录、包多大。非法快照返回 null。 */
+export function snapshotSummary(snapshot) {
+  const snap = parseSnapshot(snapshot);
+  if (!snap) return null;
+  let bytes = 0;
+  try {
+    bytes = String(JSON.stringify(snap.payload) ?? '').length;
+  } catch {
+    return null; // 循环引用之类根本发不出去
+  }
+  return {
+    savedAt: snap.savedAt,
+    records:
+      countRows(snap.payload.weights) +
+      countRows(snap.payload.meals) +
+      countRows(snap.payload.exercises) +
+      countRows(snap.payload.waters),
+    bytes,
+  };
+}
