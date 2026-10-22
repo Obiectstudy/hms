@@ -79,6 +79,11 @@ function fireInput(node) {
   for (const fn of node.listeners.input || []) fn({ target: node, preventDefault() {}, stopPropagation() {} });
 }
 
+/** select 的 change：和 input 分开，视图里两件事的语义不同（类型换档要重建强度下拉）。 */
+function fireChange(node) {
+  for (const fn of node.listeners.change || []) fn({ target: node, preventDefault() {}, stopPropagation() {} });
+}
+
 /** 指针事件：rulerPicker 用 pointerdown/move/up 覆盖触摸与鼠标，这里按同一形状投递。 */
 function firePointer(node, type, extra = {}) {
   const event = {
@@ -1251,8 +1256,18 @@ export async function run() {
       fireClick(findButton(modal, '删除'));
       await tick(220);
       assert.equal((await store.getMealTemplates()).length, 0, '确认后套餐没有被删除');
+      // 无套餐 + 当天 ≥2 餐：卡片改叫「整日套餐」，只留「把今天存为整日套餐」入口——
+      // 那正是新用户要做的第一个动作，整块不渲染等于没有入口。
       const cleared = await renderView('food');
-      assert.ok(!nodeText(cleared).includes('常吃套餐'), '没有套餐时不应渲染套餐块');
+      assert.ok(!nodeText(cleared).includes('常吃套餐'), '没有套餐时不应再显示「常吃套餐」标题');
+      assert.ok(nodeText(cleared).includes('整日套餐'), '无套餐但当天已有 ≥2 餐时应渲染整日套餐卡片');
+      assert.ok(findButton(cleared, '把今天存为整日套餐'), '整日套餐卡片缺少存入口');
+      assert.equal(byClass(cleared, 'tpl-chip').length, 0, '没有套餐时不该有 chip');
+      // 无套餐 + 当天 <2 餐：整块不渲染（翻到前一天，那里一餐都没有）
+      fireClick(findButton(cleared, '‹ 前一天'));
+      await tick(300);
+      assert.ok(!nodeText(cleared).includes('整日套餐'), '当天 <2 餐时不应渲染整日套餐卡片');
+      assert.ok(!findButton(cleared, '把今天存为整日套餐'), '当天 <2 餐时不应出现存入口');
     });
 
     // ---- 2.65 存为套餐：草稿弹层起名 → 落库 → 饮食页出现 chip ----
@@ -1694,6 +1709,329 @@ export async function run() {
       fireClick(findButton(sheet, '取消'));
       await tick(80);
       assert.ok(!dom.body.childNodes.some((n) => n.className === 'sheet-backdrop'), '取消后编辑层没有关闭');
+    });
+
+    // ---- 3.9 BMI 可视化：四档小人 / 指针百分比 / 边界提示 ----
+    // 前面的用例拖过刻度尺、存过别的体重；这一段依赖种子状态（今天 68.4kg / 172cm），
+    // 先把它钉回去（logWeight 按日期覆盖），免得断言跟着跑过的用例漂。
+    await store.logWeight({ date: today, weightKg: SEED.weightKg });
+    await checkAsync('weight BMI 区块：四档小人 + 当前档位高亮 + 指针百分比', async () => {
+      const weightView = await import('../views/weight.js');
+      const root = await renderView('weight');
+      assertNoLeak(nodeText(root), 'weight(BMI)');
+
+      // 种子：172cm / 68.4kg → 23.1（正常）
+      const bmiValue = nutrition.bmi({ weightKg: SEED.weightKg, heightCm: 172 });
+      assert.equal(bmiValue, 23.1, `种子数据下 BMI 应为 23.1：${bmiValue}`);
+
+      const panel = byClass(root, 'bmi-panel');
+      assert.equal(panel.length, 1, `BMI 区块应恰好一个：${panel.length}`);
+      // 旧的「BMI + 药丸标签」一行必须已经换掉，不能两套并存
+      assert.ok(!byClass(root, 'pill').some((n) => n.textOf().includes('BMI')), '旧的 BMI 药丸标签仍在');
+      assert.equal(byClass(panel[0], 'bmi-value__num')[0].textOf(), '23.1', 'BMI 大号数值不对');
+      assert.equal(byClass(panel[0], 'bmi-value__unit')[0].textOf(), 'BMI', '大号数值缺少 BMI 单位');
+
+      // 四档小人：每档一个圆头 + 躯干/双臂/双腿三条 path，只有当前档位带 is-active
+      const figures = byClass(panel[0], 'bmi-figure');
+      assert.equal(figures.length, 4, `体态小人应为 4 档：${figures.length}`);
+      assert.deepEqual(figures.map((n) => n.textOf()), ['偏瘦', '正常', '超重', '肥胖']);
+      const active = figures.filter((n) => String(n.className).split(/\s+/).includes('is-active'));
+      assert.equal(active.length, 1, `当前档位应恰好高亮一个：${active.length}`);
+      assert.equal(active[0].textOf(), '正常', `高亮档位应与 bmiClass 一致：${active[0].textOf()}`);
+      const drawn = byAttrClass(figures[0], 'bmi-body-line');
+      assert.equal(drawn.length, 4, `小人应有 4 条描线（头 + 躯干 + 双臂 + 双腿）：${drawn.length}`);
+      assert.equal(drawn.filter((n) => n.tagName === 'circle').length, 1, '小人缺少圆头');
+      assert.equal(drawn.filter((n) => n.tagName === 'path').length, 3, '小人缺少躯干/双臂/双腿 path');
+      assert.equal(byAttrClass(figures[3], 'bmi-body-line').length, 4, '四档小人应共用同一套骨架');
+      // 骨架按档位变宽：肥胖档的肩宽必须大于偏瘦档，否则四条线看起来一模一样
+      const shoulderOf = (node) => Number(/M (-?[\d.]+) /.exec(byAttrClass(node, 'bmi-body-line')[1].getAttribute('d'))[1]);
+      assert.ok(Math.abs(shoulderOf(figures[3])) > Math.abs(shoulderOf(figures[0])), '肥胖档小人没有比偏瘦档更宽');
+
+      // 指针位置 = (BMI − 14) / (34 − 14) × 100%，保留 1 位；端点与越界夹取
+      const marker = byClass(panel[0], 'bmi-marker');
+      assert.equal(marker.length, 1, '区间条缺少气泡指针');
+      assert.equal(weightView.bmiScalePos(bmiValue), 45.5, `23.1 应对应 45.5%：${weightView.bmiScalePos(bmiValue)}`);
+      assert.equal(marker[0].style.left, '45.5%', `指针位置不对：${marker[0].style.left}`);
+      assert.equal(weightView.bmiScalePos(14), 0, '14 应对应 0%');
+      assert.equal(weightView.bmiScalePos(18.5), 22.5, '18.5 应对应 22.5%');
+      assert.equal(weightView.bmiScalePos(24), 50, '24 应对应 50%');
+      assert.equal(weightView.bmiScalePos(28), 70, '28 应对应 70%');
+      assert.equal(weightView.bmiScalePos(34), 100, '34 应对应 100%');
+      assert.equal(weightView.bmiScalePos(9), 0, '低于 14 应夹到 0%');
+      assert.equal(weightView.bmiScalePos(40), 100, '高于 34 应夹到 100%');
+      assert.equal(weightView.bmiScalePos(Number.NaN), 0, '非法值不该算出 NaN%');
+      assert.equal(byClass(marker[0], 'bmi-bubble')[0].textOf(), '23.1', '气泡没有显示当前 BMI');
+
+      // 刻度与区间条同源：每个刻度落在自己的百分比上（指针因此对得上刻度）
+      const ticks = byClass(panel[0], 'bmi-tick');
+      assert.deepEqual(ticks.map((n) => n.textOf()), ['14', '18.5', '24', '28', '34']);
+      assert.deepEqual(ticks.map((n) => n.style.left), ['0%', '22.5%', '50%', '70%', '100%'], '刻度位置与区间边界不对齐');
+      const segs = byClass(panel[0], 'bmi-seg');
+      assert.equal(segs.length, 4, `区间条应分 4 段：${segs.length}`);
+      assert.deepEqual(segs.map((n) => n.style.width), ['22.5%', '27.5%', '20%', '30%'], '四段宽度不对');
+      assert.deepEqual(byClass(panel[0], 'bmi-band').map((n) => n.textOf()), ['偏瘦', '正常', '超重', '肥胖']);
+      assert.ok(nodeText(root).includes('区间后段'), '23.1 在正常档 83.6% 处，应显示「区间后段」');
+    });
+
+    await checkAsync('weight BMI 区块：上下两条边界提示与 bmiGaps 同源', async () => {
+      const weightView = await import('../views/weight.js');
+      const root = await renderView('weight');
+      const text = nodeText(root);
+
+      const gaps = nutrition.bmiGaps(23.1, 172);
+      assert.deepEqual(gaps, { lower: { label: '偏瘦', kg: 13.6 }, upper: { label: '超重', kg: 2.7 } }, 'bmiGaps 结果与预期不符');
+      assert.equal(byClass(root, 'bmi-gap').length, 2, '上下两条边界提示都要显示');
+      assert.ok(text.includes('距「超重」还差 2.7 kg'), `缺少上边界提示：${text.slice(0, 240)}`);
+      assert.ok(text.includes('距「偏瘦」还有 13.6 kg'), '缺少下边界提示');
+
+      // 前 / 中 / 后段按档位内的相对位置算：<35% 前段、35–65% 中段、>65% 后段
+      assert.equal(weightView.bmiBandPhase(18.5), '前段', '刚进正常档应是前段');
+      assert.equal(weightView.bmiBandPhase(20.4), '前段', '34.5% 仍是前段');
+      assert.equal(weightView.bmiBandPhase(20.5), '中段', '36.4% 进入中段');
+      assert.equal(weightView.bmiBandPhase(23.1), '后段', '83.6% 是后段');
+      assert.equal(weightView.bmiBandPhase(25), '前段', '超重档的 25% 是前段');
+      assert.equal(weightView.bmiBandPhase(26), '中段', '超重档的一半是中段');
+      assert.equal(weightView.bmiBandPhase(Number.NaN), '中段', '非法值回落到中段而不是 NaN');
+    });
+
+    await checkAsync('weight BMI 区块：缺身高或体重时整块不渲染', async () => {
+      const weightView = await import('../views/weight.js');
+      // 纯函数层：身高/体重缺一都返回 null，绝不产出 0 / NaN 的区块
+      assert.equal(weightView.bmiPanel(SEED.weightKg, 0), null, '没有身高时不该出区块');
+      assert.equal(weightView.bmiPanel(SEED.weightKg, Number.NaN), null, '身高非法时不该出区块');
+      assert.equal(weightView.bmiPanel(0, 172), null, '没有体重时不该出区块');
+      assert.equal(weightView.bmiPanel(null, 172), null, '体重为空时不该出区块');
+
+      // DOM 层：把档案身高抹掉，整页不应再出现 BMI 区块
+      const profile = await store.getProfile();
+      assert.equal(Number(profile.heightCm), 172, '种子档案应带 172cm 身高');
+      await store.saveProfile({ ...profile, heightCm: 0 });
+      const noHeight = await renderView('weight');
+      assert.equal(byClass(noHeight, 'bmi-panel').length, 0, '没有身高时仍渲染了 BMI 区块');
+      assert.ok(!nodeText(noHeight).includes('BMI'), '没有身高时不该出现 BMI 字样');
+      assert.equal(byClass(noHeight, 'bmi-figure').length, 0, '没有身高时不该有体态小人');
+      // 还原档案，后面的用例还要用
+      await store.saveProfile(profile);
+      const restored = await renderView('weight');
+      assert.equal(byClass(restored, 'bmi-panel').length, 1, '恢复身高后 BMI 区块没有回来');
+    });
+
+    // ---- 3.95 运动页：类型分组 / 强度档位 / 净消耗 ----
+    await checkAsync('exercise 强度档位：每个类型记住上次的选择', async () => {
+      const bag = new Map();
+      const previous = globalThis.localStorage;
+      globalThis.localStorage = {
+        getItem: (k) => (bag.has(k) ? bag.get(k) : null),
+        setItem: (k, v) => { bag.set(k, String(v)); },
+        removeItem: (k) => { bag.delete(k); },
+      };
+      try {
+        let root = await renderView('exercise');
+        const typeSel = () => byClass(root, 'type-field')[0].walk().find((n) => n.tagName === 'select');
+        const intSel = () => byClass(root, 'intensity-field')[0].walk().find((n) => n.tagName === 'select');
+
+        typeSel().value = 'bike';
+        fireChange(typeSel());
+        assert.equal(intSel().value, 'road', '骑行第一次进来应是数据侧的中档（公路车）');
+
+        intSel().value = 'commute';
+        fireChange(intSel());
+        assert.equal(bag.get('hms.ex.intensity.bike'), 'commute', '选了通勤档却没有记住');
+
+        root = await renderView('exercise');
+        typeSel().value = 'bike';
+        fireChange(typeSel());
+        assert.equal(intSel().value, 'commute', '重新进入运动页没有恢复上次的档位');
+
+        typeSel().value = 'jog';
+        fireChange(typeSel());
+        assert.equal(intSel().value, 'steady', '没选过的类型该回到默认档，不该被骑行的记忆串味');
+      } finally {
+        if (previous === undefined) delete globalThis.localStorage;
+        else globalThis.localStorage = previous;
+      }
+    });
+
+    await checkAsync('exercise 类型下拉：EXERCISE_TYPES 全量 + 按 group 分组', async () => {
+      const root = await renderView('exercise');
+      const field = byClass(root, 'type-field')[0];
+      assert.ok(field, '运动页没有类型字段');
+      const select = field.walk().find((n) => n.tagName === 'select');
+      assert.ok(select, '类型字段里没有 select');
+
+      assert.ok(nutrition.EXERCISE_TYPES.length >= 20, `类型不足 20 种：${nutrition.EXERCISE_TYPES.length}`);
+      const groups = field.walk().filter((n) => n.tagName === 'optgroup');
+      assert.deepEqual(
+        groups.map((n) => n.getAttribute('label')),
+        [...new Set(nutrition.EXERCISE_TYPES.map((t) => t.group))],
+        'optgroup 的分组与顺序应照 EXERCISE_TYPES',
+      );
+      assert.ok(groups.length >= 3, `分组太少：${groups.length}`);
+
+      const options = groups.flatMap((g) => g.walk().filter((n) => n.tagName === 'option'));
+      assert.deepEqual(
+        options.map((n) => n.value),
+        nutrition.EXERCISE_TYPES.map((t) => t.value),
+        '下拉里的类型与 EXERCISE_TYPES 不一致',
+      );
+      assert.ok(options.every((n) => n.textOf().length > 0), '有类型没有中文标签');
+      assert.equal(select.value, nutrition.EXERCISE_TYPES[0].value, '类型下拉的初值应为第一项');
+    });
+
+    await checkAsync('exercise 强度下拉：带 intensities 的类型才出现，估算随档位变化', async () => {
+      const root = await renderView('exercise');
+      const hintText = () => byClass(root, 'estimate-hint')[0].textOf();
+      const typeSelect = byClass(root, 'type-field')[0].walk().find((n) => n.tagName === 'select');
+      const minutes = root.walk().find((n) => n.tagName === 'input' && n.type === 'number');
+      minutes.value = '30';
+      fireInput(minutes);
+
+      // 不带档位的类型（椭圆机）：整块强度下拉不出现
+      typeSelect.value = 'elliptical';
+      fireChange(typeSelect);
+      assert.equal(byClass(root, 'intensity-field').length, 0, '椭圆机没有档位，不该出现强度下拉');
+      assert.equal(hintText(), '估算 137 kcal（椭圆机 · 30 分钟 · 净消耗）', `无档位类型的文案不对：${hintText()}`);
+
+      // 带档位的类型（骑行，5 档）：出现强度下拉，默认取 met 与该类型默认 met 相同的一档
+      const bike = nutrition.EXERCISE_TYPES.find((t) => t.value === 'bike');
+      typeSelect.value = 'bike';
+      fireChange(typeSelect);
+      const field = byClass(root, 'intensity-field');
+      assert.equal(field.length, 1, '骑行有 5 档，应出现强度下拉');
+      assert.equal(field[0].walk().find((n) => n.tagName === 'span').textOf(), '强度 / 配速');
+      const intensitySelect = field[0].walk().find((n) => n.tagName === 'select');
+      assert.deepEqual(
+        intensitySelect.walk().filter((n) => n.tagName === 'option').map((n) => n.value),
+        bike.intensities.map((i) => i.value),
+        '强度选项应来自该类型的 intensities',
+      );
+      assert.equal(intensitySelect.value, 'road', `默认档位应取 met=8 那一档：${intensitySelect.value}`);
+      assert.equal(hintText(), `估算 239 kcal（骑行 · ${bike.intensities.find((i) => i.value === 'road').label} · 30 分钟 · 净消耗）`, `默认档位文案不对：${hintText()}`);
+
+      // 换档位：估算数值随之变化
+      intensitySelect.value = 'spin';
+      fireChange(intensitySelect);
+      assert.equal(hintText(), `估算 257 kcal（骑行 · ${bike.intensities.find((i) => i.value === 'spin').label} · 30 分钟 · 净消耗）`, `换档位后文案不对：${hintText()}`);
+      assert.notEqual(
+        nutrition.estimateBurn({ type: 'bike', minutes: 30, weightKg: 68.4, intensity: 'road' }),
+        nutrition.estimateBurn({ type: 'bike', minutes: 30, weightKg: 68.4, intensity: 'spin' }),
+        '两个档位的估算值不该相同',
+      );
+
+      // 换回不带到档位的类型：下拉整块收回
+      typeSelect.value = 'yoga';
+      fireChange(typeSelect);
+      assert.equal(byClass(root, 'intensity-field').length, 0, '瑜伽没有档位，强度下拉应收回');
+      assert.equal(hintText(), '估算 51 kcal（瑜伽 · 30 分钟 · 净消耗）', `换类型后文案不对：${hintText()}`);
+    });
+
+    await checkAsync('exercise 估算走净消耗口径：同一输入小于旧的 met×kg×h', async () => {
+      const root = await renderView('exercise');
+      const hintText = () => byClass(root, 'estimate-hint')[0].textOf();
+      const typeSelect = byClass(root, 'type-field')[0].walk().find((n) => n.tagName === 'select');
+      const minutes = root.walk().find((n) => n.tagName === 'input' && n.type === 'number');
+      minutes.value = '30';
+      fireInput(minutes);
+      typeSelect.value = 'bike';
+      fireChange(typeSelect);
+
+      const net = nutrition.estimateBurn({ type: 'bike', minutes: 30, weightKg: SEED.weightKg, intensity: 'road' });
+      const gross = Math.round(nutrition.exerciseMet('bike', 'road') * SEED.weightKg * 0.5);
+      assert.equal(net, 239, `净消耗应为 (8−1)×68.4×0.5 = 239：${net}`);
+      assert.equal(gross, 274, `旧口径应为 8×68.4×0.5 = 274：${gross}`);
+      assert.ok(net < gross, `净消耗 ${net} 必须小于总消耗 ${gross}`);
+      assert.equal(net, Math.round((nutrition.exerciseMet('bike', 'road') - 1) * SEED.weightKg * 0.5), '净消耗公式应扣掉 1 个 MET');
+      assert.ok(hintText().includes('239'), `页面估算没有用净消耗：${hintText()}`);
+      assert.ok(!hintText().includes('274'), `页面出现的还是旧口径的总额：${hintText()}`);
+      assert.ok(hintText().includes('净消耗'), '文案没有写明净消耗口径');
+      assert.ok(nodeText(root).includes('不含基础代谢'), '页面顶部没有说明净消耗口径');
+      assert.ok(nodeText(root).includes(`按当前体重 ${SEED.weightKg} kg`), '页面顶部没有写明估算用的体重');
+    });
+
+    await checkAsync('exercise 保存：类型 / 强度 / 净消耗一起落库，列表显示中文标签', async () => {
+      const root = await renderView('exercise');
+      const typeSelect = byClass(root, 'type-field')[0].walk().find((n) => n.tagName === 'select');
+      const minutes = root.walk().find((n) => n.tagName === 'input' && n.type === 'number');
+      minutes.value = '30';
+      fireInput(minutes);
+      typeSelect.value = 'bike';
+      fireChange(typeSelect);
+      const intensitySelect = byClass(root, 'intensity-field')[0].walk().find((n) => n.tagName === 'select');
+      intensitySelect.value = 'spin';
+      fireChange(intensitySelect);
+
+      fireClick(findButton(root, '保存运动'));
+      await tick(220);
+      const after = await store.daySummary(today);
+      const saved = after.exercises.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+      assert.ok(saved, '保存后当天没有新增运动记录');
+      assert.equal(saved.type, 'bike', '落库类型不对');
+      assert.equal(saved.intensity, 'spin', 'intensity 没有一起落库');
+      assert.equal(saved.minutes, 30, '落库时长不对');
+      assert.equal(saved.kcalBurned, 257, `落库的应是净消耗估算值：${saved.kcalBurned}`);
+      assert.ok(
+        dom.body.childNodes.some((n) => String(n.className).split(/\s+/).includes('toast') && n.textOf().includes('运动已记录')),
+        '保存后没有 toast 反馈',
+      );
+
+      const listed = await renderView('exercise');
+      assert.ok(nodeText(listed).includes('骑行'), '列表没有显示中文类型标签');
+      assert.ok(
+        nodeText(listed).includes(nutrition.EXERCISE_TYPES.find((t) => t.value === 'bike').intensities.find((i) => i.value === 'spin').label),
+        '列表没有带上档位名',
+      );
+      await store.deleteExercise(saved.id);
+      assert.equal((await store.daySummary(today)).exercises.some((e) => e.id === saved.id), false, '收尾没有删掉测试记录');
+    });
+
+    await checkAsync('exercise 历史记录：旧 type 值（bike 等）仍渲染中文标签', async () => {
+      const exerciseView = await import('../views/exercise.js');
+      for (const legacyType of ['walk', 'jog', 'bike', 'swim', 'strength', 'other']) {
+        const label = exerciseView.exerciseLabel(legacyType, '');
+        assert.ok(label && !/[A-Za-z]/.test(label), `旧 type=${legacyType} 没有中文标签：${label}`);
+      }
+      assert.ok(exerciseView.exerciseLabel('bike', 'road').startsWith('骑行 · '), '带档位的记录应显示「类型 · 档位」');
+      assert.equal(exerciseView.exerciseLabel('unknown-type', ''), '运动', '未知类型回落到「运动」');
+      assert.equal(exerciseView.exerciseLabel('bike', 'not-a-real-intensity'), '骑行', '档位对不上时不硬贴一个名字');
+
+      // 落一条旧形状的记录（type=bike，没有 intensity）：列表里仍要是「骑行」
+      await store.logExercise({ date: today, type: 'bike', minutes: 20, kcalBurned: 100, note: '旧记录' });
+      const root = await renderView('exercise');
+      const text = nodeText(root);
+      assert.ok(text.includes('骑行'), `旧记录 type=bike 没有中文标签：${text.slice(0, 300)}`);
+      assert.ok(text.includes('旧记录'), '旧记录的备注没有渲染');
+      assert.ok(!text.includes('bike ·'), '列表里漏出了英文 type 值');
+      // 收尾：按备注找回这条（logExercise 返回的是 key，不是带 id 的记录）
+      for (const row of (await store.daySummary(today)).exercises) {
+        if (row.note === '旧记录') await store.deleteExercise(row.id);
+      }
+      assert.equal((await store.daySummary(today)).exercises.some((row) => row.note === '旧记录'), false, '收尾没有删掉旧记录用例');
+    });
+
+    // ---- 3.97 整日套餐入口：无套餐 + 当天 ≥2 餐也要可达 ----
+    await checkAsync('food 整日套餐入口：无套餐且当天 ≥2 餐仍渲染，<2 餐整块不渲染', async () => {
+      for (const template of await store.getMealTemplates()) await store.deleteMealTemplate(template.id);
+      assert.equal((await store.getMealTemplates()).length, 0, '起点应是「一个套餐都没有」');
+      const summary = await store.daySummary(today);
+      assert.ok(summary.meals.length >= 2, `种子数据当天应已有 ≥2 餐：${summary.meals.length}`);
+
+      const root = await renderView('food');
+      const text = nodeText(root);
+      assert.equal(byClass(root, 'template-card').length, 1, '无套餐 + 当天 ≥2 餐时应渲染套餐卡片');
+      assert.ok(text.includes('整日套餐'), '卡片标题应为「整日套餐」而不是空无内容的「常吃套餐」');
+      assert.ok(!text.includes('常吃套餐'), '一个套餐都没有时不该说「常吃套餐」');
+      assert.ok(findButton(root, '把今天存为整日套餐'), '整日套餐卡片缺少「把今天存为整日套餐」入口');
+      assert.equal(byClass(root, 'tpl-chip').length, 0, '没有套餐时不该有 chip');
+
+      // 翻到前一天（一餐都没有）：整块不渲染
+      fireClick(findButton(root, '‹ 前一天'));
+      await tick(300);
+      const yesterdayText = nodeText(root);
+      assert.ok(yesterdayText.includes('这一天还没有饮食记录'), `没翻到前一天：${yesterdayText.slice(0, 160)}`);
+      assert.equal(byClass(root, 'template-card').length, 0, '当天 <2 餐时不该渲染套餐卡片');
+      assert.ok(!yesterdayText.includes('整日套餐'), '当天 <2 餐时不该出现「整日套餐」');
+      assert.ok(!findButton(root, '把今天存为整日套餐'), '当天 <2 餐时不该出现存入口');
+      assert.ok(!yesterdayText.includes('常吃套餐'), '当天 <2 餐时不该出现「常吃套餐」');
     });
 
     // ---- 4. 空数据态：不能白屏、不能 NaN ----

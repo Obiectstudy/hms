@@ -123,6 +123,9 @@ export function normalizeExerciseRecord(rec) {
   if (hasId(rec)) out.id = Number(rec.id);
   const note = text(rec.note);
   if (note) out.note = note;
+  // 强度档：trim 后 ≤16 字符才落库，超长/非字符串一律丢弃（不写进 CSV 列）
+  const intensity = text(rec.intensity);
+  if (intensity && intensity.length <= 16) out.intensity = intensity;
   return out;
 }
 
@@ -273,7 +276,7 @@ export function planDayTemplateSave(existing, input, now = Date.now()) {
   const name = text(src.name);
   if (!name) throw new Error('套餐名称不能为空');
   const meals = normalizeDayMeals(src.meals);
-  if (meals.length < 2) throw new Error('整日套餐至少要有一餐');
+  if (meals.length < 2) throw new Error('整日套餐至少要两餐');
 
   const index = list.findIndex((t) => t.name === name);
   if (index >= 0) {

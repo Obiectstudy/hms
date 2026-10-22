@@ -187,6 +187,195 @@ export function bmiClass(bmiValue) {
   return { label: '肥胖', level: 'obese' };
 }
 
+/**
+ * BMI 反算体重（kg），保留 1 位；身高或 BMI 非法返回 null。
+ * 给「距下一档边界还差几公斤」的标尺用。
+ */
+export function weightForBmi(bmiValue, heightCm) {
+  const b = num(bmiValue);
+  const h = num(heightCm) / 100;
+  if (!(b > 0) || !(h > 0)) return null;
+  return round1(b * h * h);
+}
+
+// 中国成人分档的边界：<18.5 偏瘦 | 18.5–24 正常 | 24–28 超重 | ≥28 肥胖
+const BMI_THRESHOLDS = [18.5, 24, 28];
+const BMI_LABELS = ['偏瘦', '正常', '超重', '肥胖'];
+
+function bmiBandIndex(v) {
+  if (v < BMI_THRESHOLDS[0]) return 0;
+  if (v < BMI_THRESHOLDS[1]) return 1;
+  if (v < BMI_THRESHOLDS[2]) return 2;
+  return 3;
+}
+
+/**
+ * 距相邻档位的边界还差多少 kg（当前体重与边界体重的差的绝对值，1 位小数）。
+ * lower = 更低一档的边界，已是最低档 → null；upper = 更高一档的边界，已是最高档 → null。
+ * label 取相邻档位的名字（跨过该边界就会进入那一档），与 bmiClass() 的档位名一致。
+ */
+export function bmiGaps(bmiValue, heightCm) {
+  const v = num(bmiValue);
+  const h = num(heightCm) / 100;
+  if (!(v > 0) || !(h > 0)) return { lower: null, upper: null };
+  const band = bmiBandIndex(v);
+  const kgTo = (boundary) => round1(Math.abs(v * h * h - boundary * h * h));
+  return {
+    lower: band > 0
+      ? { label: BMI_LABELS[band - 1], kg: kgTo(BMI_THRESHOLDS[band - 1]) }
+      : null,
+    upper: band < BMI_LABELS.length - 1
+      ? { label: BMI_LABELS[band + 1], kg: kgTo(BMI_THRESHOLDS[band]) }
+      : null,
+  };
+}
+
+// ---------- 运动消耗 ----------
+// MET 量级取自 Compendium of Physical Activities（那是**总消耗**口径）；
+// 记账用 estimateBurn 换算成净消耗 (MET − 1)，只算「因为运动额外多烧的」。
+// group 供界面做 optgroup；带 intensities 的类型 met 取中档（不选强度时的默认）。
+
+const OTHER_MET = 4.0;
+
+export const EXERCISE_TYPES = [
+  {
+    value: 'walk', label: '走路', group: '有氧', met: 3.5,
+    intensities: [
+      { value: 'stroll', label: '散步 <4km/h', met: 3.0 },
+      { value: 'normal', label: '常速 4–5.5km/h', met: 3.5 },
+      { value: 'brisk', label: '快走 >5.5km/h', met: 4.3 },
+    ],
+  },
+  {
+    value: 'jog', label: '跑步', group: '有氧', met: 9.0,
+    intensities: [
+      { value: 'easy', label: '慢跑', met: 6.0 },
+      { value: 'steady', label: '中速', met: 9.0 },
+      { value: 'fast', label: '快跑', met: 11.0 },
+    ],
+  },
+  {
+    value: 'swim', label: '游泳', group: '有氧', met: 7.0,
+    intensities: [
+      { value: 'easy', label: '慢速', met: 5.0 },
+      { value: 'steady', label: '一般', met: 7.0 },
+      { value: 'fast', label: '快速', met: 9.8 },
+    ],
+  },
+  {
+    value: 'rope', label: '跳绳', group: '有氧', met: 11.0,
+    intensities: [
+      { value: 'easy', label: '慢速', met: 8.8 },
+      { value: 'steady', label: '一般', met: 11.0 },
+      { value: 'fast', label: '快速', met: 12.3 },
+    ],
+  },
+  { value: 'elliptical', label: '椭圆机', group: '有氧', met: 5.0 },
+  {
+    value: 'rower', label: '划船机', group: '有氧', met: 7.0,
+    intensities: [
+      { value: 'light', label: '轻', met: 4.8 },
+      { value: 'steady', label: '中', met: 7.0 },
+      { value: 'hard', label: '重', met: 8.5 },
+    ],
+  },
+  {
+    value: 'stairs', label: '爬楼梯', group: '有氧', met: 8.0,
+    intensities: [
+      { value: 'down', label: '下楼', met: 3.5 },
+      { value: 'up', label: '上楼', met: 8.0 },
+      { value: 'both', label: '上下往返', met: 9.0 },
+    ],
+  },
+  {
+    value: 'hiit', label: 'HIIT', group: '有氧', met: 9.0,
+    intensities: [
+      { value: 'light', label: '轻', met: 7.0 },
+      { value: 'steady', label: '中', met: 9.0 },
+      { value: 'hard', label: '重', met: 11.0 },
+    ],
+  },
+  {
+    value: 'dance', label: '舞蹈', group: '有氧', met: 5.5,
+    intensities: [
+      { value: 'social', label: '休闲', met: 4.5 },
+      { value: 'general', label: '一般', met: 5.5 },
+      { value: 'aerobic', label: '剧烈', met: 7.3 },
+    ],
+  },
+  {
+    value: 'hike', label: '徒步', group: '户外', met: 6.3,
+    intensities: [
+      { value: 'flat', label: '平地', met: 5.0 },
+      { value: 'hill', label: '爬坡', met: 6.3 },
+      { value: 'loaded', label: '重装爬坡', met: 8.0 },
+    ],
+  },
+  {
+    value: 'bike', label: '骑行', group: '户外', met: 8.0,
+    intensities: [
+      { value: 'casual', label: '休闲 <16km/h', met: 4.0 },
+      { value: 'commute', label: '通勤 16–19km/h', met: 6.0 },
+      { value: 'road', label: '公路车 20–25km/h', met: 8.0 },
+      { value: 'spin', label: '动感单车', met: 8.5 },
+      { value: 'climb', label: '爬坡 / >25km/h', met: 10.0 },
+    ],
+  },
+  { value: 'climb', label: '攀岩', group: '户外', met: 8.0 },
+  { value: 'ski', label: '滑雪', group: '户外', met: 7.0 },
+  { value: 'skate', label: '滑板', group: '户外', met: 5.0 },
+  {
+    value: 'strength', label: '力量训练', group: '力量', met: 5.0,
+    intensities: [
+      { value: 'light', label: '轻', met: 3.5 },
+      { value: 'steady', label: '中', met: 5.0 },
+      { value: 'hard', label: '重', met: 6.0 },
+    ],
+  },
+  {
+    value: 'badminton', label: '羽毛球', group: '球类', met: 5.5,
+    intensities: [
+      { value: 'casual', label: '休闲', met: 4.5 },
+      { value: 'general', label: '一般', met: 5.5 },
+      { value: 'match', label: '比赛', met: 7.0 },
+    ],
+  },
+  { value: 'pingpong', label: '乒乓球', group: '球类', met: 4.0 },
+  { value: 'basketball', label: '篮球', group: '球类', met: 6.5 },
+  { value: 'soccer', label: '足球', group: '球类', met: 7.0 },
+  { value: 'tennis', label: '网球', group: '球类', met: 7.3 },
+  { value: 'yoga', label: '瑜伽', group: '其他', met: 2.5 },
+  { value: 'pilates', label: '普拉提', group: '其他', met: 3.0 },
+  { value: 'taichi', label: '太极', group: '其他', met: 3.0 },
+  { value: 'other', label: '其他', group: '其他', met: OTHER_MET },
+];
+
+/** 类型的 MET；未知 type → 'other' 的 MET，未知 intensity → 该类型的默认 MET。 */
+export function exerciseMet(type, intensity) {
+  const hit = EXERCISE_TYPES.find((t) => t.value === type);
+  if (!hit) return OTHER_MET;
+  const list = Array.isArray(hit.intensities) ? hit.intensities : [];
+  const want = typeof intensity === 'string' ? intensity.trim() : '';
+  if (want) {
+    const found = list.find((i) => i.value === want);
+    if (found) return found.met;
+  }
+  return hit.met;
+}
+
+/**
+ * 运动净消耗，取整：max(0, (MET − 1) × 体重kg × 小时)。
+ * 扣掉 1 个 MET 的基础代谢，得到「因为运动额外多烧的」热量——减脂记账该用的数。
+ * 时长 / 体重非正或非有限数一律 0。
+ */
+export function estimateBurn(rec = {}) {
+  const src = rec && typeof rec === 'object' ? rec : {};
+  const minutes = num(src.minutes);
+  const weightKg = num(src.weightKg);
+  if (!(minutes > 0) || !(weightKg > 0)) return 0;
+  return Math.max(0, Math.round((exerciseMet(src.type, src.intensity) - 1) * weightKg * (minutes / 60)));
+}
+
 function byDateAsc(a, b) {
   if (a.date === b.date) return 0;
   return a.date < b.date ? -1 : 1;

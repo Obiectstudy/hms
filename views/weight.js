@@ -2,7 +2,7 @@
 // 存储永远是 kg；斤只是「显示与输入」单位，落库前一律过 unitToKg。
 import { el, clear, rulerPicker, lineChart, bar, toast, confirmDialog, emptyState, fmt1, fmtDateCN } from '../js/ui.js';
 import {
-  localDateStr, bmi, bmiClass, weightStats, movingAverage,
+  localDateStr, bmi, bmiClass, bmiGaps, weightStats, movingAverage,
   WEIGHT_UNITS, kgToUnit, unitToKg, weightStep, weightRange, weightUnitLabel,
 } from '../js/nutrition.js';
 import {
@@ -77,6 +77,178 @@ function avgOverlay(d, height) {
   line.setAttribute('stroke-dasharray', AVG_DASH);
   svgNode.appendChild(line);
   return svgNode;
+}
+
+/* ---------- BMI 可视化 ----------
+   中国成人分档（与 nutrition.bmiClass 同一口径：18.5 / 24 / 28）。
+   区间条只画 14–34 这一段：再往外既没有参考价值，也会把三个边界挤成一团。 */
+
+const BMI_SCALE = { min: 14, max: 34 };
+const BMI_BANDS = [
+  { key: 'low', from: 14, to: 18.5, label: '偏瘦' },
+  { key: 'normal', from: 18.5, to: 24, label: '正常' },
+  { key: 'over', from: 24, to: 28, label: '超重' },
+  { key: 'obese', from: 28, to: 34, label: '肥胖' },
+];
+const BMI_TICKS = [14, 18.5, 24, 28, 34];
+
+// 体态小人：同一套骨架，按档位改肩 / 腰 / 胯 / 手臂外扩 / 腿缝五处宽度。
+const BMI_SHAPES = [
+  { key: 'low', label: '偏瘦', shoulder: 19, waist: 13, hip: 17, armOut: 5, legGap: 5 },
+  { key: 'normal', label: '正常', shoulder: 24, waist: 18, hip: 22, armOut: 7, legGap: 7 },
+  { key: 'over', label: '超重', shoulder: 28, waist: 26, hip: 28, armOut: 9, legGap: 8 },
+  { key: 'obese', label: '肥胖', shoulder: 31, waist: 33, hip: 33, armOut: 10, legGap: 8 },
+];
+
+/** 指针在区间条上的横向位置（%）：14 → 0%，34 → 100%，超出显示范围夹到两端。 */
+export function bmiScalePos(bmiValue) {
+  const v = Number(bmiValue);
+  if (!Number.isFinite(v)) return 0;
+  const pct = ((v - BMI_SCALE.min) / (BMI_SCALE.max - BMI_SCALE.min)) * 100;
+  return Math.round(Math.min(100, Math.max(0, pct)) * 10) / 10;
+}
+
+/** 当前值在所属档位内的相对位置：<35% 前段、35–65% 中段、>65% 后段。 */
+export function bmiBandPhase(bmiValue) {
+  const v = Number(bmiValue);
+  const band = BMI_BANDS.find((b) => v >= b.from && v < b.to);
+  if (!Number.isFinite(v) || !band) return '中段';
+  const inside = (v - band.from) / (band.to - band.from);
+  if (inside < 0.35) return '前段';
+  if (inside > 0.65) return '后段';
+  return '中段';
+}
+
+function svgNode(tag, attrs = {}, ...children) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
+  for (const child of children) {
+    if (child == null || child === false) continue;
+    node.appendChild(child);
+  }
+  return node;
+}
+
+/** 一个小人：圆头 + 躯干 / 双臂 / 双腿三条 path；描边颜色交给 styles.css 的变量。 */
+function bmiFigure(shape) {
+  const headR = 7.6;
+  const headY = 6 + headR;
+  const neck = 6 + headR * 2 + 3;
+  const waistY = neck + 26;
+  const hipY = waistY + 12;
+  const kneeY = hipY + 20;
+  const s = shape.shoulder / 2;
+  const w = shape.waist / 2;
+  const h = shape.hip / 2;
+  return svgNode('svg', {
+    viewBox: '-46 -2 92 92',
+    'aria-hidden': 'true',
+    class: 'bmi-figure__svg',
+  },
+    svgNode('circle', { class: 'bmi-body-line', cx: 0, cy: headY, r: headR }),
+    svgNode('path', {
+      class: 'bmi-body-line',
+      d: `M ${-s} ${neck} Q ${-w - 2} ${neck + 14} ${-w} ${waistY} Q ${-h - 1} ${waistY + 6} ${-h} ${hipY}`
+        + ` L ${h} ${hipY} Q ${h + 1} ${waistY + 6} ${w} ${waistY} Q ${w + 2} ${neck + 14} ${s} ${neck}`
+        + ` Q 0 ${neck - 4} ${-s} ${neck} Z`,
+    }),
+    svgNode('path', {
+      class: 'bmi-body-line',
+      d: `M ${-s + 1} ${neck + 1} Q ${-s - shape.armOut} ${neck + 12} ${-s - shape.armOut + 1} ${waistY + 6}`
+        + ` M ${s - 1} ${neck + 1} Q ${s + shape.armOut} ${neck + 12} ${s + shape.armOut - 1} ${waistY + 6}`,
+    }),
+    svgNode('path', {
+      class: 'bmi-body-line',
+      d: `M ${-h + 3} ${hipY} L ${-shape.legGap} ${kneeY} M ${h - 3} ${hipY} L ${shape.legGap} ${kneeY}`,
+    }),
+  );
+}
+
+/**
+ * BMI 区块：大号数值 + 档位文案 + 上下边界提示 + 分段区间条（带指针）+ 刻度 + 四档小人。
+ * 身高或体重缺失 / 非法时返回 null，调用方整块不渲染（不显示 0 / NaN）。
+ */
+export function bmiPanel(weightKg, heightCm) {
+  const w = Number(weightKg);
+  const hCm = Number(heightCm);
+  if (!(w > 0) || !(hCm > 0)) return null;
+  const bmiValue = bmi({ weightKg: w, heightCm: hCm });
+  if (!(bmiValue > 0)) return null;
+
+  const klass = bmiClass(bmiValue);
+  const gaps = bmiGaps(bmiValue, hCm);
+  const pos = bmiScalePos(bmiValue);
+  // 高亮档位按 bmiClass 的名字找，保证小人高亮与文案永远指同一档。
+  const active = BMI_BANDS.find((b) => b.label === klass.label) || BMI_BANDS[1];
+
+  const gapsRow = el('div', { className: 'bmi-gaps' });
+  if (gaps.upper) {
+    gapsRow.appendChild(el('span', { className: 'bmi-gap', text: `距「${gaps.upper.label}」还差 ${fmt1(gaps.upper.kg)} kg` }));
+  }
+  if (gaps.lower) {
+    gapsRow.appendChild(el('span', { className: 'bmi-gap', text: `距「${gaps.lower.label}」还有 ${fmt1(gaps.lower.kg)} kg` }));
+  }
+
+  const track = el('div', { className: 'bmi-track' },
+    BMI_BANDS.map((band) => el('div', {
+      className: `bmi-seg bmi-seg--${band.key}`,
+      style: { width: `${bmiScalePos(band.to) - bmiScalePos(band.from)}%` },
+    })),
+  );
+
+  const ticks = el('div', { className: 'bmi-ticks' },
+    BMI_TICKS.map((value, index) => {
+      // 首尾两个刻度贴着两点，靠修饰类把标签收回卡片内，不横向溢出。
+      const edge = index === 0 ? ' bmi-tick--first' : index === BMI_TICKS.length - 1 ? ' bmi-tick--last' : '';
+      return el('span', {
+        className: `bmi-tick${edge}`,
+        style: { left: `${bmiScalePos(value)}%` },
+        text: String(value),
+      });
+    }),
+  );
+
+  const bands = el('div', { className: 'bmi-bands' },
+    BMI_BANDS.map((band) => el('div', {
+      className: 'bmi-band',
+      style: { flex: String(band.to - band.from) },
+      text: band.label,
+    })),
+  );
+
+  const figures = el('div', { className: 'bmi-figures' },
+    BMI_SHAPES.map((shape) => el('div', {
+      className: `bmi-figure${shape.key === active.key ? ' is-active' : ''}`,
+      dataset: { key: shape.key },
+    },
+      bmiFigure(shape),
+      el('span', { className: 'bmi-figure__label', text: shape.label }),
+    )),
+  );
+
+  return el('div', { className: 'bmi-panel' },
+    el('div', { className: 'bmi-hero' },
+      el('div', { className: 'bmi-value' },
+        el('span', { className: 'bmi-value__num', text: fmt1(bmiValue) }),
+        el('span', { className: 'bmi-value__unit', text: 'BMI' }),
+      ),
+      el('div', { className: 'bmi-cat' },
+        '处于 ', el('b', { className: 'bmi-cat__band', text: klass.label }), ` 区间${bmiBandPhase(bmiValue)}`,
+      ),
+    ),
+    gapsRow,
+    el('div', { className: 'bmi-scale' },
+      track,
+      el('div', { className: 'bmi-marker', style: { left: `${pos}%` } },
+        el('div', { className: 'bmi-bubble', text: fmt1(bmiValue) }),
+        el('div', { className: 'bmi-pointer' }),
+      ),
+    ),
+    ticks,
+    bands,
+    figures,
+    el('div', { className: 'bmi-hint', text: '小人对应你的 BMI 区间：线条越宽表示体重越高。切到别的区间时重新描一遍线。' }),
+  );
 }
 
 export async function render(root) {
@@ -278,13 +450,11 @@ export async function render(root) {
         ),
       ));
 
-      if (profile && Number(profile.heightCm) > 0) {
-        const bmiValue = bmi({ weightKg: stats.latest, heightCm: profile.heightCm });
-        const klass = bmiClass(bmiValue);
-        latestCard.appendChild(el('div', { className: 'row row--between divider' },
-          el('span', { className: 'label', text: 'BMI' }),
-          el('span', { className: `pill ${klass.level === 'normal' ? 'pill--ok' : 'pill--warn'}`, text: `${fmt1(bmiValue)} · ${klass.label}` }),
-        ));
+      // BMI 区块：身高或体重缺一就不渲染（不再摆一行「BMI —」占位）。
+      const panel = bmiPanel(stats.latest, profile && profile.heightCm);
+      if (panel) {
+        latestCard.appendChild(el('div', { className: 'divider' }));
+        latestCard.appendChild(panel);
       }
 
       if (target && stats.series.length) {

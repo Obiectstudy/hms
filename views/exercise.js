@@ -1,20 +1,72 @@
-// 运动页（SPEC §7「运动」）：MET × 体重 × 时长自动估算消耗，可手改。
-import { el, toast, confirmDialog, emptyState, fmtKcal, fmtDateCN, fmtTime } from '../js/ui.js';
-import { localDateStr } from '../js/nutrition.js';
+// 运动页（SPEC §7「运动」）：MET 估算净消耗（不含基础代谢），可手改。
+import { el, clear, toast, confirmDialog, emptyState, fmtKcal, fmtDateCN, fmtTime } from '../js/ui.js';
+import { localDateStr, EXERCISE_TYPES, estimateBurn } from '../js/nutrition.js';
 import { daySummary, logExercise, deleteExercise, recentWeights } from '../js/store.js';
 
-const TYPES = [
-  { value: 'walk', label: '走路', met: 3.5 },
-  { value: 'jog', label: '慢跑', met: 8.0 },
-  { value: 'bike', label: '骑行', met: 6.8 },
-  { value: 'swim', label: '游泳', met: 7.0 },
-  { value: 'strength', label: '力量训练', met: 5.0 },
-  { value: 'other', label: '其他', met: 4.0 },
-];
+/* ---------- 类型 / 强度 ---------- */
 
-function metOf(type) {
-  const hit = TYPES.find((t) => t.value === type);
-  return hit ? hit.met : TYPES[TYPES.length - 1].met;
+function findType(value) {
+  return EXERCISE_TYPES.find((t) => t && t.value === value) || null;
+}
+
+/** 类型按 group 分组；组与组内顺序都照 EXERCISE_TYPES 的声明顺序（optgroup 用）。 */
+export function groupExerciseTypes(types) {
+  const groups = new Map();
+  for (const type of Array.isArray(types) ? types : []) {
+    if (!type || !type.value) continue;
+    const key = type.group || '其他';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(type);
+  }
+  return [...groups.entries()].map(([label, list]) => ({ label, list }));
+}
+
+/** 该类型的强度档位；没有 intensities 的类型返回空数组（界面就不出强度下拉）。 */
+export function intensitiesOf(type) {
+  const hit = findType(type);
+  return hit && Array.isArray(hit.intensities) ? hit.intensities : [];
+}
+
+/** 默认档位：met 与该类型默认 met 相同的那一档（数据侧默认就是中档），没有就第一档。 */
+export function defaultIntensityOf(type) {
+  const list = intensitiesOf(type);
+  if (!list.length) return '';
+  const hit = findType(type);
+  const same = list.find((item) => Number(item.met) === Number(hit.met));
+  return (same || list[0]).value;
+}
+
+const INTENSITY_MEMO_PREFIX = 'hms.ex.intensity.';
+
+/**
+ * 记住每个运动类型上次选的强度档位。
+ * 常骑车的人均速基本固定（比如城市里 15–18km/h 对应通勤档），
+ * 不该每次记一次运动都重新选一遍。
+ */
+export function rememberedIntensity(type) {
+  try {
+    const saved = globalThis.localStorage && globalThis.localStorage.getItem(INTENSITY_MEMO_PREFIX + type);
+    if (saved && intensitiesOf(type).some((item) => item.value === saved)) return saved;
+  } catch {
+    // 隐私模式或存储被禁用：退回默认档，不影响记录。
+  }
+  return '';
+}
+
+export function rememberIntensity(type, intensity) {
+  try {
+    if (intensity) globalThis.localStorage.setItem(INTENSITY_MEMO_PREFIX + type, intensity);
+  } catch {
+    // 存不下就算了，功能本身不依赖它。
+  }
+}
+
+/** 标签：旧记录（walk/jog/bike/swim/strength/other）照样查得到中文；带档位时补上档位名。 */
+export function exerciseLabel(type, intensity) {
+  const hit = findType(type);
+  const base = hit ? hit.label : '运动';
+  const found = intensitiesOf(type).find((item) => item.value === intensity);
+  return found ? `${base} · ${found.label}` : base;
 }
 
 export async function render(root) {
@@ -28,31 +80,62 @@ export async function render(root) {
 
   root.appendChild(el('div', { className: 'col' },
     el('div', { className: 'h1', text: '运动' }),
-    el('div', { className: 'muted', text: `按当前体重 ${weightKg} kg 估算消耗，可手动修改` }),
+    el('div', { className: 'muted', text: `按当前体重 ${weightKg} kg 估算净消耗（不含基础代谢），可手动修改` }),
   ));
 
-  const select = el('select', { className: 'select' },
-    TYPES.map((t) => el('option', { value: t.value, text: t.label })),
+  const typeSelect = el('select', { className: 'select' },
+    groupExerciseTypes(EXERCISE_TYPES).map((group) => el('optgroup', { attr: { label: group.label } },
+      group.list.map((type) => el('option', { value: type.value, text: type.label })),
+    )),
   );
+  // 初值必须写死：空值会掉进「未知类型」的兜底 MET，估算就跟界面显示的类型对不上。
+  if (EXERCISE_TYPES.length) typeSelect.value = EXERCISE_TYPES[0].value;
+
   const minutesInput = el('input', { className: 'input', type: 'number', inputmode: 'numeric', min: '1', max: '600', step: '1', placeholder: '例如 30' });
   const kcalInput = el('input', { className: 'input', type: 'number', inputmode: 'numeric', min: '0', step: '1', placeholder: '自动估算' });
   const noteInput = el('input', { className: 'input', type: 'text', placeholder: '可选，如「晚饭后快走」' });
-  const estimateHint = el('div', { className: 'muted', text: '' });
+  const estimateHint = el('div', { className: 'muted estimate-hint', text: '' });
+  const intensitySlot = el('div', { className: 'intensity-slot' });
+  let intensitySelect = null;
+
+  const intensityValue = () => (intensitySelect ? intensitySelect.value : '');
 
   const estimate = () => {
     const minutes = Number(minutesInput.value);
     if (!Number.isFinite(minutes) || minutes <= 0) return null;
-    return Math.max(0, Math.round(metOf(select.value) * weightKg * (minutes / 60)));
+    return estimateBurn({ type: typeSelect.value, minutes, weightKg, intensity: intensityValue() });
   };
+
   const refreshEstimate = () => {
     const kcal = estimate();
     kcalInput.placeholder = kcal == null ? '自动估算' : `自动估算 ${kcal} kcal`;
     estimateHint.textContent = kcal == null
-      ? '填写时长后自动估算消耗'
-      : `估算 ${kcal} kcal（${TYPES.find((t) => t.value === select.value).label} · ${minutesInput.value} 分钟）`;
+      ? '填写时长后按净消耗估算'
+      : `估算 ${kcal} kcal（${exerciseLabel(typeSelect.value, intensityValue())} · ${minutesInput.value} 分钟 · 净消耗）`;
   };
-  select.addEventListener('change', refreshEstimate);
+
+  /** 选中类型有档位才出现下拉；每次按新类型重算默认档位，不留上一个类型的档位。 */
+  const syncIntensity = () => {
+    clear(intensitySlot);
+    intensitySelect = null;
+    const list = intensitiesOf(typeSelect.value);
+    if (!list.length) return;
+    const select = el('select', { className: 'select' },
+      list.map((item) => el('option', { value: item.value, text: item.label })),
+    );
+    select.value = rememberedIntensity(typeSelect.value) || defaultIntensityOf(typeSelect.value);
+    select.addEventListener('change', () => {
+      rememberIntensity(typeSelect.value, select.value);
+      refreshEstimate();
+    });
+    intensitySelect = select;
+    intensitySlot.appendChild(el('label', { className: 'field intensity-field' },
+      el('span', { className: 'field__label', text: '强度 / 配速' }), select));
+  };
+
+  typeSelect.addEventListener('change', () => { syncIntensity(); refreshEstimate(); });
   minutesInput.addEventListener('input', refreshEstimate);
+  syncIntensity();
   refreshEstimate();
 
   const saveBtn = el('button', { className: 'btn btn--primary btn--block', text: '保存运动' });
@@ -68,7 +151,14 @@ export async function render(root) {
     const kcalBurned = Number.isFinite(manual) ? Math.max(0, Math.round(manual)) : (auto == null ? 0 : auto);
     saveBtn.disabled = true;
     try {
-      await logExercise({ date, type: select.value, minutes, kcalBurned, note: noteInput.value.trim() || undefined });
+      await logExercise({
+        date,
+        type: typeSelect.value,
+        minutes,
+        kcalBurned,
+        note: noteInput.value.trim() || undefined,
+        intensity: intensityValue() || undefined,
+      });
       toast('运动已记录', 'ok');
       await window.HMS.refresh();
     } catch (err) {
@@ -82,7 +172,8 @@ export async function render(root) {
       el('div', { className: 'card__title', text: '记录运动' }),
       el('div', { className: 'muted', text: fmtDateCN(date) }),
     ),
-    el('label', { className: 'field' }, el('span', { className: 'field__label', text: '类型' }), select),
+    el('label', { className: 'field type-field' }, el('span', { className: 'field__label', text: '类型' }), typeSelect),
+    intensitySlot,
     el('div', { className: 'grid-2' },
       el('label', { className: 'field' }, el('span', { className: 'field__label', text: '时长 (分钟)' }), minutesInput),
       el('label', { className: 'field' }, el('span', { className: 'field__label', text: '消耗 (kcal)' }), kcalInput),
@@ -114,7 +205,8 @@ export async function render(root) {
   } else {
     const list = el('div', { className: 'list' });
     for (const item of exercises.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))) {
-      const label = (TYPES.find((t) => t.value === item.type) || { label: '运动' }).label;
+      // 类型标签按 EXERCISE_TYPES 查，旧记录里的 walk/jog/bike… 仍然显示中文。
+      const label = exerciseLabel(item.type, item.intensity);
       const del = el('button', { className: 'btn btn--ghost btn--sm btn--danger', text: '删除' });
       del.addEventListener('click', async () => {
         const ok = await confirmDialog({

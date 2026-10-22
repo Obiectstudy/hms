@@ -23,6 +23,8 @@ const go = (hash) => window.HMS.navigate(hash);
 
 // 常吃套餐的 chip 上限：横条只放一屏，超出的靠删除旧套餐腾位置。
 export const MAX_TEMPLATE_CHIPS = 6;
+// 整日套餐至少要覆盖 2 餐：早餐 + 午餐才叫「这一天」。
+const MIN_DAY_TEMPLATE_MEALS = 2;
 // 「最近吃过」只放一屏 8 条，再多就和搜索框抢注意力了。
 const RECENT_LIMIT = 8;
 
@@ -423,7 +425,7 @@ async function saveTodayAsDayTemplate(date, reload) {
     return;
   }
   const meals = groupDayMeals(summary && summary.meals);
-  if (meals.length < 2) {
+  if (meals.length < MIN_DAY_TEMPLATE_MEALS) {
     toast('今天还没有足够的餐次可存', 'error');
     return;
   }
@@ -457,10 +459,16 @@ async function removeTemplate(template, reload) {
   }
 }
 
-/** 常吃套餐横条：单餐与整日两类共用一行；无套餐时返回 null，调用方不 append，页面不留空白。 */
-function renderTemplateCard(templates, date, reload) {
+/**
+ * 常吃套餐横条：单餐与整日两类共用一行。
+ * 一个套餐都没有时不能整块消失：当天已有 ≥2 餐的话，「把今天存为整日套餐」正是新用户
+ * 要做的第一个动作，藏起来等于没有入口——这时标题改成「整日套餐」并只留那个入口，
+ * 免得空无一物的「常吃套餐」误导人。当天不足 2 餐才整块不渲染，不留空白。
+ */
+function renderTemplateCard(templates, date, reload, dayMealCount) {
   const list = visibleTemplates(templates);
-  if (!list.length) return null;
+  const canSaveDay = Number(dayMealCount) >= MIN_DAY_TEMPLATE_MEALS;
+  if (!list.length && !canSaveDay) return null;
   const row = el('div', { className: 'tpl-row' });
   for (const template of list) {
     const isDay = template.kind === 'day';
@@ -487,7 +495,7 @@ function renderTemplateCard(templates, date, reload) {
   }
   return el('div', { className: 'card col template-card' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
-      el('div', { className: 'card__title', text: '常吃套餐' }),
+      el('div', { className: 'card__title', text: list.length ? '常吃套餐' : '整日套餐' }),
       el('button', {
         className: 'btn btn--ghost btn--sm tpl-save-day',
         type: 'button',
@@ -495,7 +503,7 @@ function renderTemplateCard(templates, date, reload) {
         onClick: () => { saveTodayAsDayTemplate(date, reload).catch((err) => toast(`保存整日套餐失败：${err && err.message ? err.message : err}`, 'error')); },
       }),
     ),
-    row,
+    list.length ? row : null,
   );
 }
 
@@ -1095,8 +1103,8 @@ async function paint(root, date, reload) {
   );
   root.appendChild(nav);
 
-  // 日期条下方：常吃套餐。没有套餐时整块不渲染，不留空白。
-  const templateCard = renderTemplateCard(templates, date, reload);
+  // 日期条下方：常吃套餐。没有套餐且当天不足 2 餐时整块不渲染，不留空白。
+  const templateCard = renderTemplateCard(templates, date, reload, groupDayMeals(summary.meals).length);
   if (templateCard) root.appendChild(templateCard);
 
   // 相机/相册各一个 label 包 input：label 点击即原生打开选择器，没有额外的用户手势损耗。

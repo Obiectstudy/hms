@@ -276,6 +276,179 @@ function testFoodMath() {
   });
 }
 
+// ---------- nutrition: BMI 边界体重（界面可视化用） ----------
+
+function testBmiBoundaries() {
+  check('weightForBmi 由 BMI 反算体重，非法输入 null', () => {
+    eq(nutrition.weightForBmi(24, 175), 73.5);
+    eq(nutrition.weightForBmi(18.5, 175), 56.7);
+    eq(nutrition.weightForBmi(22, 160), 56.3);
+    eq(nutrition.weightForBmi('24', '175'), 73.5, '数字字符串应当可用');
+    eq(nutrition.weightForBmi(0, 175), null);
+    eq(nutrition.weightForBmi(-24, 175), null);
+    eq(nutrition.weightForBmi(NaN, 175), null);
+    eq(nutrition.weightForBmi(Infinity, 175), null);
+    eq(nutrition.weightForBmi(24, 0), null);
+    eq(nutrition.weightForBmi(24, -175), null);
+    eq(nutrition.weightForBmi(24, Infinity), null);
+    eq(nutrition.weightForBmi(24, 'abc'), null);
+  });
+
+  check('bmiGaps 给出相邻档位边界的距离（23.3 → 上界超重 2.1kg）', () => {
+    const g = nutrition.bmiGaps(23.3, 175);
+    eq(g.upper.label, '超重');
+    near(g.upper.kg, 2.1, 0.2, '23.3 → 24 边界应约 2.1kg');
+    eq(g.lower.label, '偏瘦');
+    near(g.lower.kg, 14.7, 0.2, '23.3 → 18.5 边界应约 14.7kg');
+    ok(g.upper.kg > 0 && g.lower.kg > 0, 'kg 是绝对差，必须为正');
+    // kg 保留 1 位
+    for (const side of [g.lower, g.upper]) {
+      near(side.kg * 10, Math.round(side.kg * 10), 1e-9, 'kg 必须落在 0.1 网格上');
+    }
+
+    const lean = nutrition.bmiGaps(17, 175);
+    deep(lean.lower, null, '最低档没有更低边界');
+    eq(lean.upper.label, '正常');
+    near(lean.upper.kg, 4.6, 0.2);
+
+    const obese = nutrition.bmiGaps(29, 175);
+    deep(obese.upper, null, '最高档没有更高边界');
+    eq(obese.lower.label, '超重');
+    near(obese.lower.kg, 3.1, 0.2);
+
+    // 边界值本身进入下一档，与 bmiClass 的口径一致
+    eq(nutrition.bmiClass(28).label, '肥胖');
+    deep(nutrition.bmiGaps(28, 175).upper, null);
+    eq(nutrition.bmiGaps(28, 175).lower.label, '超重');
+    eq(nutrition.bmiClass(18.5).label, '正常');
+    eq(nutrition.bmiGaps(18.5, 175).lower.label, '偏瘦');
+  });
+
+  check('bmiGaps 非法输入返回双 null，label 来自 bmiClass 的档位名', () => {
+    deep(nutrition.bmiGaps(0, 175), { lower: null, upper: null });
+    deep(nutrition.bmiGaps(-1, 175), { lower: null, upper: null });
+    deep(nutrition.bmiGaps(NaN, 175), { lower: null, upper: null });
+    deep(nutrition.bmiGaps(23.3, 0), { lower: null, upper: null });
+    deep(nutrition.bmiGaps(23.3, -175), { lower: null, upper: null });
+    deep(nutrition.bmiGaps(23.3, NaN), { lower: null, upper: null });
+    deep(nutrition.bmiGaps('abc', 'abc'), { lower: null, upper: null });
+    // 四个档位名必须与 bmiClass() 一致（界面直接显示这四个词）
+    for (const [probe, label] of [[17, '偏瘦'], [20, '正常'], [25, '超重'], [29, '肥胖']]) {
+      eq(nutrition.bmiClass(probe).label, label);
+    }
+    eq(nutrition.bmiGaps(20, 175).lower.label, '偏瘦');
+    eq(nutrition.bmiGaps(20, 175).upper.label, '超重');
+    eq(nutrition.bmiGaps(25, 175).lower.label, '正常');
+    eq(nutrition.bmiGaps(25, 175).upper.label, '肥胖');
+  });
+}
+
+// ---------- nutrition: 运动净消耗 ----------
+
+function testExerciseBurn() {
+  check('estimateBurn 走净消耗口径 (MET−1)，小于旧的总消耗', () => {
+    const net = nutrition.estimateBurn({ type: 'bike', intensity: 'road', minutes: 30, weightKg: 70 });
+    eq(net, Math.round((8.0 - 1) * 70 * 0.5));
+    eq(net, 245);
+    const oldGross = 8.0 * 70 * 0.5;
+    eq(oldGross, 280);
+    ok(net < oldGross, `净消耗 ${net} 必须小于旧的总消耗 ${oldGross}`);
+    near(net, Math.round(oldGross * (7 / 8)), 1, '净额应约为总量的 (MET−1)/MET');
+  });
+
+  check('骑行分档：休闲明显低于公路车，未选强度时用中档默认', () => {
+    const burn = (intensity) => nutrition.estimateBurn({ type: 'bike', intensity, minutes: 30, weightKg: 70 });
+    eq(burn('casual'), Math.round((4.0 - 1) * 70 * 0.5));
+    eq(burn('commute'), Math.round((6.0 - 1) * 70 * 0.5));
+    eq(burn('road'), 245);
+    eq(burn('climb'), Math.round((10.0 - 1) * 70 * 0.5));
+    ok(burn('casual') < burn('road') * 0.6, '休闲档必须明显低于公路车档');
+    ok(burn('road') < burn('climb'), '爬坡档必须高于公路车档');
+    // 不选强度：取中档（公路车 8.0）
+    eq(nutrition.exerciseMet('bike'), 8.0);
+    eq(nutrition.estimateBurn({ type: 'bike', minutes: 30, weightKg: 70 }), 245);
+    eq(nutrition.exerciseMet('bike', 'road'), 8.0);
+    eq(nutrition.exerciseMet('bike', '  road  '), 8.0, '强度值应 trim');
+    eq(nutrition.exerciseMet('bike', '没这档'), 8.0, '未知强度回退该类型的默认 met');
+  });
+
+  check('estimateBurn 边界：非正/非有限数一律 0，且不会算出负数', () => {
+    eq(nutrition.estimateBurn({ type: 'bike', intensity: 'road', minutes: 0, weightKg: 70 }), 0);
+    eq(nutrition.estimateBurn({ type: 'bike', intensity: 'road', minutes: -30, weightKg: 70 }), 0);
+    eq(nutrition.estimateBurn({ type: 'bike', intensity: 'road', minutes: 30, weightKg: 0 }), 0);
+    eq(nutrition.estimateBurn({ type: 'bike', intensity: 'road', minutes: 30, weightKg: -70 }), 0);
+    eq(nutrition.estimateBurn({ minutes: NaN, weightKg: 70 }), 0);
+    eq(nutrition.estimateBurn({ minutes: Infinity, weightKg: 70 }), 0);
+    eq(nutrition.estimateBurn({ minutes: 30, weightKg: Infinity }), 0);
+    eq(nutrition.estimateBurn({ minutes: 'abc', weightKg: 'abc' }), 0);
+    eq(nutrition.estimateBurn({}), 0);
+    eq(nutrition.estimateBurn(), 0);
+    eq(nutrition.estimateBurn(null), 0);
+    // 未知类型回退 'other'
+    eq(nutrition.estimateBurn({ type: 'no-such-type', minutes: 30, weightKg: 70 }), Math.round((4.0 - 1) * 70 * 0.5));
+    // 全表 MET > 1：任何 类型 × 强度 都算不出负数（MET ≤ 1 才可能为负）
+    for (const t of nutrition.EXERCISE_TYPES) {
+      ok(t.met > 1, `${t.value} 的 met 必须 > 1，否则净消耗会变成负数`);
+      ok(nutrition.estimateBurn({ type: t.value, minutes: 30, weightKg: 70 }) >= 0, `${t.value} 算出了负数`);
+      for (const i of t.intensities ?? []) ok(i.met > 1, `${t.value}/${i.value} 的 met 必须 > 1`);
+    }
+  });
+
+  check('EXERCISE_TYPES 结构：≥20 种、value 唯一、都有 group、强度递增、含 6 个旧值', () => {
+    const types = nutrition.EXERCISE_TYPES;
+    ok(Array.isArray(types), 'EXERCISE_TYPES 必须是数组');
+    ok(types.length >= 20, `类型数 ${types.length} 应 ≥ 20`);
+    const values = types.map((t) => t.value);
+    eq(new Set(values).size, values.length, 'value 必须唯一');
+    for (const t of types) {
+      ok(typeof t.value === 'string' && t.value.length > 0, 'value 必须是非空字符串');
+      ok(typeof t.label === 'string' && t.label.length > 0, `${t.value} 缺 label`);
+      ok(typeof t.group === 'string' && t.group.length > 0, `${t.value} 缺 group`);
+      ok(Number.isFinite(t.met) && t.met > 1, `${t.value} 的 met 必须是 >1 的有限数`);
+      if (t.intensities != null) {
+        ok(Array.isArray(t.intensities) && t.intensities.length >= 2, `${t.value} 的 intensities 至少 2 档`);
+        let prev = 0;
+        for (const i of t.intensities) {
+          ok(typeof i.value === 'string' && i.value.length > 0, `${t.value} 的强度缺 value`);
+          ok(typeof i.label === 'string' && i.label.length > 0, `${t.value}/${i.value} 缺 label`);
+          ok(Number.isFinite(i.met) && i.met > prev, `${t.value} 的强度 met 必须严格递增`);
+          prev = i.met;
+        }
+        eq(t.met, t.intensities[Math.floor(t.intensities.length / 2)].met, `${t.value} 的 met 应取中档`);
+      }
+    }
+    for (const legacy of ['walk', 'jog', 'bike', 'swim', 'strength', 'other']) {
+      const hit = types.find((t) => t.value === legacy);
+      ok(hit, `历史记录里的 ${legacy} 必须继续有效`);
+      ok(hit.label.length > 0, `旧值 ${legacy} 必须能查到标签`);
+      ok(nutrition.exerciseMet(legacy) > 1, `旧值 ${legacy} 必须能算出 met`);
+    }
+    for (const group of ['有氧', '户外', '力量', '球类', '其他']) {
+      ok(types.some((t) => t.group === group), `缺分组 ${group}`);
+    }
+    // 要求 1：整表平均下调 15–30%（净/总 = (MET−1)/MET）
+    const avgDrop = types.reduce((sum, t) => sum + 1 / t.met, 0) / types.length;
+    ok(avgDrop >= 0.15 && avgDrop <= 0.30, `整表平均降幅 ${(avgDrop * 100).toFixed(1)}% 应落在 15–30%`);
+  });
+
+  check('每个类型都能给出有限正 MET，未知类型/强度都有兜底', () => {
+    for (const t of nutrition.EXERCISE_TYPES) {
+      const met = nutrition.exerciseMet(t.value);
+      ok(Number.isFinite(met) && met > 1, `${t.value} 的默认 met 非法`);
+      for (const i of t.intensities ?? []) eq(nutrition.exerciseMet(t.value, i.value), i.met);
+      eq(nutrition.exerciseMet(t.value, '没这档'), t.met, `${t.value} 未知强度应回退默认 met`);
+      eq(nutrition.exerciseMet(t.value, null), t.met);
+    }
+    const otherMet = nutrition.EXERCISE_TYPES.find((t) => t.value === 'other').met;
+    eq(otherMet, 4.0);
+    eq(nutrition.exerciseMet('no-such-type'), otherMet);
+    eq(nutrition.exerciseMet('no-such-type', 'road'), otherMet);
+    eq(nutrition.exerciseMet(''), otherMet);
+    eq(nutrition.exerciseMet(null), otherMet);
+    eq(nutrition.exerciseMet('walk', 'brisk'), 4.3);
+  });
+}
+
 // ---------- nutrition: 序列 ----------
 
 function testSeries() {
@@ -609,6 +782,46 @@ function testNormalize() {
   });
 }
 
+// ---------- pure: 运动记录的强度字段 ----------
+
+function testExerciseRecordShape() {
+  check('normalizeExerciseRecord 保留合法 intensity，丢弃超长/非字符串', () => {
+    const base = { date: '2026-10-01', type: 'bike', minutes: 30, kcalBurned: 245, createdAt: 1 };
+    eq(pure.normalizeExerciseRecord({ ...base, intensity: '  road  ' }).intensity, 'road', 'intensity 应 trim 后落库');
+    eq('intensity' in pure.normalizeExerciseRecord(base), false, '缺字段不落键');
+    eq('intensity' in pure.normalizeExerciseRecord({ ...base, intensity: '' }), false, '空串不落键');
+    eq('intensity' in pure.normalizeExerciseRecord({ ...base, intensity: '   ' }), false, '全空白不落键');
+    eq('intensity' in pure.normalizeExerciseRecord({ ...base, intensity: 123 }), false, '非字符串丢弃');
+    eq('intensity' in pure.normalizeExerciseRecord({ ...base, intensity: null }), false);
+    eq('intensity' in pure.normalizeExerciseRecord({ ...base, intensity: {} }), false, '对象丢弃');
+    eq('intensity' in pure.normalizeExerciseRecord({ ...base, intensity: 'x'.repeat(17) }), false, '17 字符超长丢弃');
+    eq(pure.normalizeExerciseRecord({ ...base, intensity: 'x'.repeat(16) }).intensity, 'x'.repeat(16), '16 字符是边界，保留');
+    // 其余字段语义不变
+    const r = pure.normalizeExerciseRecord({ ...base, intensity: 'road', minutes: 30.44 });
+    eq(r.type, 'bike');
+    eq(r.minutes, 30.4);
+    eq(r.kcalBurned, 245);
+    eq(pure.normalizeExerciseRecord({}), null);
+  });
+
+  check('keyOf 与 CSV 导出不受 intensity 影响（列不变）', () => {
+    const row = { date: '2026-10-01', type: 'bike', minutes: 30, kcalBurned: 245, intensity: 'road' };
+    ok(pure.keyOf('exercises', row).startsWith('fk:'), '无 id 时仍走内容指纹');
+    eq(
+      pure.keyOf('exercises', row),
+      pure.keyOf('exercises', { ...row, intensity: 'climb' }),
+      '内容指纹不应因强度改变（历史导出照旧去重）',
+    );
+    eq(pure.keyOf('exercises', { id: 7, ...row }), 'id:7');
+
+    const csv = pure.buildCSV({ exercises: [{ ...row, note: '通勤', createdAt: 5 }] });
+    ok(csv.includes('date,type,minutes,kcalBurned,note,createdAt'), '运动段表头必须保持不变');
+    eq(csv.includes('intensity'), false, 'CSV 不应新增 intensity 列');
+    eq(csv.includes('road'), false, '强度值不应出现在 CSV 里');
+    ok(csv.includes('2026-10-01,bike,30,245,通勤,5'), '行内容保持旧格式');
+  });
+}
+
 // ---------- pure: 套餐模板 / 最近吃过 ----------
 
 function testMealTemplatePure() {
@@ -736,9 +949,9 @@ function testMealTemplatePure() {
 
     for (const [input, expected] of [
       [{ name: '   ', meals: first.template.meals }, '套餐名称不能为空'],
-      [{ name: '零餐' }, '整日套餐至少要有一餐'],
-      [{ name: '全非法', meals: [{ slot: 'lunch', items: [] }, null, 'oops'] }, '整日套餐至少要有一餐'],
-      [{ name: '只剩一餐', meals: [{ slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] }] }, '整日套餐至少要有一餐'],
+      [{ name: '零餐' }, '整日套餐至少要两餐'],
+      [{ name: '全非法', meals: [{ slot: 'lunch', items: [] }, null, 'oops'] }, '整日套餐至少要两餐'],
+      [{ name: '只剩一餐', meals: [{ slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] }] }, '整日套餐至少要两餐'],
     ]) {
       let msg = '';
       try {
@@ -1531,9 +1744,9 @@ async function testStoreMealTemplates() {
       ];
       for (const [input, expected] of [
         [{ name: '   ', meals: valid }, '套餐名称不能为空'],
-        [{ name: '整日' }, '整日套餐至少要有一餐'],
-        [{ name: '整日', meals: [] }, '整日套餐至少要有一餐'],
-        [{ name: '整日', meals: [{ slot: 'lunch', items: [] }, 'oops'] }, '整日套餐至少要有一餐'],
+        [{ name: '整日' }, '整日套餐至少要两餐'],
+        [{ name: '整日', meals: [] }, '整日套餐至少要两餐'],
+        [{ name: '整日', meals: [{ slot: 'lunch', items: [] }, 'oops'] }, '整日套餐至少要两餐'],
       ]) {
         let msg = '';
         try {
@@ -1674,17 +1887,115 @@ async function testStoreExportStatus() {
   });
 }
 
+// ---------- pure / store: 整日套餐的报错文案 ----------
+
+function testDayTemplateMessage() {
+  check('整日套餐错误文案已改为「至少要两餐」，且两餐真的能存', () => {
+    const two = [{ slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] }, { slot: 'dinner', items: [{ name: '面', kcal: 200 }] }];
+    const one = [{ slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] }];
+    for (const [input, expected] of [
+      [{ name: '零餐' }, '整日套餐至少要两餐'],
+      [{ name: '只剩一餐', meals: one }, '整日套餐至少要两餐'],
+      [{ name: '非法餐次', meals: [{ slot: 'lunch', items: [] }, 'oops'] }, '整日套餐至少要两餐'],
+      [{ name: ' ', meals: two }, '套餐名称不能为空'],
+    ]) {
+      let msg = '';
+      try {
+        pure.planDayTemplateSave([], input);
+      } catch (err) {
+        msg = err.message;
+      }
+      eq(msg, expected);
+    }
+    // 文案说「至少两餐」，那两餐就必须是合法下限
+    const okTwo = pure.planDayTemplateSave([], { name: '两餐', meals: two });
+    eq(okTwo.template.meals.length, 2);
+    eq(okTwo.template.kind, 'day');
+    eq('slot' in okTwo.template, false, '整日套餐不带单餐 slot');
+  });
+}
+
+// ---------- store: 运动落库（含强度，同样用最小假 IDB） ----------
+
+async function testStoreExerciseLog() {
+  await checkAsync('store: logExercise 落库 intensity 并读回，取整/日期语义不变', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const date = nutrition.localDateStr();
+      // 既有语义：logExercise 返回 db.put 的主键（id），记录本身要从库里读回
+      const id = await store.logExercise({
+        date, type: 'bike', minutes: 30.44, kcalBurned: 245.6, note: '通勤', intensity: '  road  ',
+      });
+      eq(typeof id, 'number');
+
+      const rows = await db.getAll('exercises');
+      eq(rows.length, 1);
+      eq(rows[0].id, id);
+      eq(rows[0].intensity, 'road', 'intensity 应 trim 后落库');
+      eq(rows[0].type, 'bike');
+      eq(rows[0].minutes, 30.4);
+      eq(rows[0].kcalBurned, 246);
+      eq(rows[0].date, date);
+      eq(rows[0].note, '通勤');
+
+      const summary = await store.daySummary(date);
+      eq(summary.exercises.length, 1);
+      eq(summary.exercises[0].intensity, 'road', 'daySummary 读回的运动记录应带强度');
+
+      // 不带强度 / 超长强度：字段不落键，其余照旧
+      await store.logExercise({ date, type: 'walk', minutes: 20, kcalBurned: 80 });
+      await store.logExercise({ date, type: 'walk', minutes: 20, kcalBurned: 80, intensity: 'y'.repeat(20) });
+      const all = await db.getAll('exercises');
+      eq(all.length, 3, '三条都该落库');
+      eq('intensity' in all[1], false);
+      eq('intensity' in all[2], false, '超长强度不应落库');
+
+      // 非法日期串回退今天（todayOf 的既有语义）
+      const fallbackId = await store.logExercise({ date: 'not-a-date', type: 'walk', minutes: 20, kcalBurned: 80 });
+      eq((await db.get('exercises', fallbackId)).date, date);
+    });
+  });
+
+  await checkAsync('store: saveDayTemplate 的报错文案同样是「至少要两餐」', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      let msg = '';
+      try {
+        await store.saveDayTemplate({ name: '只一餐', meals: [{ slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] }] });
+      } catch (err) {
+        msg = err.message;
+      }
+      eq(msg, '整日套餐至少要两餐');
+
+      const t = await store.saveDayTemplate({
+        name: '两餐',
+        meals: [
+          { slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] },
+          { slot: 'dinner', items: [{ name: '面', kcal: 200 }] },
+        ],
+      });
+      eq(t.kind, 'day');
+      eq(t.meals.length, 2);
+      eq((await store.getMealTemplates()).length, 1);
+    });
+  });
+}
+
 // ---------- 入口 ----------
 
 export async function run() {
   testDates();
   testMetabolism();
+  testBmiBoundaries();
+  testExerciseBurn();
   testFoodMath();
   testSeries();
   testMovingAverage();
   testWeightUnits();
   testNormalize();
+  testExerciseRecordShape();
   testMealTemplatePure();
+  testDayTemplateMessage();
   testRecentFoodItemsPure();
   testAggregate();
   testRoundTrip();
@@ -1694,6 +2005,7 @@ export async function run() {
   await testStoreSettings();
   // 同样注入假 indexedDB；每段都在 finally 里清掉 db.js 单例
   await testStoreMealTemplates();
+  await testStoreExerciseLog();
   await testStoreExportStatus();
 
   const result = { passed, failed: failures.length, failures };

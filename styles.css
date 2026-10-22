@@ -36,6 +36,11 @@
   --warn-soft: rgba(224, 161, 6, .14);
   --warn-line: rgba(224, 161, 6, .38);
   --danger-line: rgba(217, 83, 79, .26);
+  /* BMI 区间条的浅色段：与设计稿 color-mix(基础色 55~70%, 白) 同一观感。
+     叠在白卡（--surface）上的带透明通道版本，色值仍然只出现在这里。 */
+  --protein-tint: rgba(60, 141, 242, .55);
+  --warn-tint: rgba(224, 161, 6, .7);
+  --danger-tint: rgba(217, 83, 79, .7);
   --tabbar-h: 58px;
 }
 
@@ -237,6 +242,8 @@ label.btn { cursor: pointer; }
 
 .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .field__label { font-size: 12px; color: var(--text-2); }
+/* 强度下拉的挂载点：没有档位时为空，display:contents 保证空槽不占一行也不多一个间距。 */
+.intensity-slot { display: contents; }
 
 .input, .select {
   width: 100%;
@@ -889,4 +896,122 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+/* ---------- BMI 可视化 ---------- */
+
+.bmi-panel { display: flex; flex-direction: column; gap: 10px; }
+
+.bmi-hero { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.bmi-value { display: flex; align-items: baseline; gap: 4px; }
+.bmi-value__num {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+.bmi-value__unit { font-size: 14px; font-weight: 500; color: var(--text-2); }
+.bmi-cat { font-size: 13px; color: var(--text-2); }
+.bmi-cat__band { color: var(--brand-2); }
+
+.bmi-gaps { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; color: var(--text-2); }
+.bmi-gap { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* 区间条：四段按 BMI 跨度分宽，指针气泡挂在条上方。 */
+.bmi-scale { position: relative; height: 10px; margin: 26px 0 0; }
+.bmi-track {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.bmi-seg { height: 100%; }
+.bmi-seg--low { background: var(--protein-tint); }
+.bmi-seg--normal { background: var(--brand); }
+.bmi-seg--over { background: var(--warn-tint); }
+.bmi-seg--obese { background: var(--danger-tint); }
+.bmi-marker {
+  position: absolute;
+  top: -22px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transition: left .45s cubic-bezier(.4, 0, .2, 1);
+}
+.bmi-bubble {
+  background: var(--text);
+  color: var(--on-brand);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  border-radius: 8px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.bmi-pointer {
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--text);
+  margin-top: 1px;
+}
+
+/* 刻度按真实百分比定位：18.5 落在 22.5%、28 落在 70%，与区间条的边界对齐。 */
+.bmi-ticks { position: relative; height: 16px; margin-top: 6px; font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.bmi-tick { position: absolute; top: 0; transform: translateX(-50%); }
+.bmi-tick--first { transform: none; }
+.bmi-tick--last { transform: translateX(-100%); }
+.bmi-bands { display: flex; font-size: 11px; color: var(--text-2); }
+.bmi-band { text-align: center; }
+
+/* 四档体态小人：当前档位高亮并重描一次线条（时长由全局 reduced-motion 规则归零）。 */
+.bmi-figures { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 6px; }
+.bmi-figure {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+}
+.bmi-figure.is-active { background: var(--brand-soft); border-color: var(--brand); }
+.bmi-figure__svg { display: block; width: 56px; height: 76px; overflow: visible; }
+.bmi-figure__label { font-size: 11px; color: var(--text-2); }
+.bmi-figure.is-active .bmi-figure__label { color: var(--brand-2); font-weight: 600; }
+
+.bmi-body-line {
+  fill: none;
+  stroke: var(--text-2);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: .55;
+}
+.bmi-figure.is-active .bmi-body-line {
+  stroke: var(--brand-2);
+  stroke-width: 2.6;
+  opacity: 1;
+  stroke-dasharray: 260;
+  stroke-dashoffset: 260;
+  animation: bmi-draw 1.1s ease forwards;
+}
+@keyframes bmi-draw {
+  to { stroke-dashoffset: 0; }
+}
+
+.bmi-hint { font-size: 12px; line-height: 1.5; color: var(--text-2); }
+
+@media (max-width: 359px) {
+  .bmi-value__num { font-size: 34px; }
+  .bmi-figure__svg { width: 48px; height: 66px; }
+  .bmi-gaps { gap: 2px 8px; }
 }

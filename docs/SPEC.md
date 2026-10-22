@@ -107,6 +107,18 @@ export function movingAverage(series, size = 7): Array<{ date, value, avg }>
 //  avg = 最近 size 个点（含当前点）中**有效值**的算术平均，保留 1 位
 //  有效点 < 2 时 avg = null；size = 1 因此恒为 null（避免单点画出假趋势）
 //  value 非有限数的点 avg = null 且不进入任何窗口统计；size 非有限数回退 7，size ≤ 0 按 1 处理
+
+// v1.8 起：运动种类表与净消耗估算、BMI 边界反算
+export const EXERCISE_TYPES = [{ value, label, group, met, intensities?: [{ value, label, met }] }, ...]
+//  24 种 / 5 组；legacy 值 walk·jog·bike·swim·strength·other 必须继续有效（历史记录里存的就是这些）
+export function exerciseMet(type, intensity): number     // 未知 type → 'other' 的 met；未知 intensity → 该类型默认 met
+export function estimateBurn({ type, minutes, weightKg, intensity }): number
+//  净消耗：max(0, round((MET − 1) × weightKg × minutes/60))；minutes/weightKg 非正或非有限数 → 0
+export function weightForBmi(bmiValue, heightCm): number|null   // 保留 1 位；非法输入 → null
+export function bmiGaps(bmiValue, heightCm): { lower: { label, kg } | null, upper: { label, kg } | null }
+//  lower = 距离更低一档边界还差多少 kg，upper = 距离更高一档边界还差多少 kg；label 是**跨过边界会进入的那一档**
+//  例：bmiGaps(23.3, 175) → { lower: { label:'偏瘦', kg:14.7 }, upper: { label:'超重', kg:2.1 } }
+//  非法输入 → { lower: null, upper: null }
 ```
 
 ### 5.2 `js/db.js` —— 只做存储，不含业务规则
@@ -172,7 +184,7 @@ export async function clearAllData(): Promise<void>    // 业务数据 + photos�
 //    kind='meal' 走 slot+items；kind='day' 走 meals（≥2 餐，用于「整日一键」）
 export async function getMealTemplates(): Promise<Template[]>       // 脏数据过滤，绝不抛；老数据（无 kind）归一为 kind='meal'
 export async function saveMealTemplate({ name, slot, items }): Promise<Template>  // 同名覆盖并保留 id；空名抛「套餐名称不能为空」
-export async function saveDayTemplate({ name, meals }): Promise<Template>         // 整日套餐：meals 少于 2 餐抛「整日套餐至少要有一餐」
+export async function saveDayTemplate({ name, meals }): Promise<Template>         // 整日套餐：meals 归一化后少于 2 餐抛「整日套餐至少要两餐」
 export async function deleteMealTemplate(id): Promise<void>                       // 通吃两种
 export async function recentFoodItems(limit = 12): Promise<Array<{ name, lastDate, slot, item }>>
 //  只取最近 200 条 meals；按 item.name（trim 后）去重，保留最后一次出现的信息；limit 在去重后生效
@@ -317,7 +329,16 @@ CSS 变量（`styles.css` 顶部定义，视图只用变量，禁止写死颜色
 手动流程：搜索食物（`searchFoods`）→ 选食物 → 输入克数或选 `unit` 快捷份量 → 加入清单 → 保存；
 下方按餐次分组展示已记录条目，支持删除与修改份量；页尾显示当日四项合计。
 
-**运动**：类型选择（走路/慢跑/骑行/游泳/力量训练/其他）+ 分钟 + 自动估算消耗（按类型 MET × 体重 × 时长，可手改）→ 保存；当日列表与合计。
+**运动**：类型选择（**24 种、按「有氧 / 户外 / 力量 / 球类 / 其他」分组**，其中 12 种带强度档：骑行五档、
+跑步三档、徒步三档、力量三档、跳绳/游泳/划船机/HIIT/舞蹈/羽毛球/爬楼梯各三档）+ 分钟 + 自动估算消耗 → 保存；当日列表与合计。
+
+估算口径为**净消耗**（v1.8 起）：
+```
+kcal = max(0, round((MET − 1) × 体重kg × 分钟/60))
+```
+减掉 1 MET 是因为旧口径的 `MET × 体重 × 时长` 是**总消耗**，含躺着也会烧的基础代谢；减脂记账要的是"因为运动
+额外多烧的"。整表因此平均下调约 19%，低 MET 动作下调更多（休闲骑行 −56%，力量训练 −20%）。
+提示文案要写清口径与档位，例如：`估算 186 kcal（骑行 · 公路车 20-25km/h · 30 分钟 · 净消耗）`。**手动改消耗的入口保留。**
 
 **饮水**：大号进度（ml / 目标）；快捷 +200 / +250 / +500、自定义、撤销（减 250）；进度到 100% 时卡片态变化。
 
@@ -462,3 +483,16 @@ body：
   3. 饮食页「常吃套餐」同时展示单餐与整日两类：整日 chip 点一下把每一餐都记入当天；
      新增「把今天存为整日套餐」（按当天已有餐次分组保存，不足 2 餐时给提示）。
 - **未改动**：单餐套餐的既有行为、`recentFoodItems` 语义、食物库结构。
+
+### v1.8 · 2026-10-21 · 运动净消耗口径 + BMI 可视化 + 整日套餐入口可达性
+- **口径变更（破坏性，仅影响新记录）**：运动消耗由 `MET × 体重 × 时长`（总消耗）改为
+  `(MET − 1) × 体重 × 时长`（**净消耗**）。历史记录里已存的 `kcalBurned` 不变。
+- **运动种类**：6 → 24 种，分 5 组；骑行五档（休闲 4.0 / 通勤 6.0 / 公路车 8.0 / 动感单车 8.5 / 爬坡或高强度 10.0），
+  跑步三档（6.0 / 9.0 / 11.0），徒步三档（5.0 / 6.3 / 8.0）。`exercises` 记录新增可选字段 `intensity`
+  （trim 后 ≤16 字符，超长或非字符串丢弃）；**CSV 导出列保持不变**。
+- **BMI**：新增 `weightForBmi` 与 `bmiGaps`；体重页把原来的药丸标签换成
+  分段区间条（14–34，四档按中国标准 18.5/24/28）+ 当前位置指针 + 四档体态小人（当前档高亮 + 描线动画，
+  遵守 `prefers-reduced-motion`）+ 距上下边界还差多少 kg。
+- **饮食**：修掉「整日套餐入口对全新用户不可达」——当天已有 ≥2 餐但零套餐时，卡片仍渲染（标题「整日套餐」），
+  只显示「把今天存为整日套餐」；零套餐且当天 <2 餐时整块不渲染（维持原行为）。
+- **文案修正**：整日套餐的错误串由「至少要有一餐」改为「**至少要两餐**」（规则本就是归一化后 ≥2 餐）。

@@ -320,13 +320,14 @@ export async function recentFoodItems(limit = 12) {
 
 // ---------- 运动 ----------
 
-export async function logExercise({ date, type, minutes, kcalBurned, note } = {}) {
+export async function logExercise({ date, type, minutes, kcalBurned, note, intensity } = {}) {
   const record = normalizeExerciseRecord({
     date: todayOf(date),
     type,
     minutes,
     kcalBurned,
     note,
+    intensity,
     createdAt: Date.now(),
   });
   if (!record) throw new Error('运动记录日期无效');
