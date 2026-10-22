@@ -7,8 +7,11 @@
  *   1) 纯逻辑层 createHandler({ db, now, randomBytes, logger })：只依赖 db.query(sql, params)，
  *      不 require('pg')、不读 process.env、不碰网络 —— 本机用内存假数据库即可端到端测通。
  *   2) 云函数入口 main(event)：把 HTTP 访问服务的事件（path / httpMethod / body / headers）转成内部调用。
- *   3) 真实连接 openDatabase()：唯一 require('pg') 且唯一读 DATABASE_URL 的地方，只有显式调用才执行，
- *      所以 import 本模块时即使没有 pg、没有环境变量也不会崩。
+ *   3) 真实数据库两条通道：
+ *      - openDatabaseViaApi()：main 实际使用的通道，走云开发 SQL HTTP API（POST /v1/rdb/exec-pgsql），
+ *        只认注入的 API Key + 环境 ID，不需要任何数据库网络地址 —— 共享集群下唯一可用。
+ *      - openDatabase()：旧的 pg 直连，保留但 main 不再调用；它仍是唯一 require('pg') 的地方，
+ *        所以本机没有 pg、没有环境变量时 import 本模块一切正常。
  *
  * HTTP 协议是冻结的（客户端并行实现），字段一个都不能改，见 cloud/README.md。
  */
@@ -557,6 +560,210 @@ function openDatabase(options) {
   return pool;
 }
 
+// ---------- 云开发 SQL HTTP API 通道 ----------
+//
+// 依据（官方 OpenAPI，勿凭记忆改动）：
+//   https://docs.cloudbase.net/openapi/pgdb.v1.openapi.yaml
+//     servers: https://{envId}.api.tcloudbasegateway.com
+//     POST /v1/rdb/exec-pgsql   body: { sql, parameters[], role }
+//     200 → 行对象组成的 JSON 数组（DDL 为 []）
+//     400 → { code, message, details, requestId }，code 形如 DATABASE_23505
+//   https://docs.cloudbase.net/cloud-function/resource-integration/cloudbase
+//     「API Key（推荐）：在函数环境变量中配置 CLOUDBASE_APIKEY」
+// 共享集群没有任何数据库网络地址，pg 直连无路可走，只能走这条 API 通道。
+
+const GATEWAY_HOST_SUFFIX = '.api.tcloudbasegateway.com';
+const EXEC_PGSQL_PATH = '/v1/rdb/exec-pgsql';
+/** 不传 role 默认落到只读角色，本后端的 INSERT/UPDATE/DELETE 会被 42501 拒掉，必须显式指定管理角色。 */
+const EXEC_PGSQL_ADMIN_ROLE = 'cloudbase_postgres';
+const API_TIMEOUT_MS = 15000;
+
+/**
+ * API Key 环境变量候选，按优先级排列。第一个是官方文档里写死的名字，其余只是兜底别名。
+ * 永远不要反过来：别名是给历史环境擦屁股的，不是新部署的标准。
+ */
+const API_KEY_ENV_NAMES = ['CLOUDBASE_APIKEY', 'CLOUDBASE_API_KEY', 'TCB_API_KEY', 'API_KEY'];
+/** 环境 ID 候选：CLOUDBASE_ENV_ID 是配套变量，TCB_ENV 是云函数运行时注入的环境 ID。 */
+const ENV_ID_ENV_NAMES = ['CLOUDBASE_ENV_ID', 'TCB_ENV', 'TENCENTCLOUD_TCB_ENVID', 'TCB_ENV_ID'];
+/** 环境 ID 只允许小写字母、数字与连字符，防止环境变量里塞进完整的 URL 把请求带去别处。 */
+const ENV_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+/** 只有「SQL 与结构级」错误的上游 message 才是我们自己的 SQL，可以带出来排查。 */
+const GATEWAY_ECHOABLE_CODES = ['INVALID_PARAM', 'DATABASE_42601', 'DATABASE_42P01'];
+
+function pickEnvValue(source, names) {
+  for (let i = 0; i < names.length; i += 1) {
+    const value = source ? source[names[i]] : undefined;
+    if (typeof value === 'string' && value.trim()) return { name: names[i], value: value.trim() };
+  }
+  return null;
+}
+
+/** 只从环境变量取凭证；绝不写文件、不进日志、不出现在任何返回值里。 */
+function resolveGatewayConfig(env) {
+  const source = isRecord(env) ? env : process.env;
+  const key = pickEnvValue(source, API_KEY_ENV_NAMES);
+  const envId = pickEnvValue(source, ENV_ID_ENV_NAMES);
+  const missing = [];
+  if (!key) missing.push(API_KEY_ENV_NAMES[0]);
+  if (!envId) missing.push(ENV_ID_ENV_NAMES[0]);
+  if (missing.length) {
+    throw new Error('缺少云开发环境变量 ' + missing.join(' 与 ') + '，请在云函数「环境变量」里配置后重新部署');
+  }
+  if (!ENV_ID_RE.test(envId.value)) {
+    throw new Error('环境变量 ' + envId.name + ' 不是合法的环境 ID');
+  }
+  return {
+    endpoint: 'https://' + envId.value + GATEWAY_HOST_SUFFIX + EXEC_PGSQL_PATH,
+    apiKey: key.value,
+    keyEnvName: key.name,
+    envIdEnvName: envId.name,
+  };
+}
+
+/**
+ * pg 的 $n 参数可以是 Date 或对象，网关的 parameters 只接受 string|number|boolean|null：
+ * Date 转 ISO 字符串（timestamptz 认这个格式），对象与数组转 JSON 文本（配合 SQL 里的 ::jsonb）。
+ */
+function normalizeParam(value) {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.toISOString();
+  const type = typeof value;
+  if (type === 'string' || type === 'number' || type === 'boolean') return value;
+  return JSON.stringify(value);
+}
+
+function normalizeParams(params) {
+  if (!Array.isArray(params)) return [];
+  return params.map(normalizeParam);
+}
+
+/** 网关错误码是 `DATABASE_<SQLSTATE>`，业务层按 pg 的 SQLSTATE 判定（如 23505 唯一冲突）。 */
+function sqlStateOf(code) {
+  if (typeof code !== 'string' || !code) return 'UNKNOWN';
+  return /^DATABASE_[0-9A-Z]{5}$/.test(code) ? code.slice('DATABASE_'.length) : code;
+}
+
+function gatewayFailure(status, code, message) {
+  const err = new Error(message);
+  err.name = 'GatewayError';
+  err.code = sqlStateOf(code);
+  err.status = toInt(status);
+  return err;
+}
+
+/**
+ * 数据级错误（如 23505 唯一冲突）的上游 message / details 可能夹带触发冲突的用户输入，
+ * 一律不回显；响应里只留状态码、SQLSTATE 与 requestId。
+ */
+function describeGatewayFailure(status, code, payload) {
+  const parts = ['云开发 SQL 接口失败', 'HTTP ' + toInt(status), 'code=' + sqlStateOf(code)];
+  const requestId = payload && typeof payload.requestId === 'string' ? payload.requestId : '';
+  if (requestId) parts.push('requestId=' + requestId);
+  if (GATEWAY_ECHOABLE_CODES.indexOf(code) !== -1 && payload && typeof payload.message === 'string') {
+    parts.push('message=' + payload.message);
+  }
+  return parts.join(' ');
+}
+
+/** 请求自带超时：即使 fetch 实现不认 AbortSignal，也一定会按时抛错而不是挂死。 */
+function fetchWithTimeout(fetchImpl, url, init, timeoutMs, onTimeout) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onTimeout();
+      reject(gatewayFailure(0, 'TIMEOUT', '云开发 SQL 接口超时'));
+    }, timeoutMs);
+    const settle = (fn) => (arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(arg);
+    };
+    try {
+      fetchImpl(url, init).then(settle(resolve), settle(reject));
+    } catch (err) {
+      settle(reject)(err);
+    }
+  });
+}
+
+/**
+ * 云开发 API 通道的 db 接口：与 pg 的 db.query(sql, params) 完全同形 ——
+ * 成功返回行对象数组（网关就是裸数组），失败抛出的错误带 pg 风格的 SQLSTATE 放在 err.code。
+ */
+function createApiDatabase(options) {
+  const opts = options || {};
+  const config = opts.config || resolveGatewayConfig(opts.env);
+  const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : globalThis.fetch;
+  if (typeof fetchImpl !== 'function') throw new Error('运行环境没有 fetch，无法调用云开发 SQL 接口');
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : API_TIMEOUT_MS;
+
+  return {
+    query: async function query(sql, params) {
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      let res;
+      try {
+        res = await fetchWithTimeout(
+          fetchImpl,
+          config.endpoint,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: 'Bearer ' + config.apiKey,
+            },
+            body: JSON.stringify({
+              sql: String(sql),
+              parameters: normalizeParams(params),
+              role: EXEC_PGSQL_ADMIN_ROLE,
+            }),
+            signal: controller ? controller.signal : undefined,
+          },
+          timeoutMs,
+          () => {
+            if (controller) controller.abort();
+          }
+        );
+      } catch (err) {
+        if (err && err.name === 'GatewayError') throw err;
+        throw gatewayFailure(0, 'NETWORK', '云开发 SQL 接口网络请求失败');
+      }
+
+      let text = '';
+      try {
+        text = await res.text();
+      } catch (err) {
+        throw gatewayFailure(res && res.status, 'BODY_READ_FAILED', '云开发 SQL 接口响应读取失败');
+      }
+      let payload = null;
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch (err) {
+          payload = null;
+        }
+      }
+      const status = toInt(res && res.status);
+      const ok = (res && res.ok === true) || (status >= 200 && status < 300);
+      if (!ok) {
+        const code = payload && typeof payload.code === 'string' ? payload.code : 'HTTP_' + status;
+        throw gatewayFailure(status, code, describeGatewayFailure(status, code, payload));
+      }
+      if (!Array.isArray(payload)) {
+        throw gatewayFailure(status, 'MALFORMED', '云开发 SQL 接口返回的不是行数组');
+      }
+      return payload;
+    },
+  };
+}
+
+/** main 实际使用的通道入口：与 openDatabase() 同形，但不需要任何数据库网络地址。 */
+function openDatabaseViaApi(options) {
+  return createApiDatabase(options);
+}
+
 function jsonFail(status, code, message) {
   return { statusCode: status, headers: JSON_HEADERS, body: JSON.stringify({ error: code, message: message }) };
 }
@@ -573,7 +780,7 @@ function safeLog(record) {
 async function main(event) {
   let handler;
   try {
-    handler = createHandler({ db: openDatabase(), logger: console });
+    handler = createHandler({ db: openDatabaseViaApi(), logger: console });
   } catch (err) {
     safeLog({ tag: 'hms-api', status: 500, error: 'server-error', name: errorName(err), phase: 'connect' });
     return jsonFail(500, 'server-error', '服务端数据库未配置或不可用，请联系管理员');
@@ -591,7 +798,15 @@ module.exports = {
   createHandler: createHandler,
   main: main,
   openDatabase: openDatabase,
+  openDatabaseViaApi: openDatabaseViaApi,
+  createApiDatabase: createApiDatabase,
+  resolveGatewayConfig: resolveGatewayConfig,
   resolveDatabaseUrl: resolveDatabaseUrl,
+  normalizeParams: normalizeParams,
+  sqlStateOf: sqlStateOf,
+  API_KEY_ENV_NAMES: API_KEY_ENV_NAMES,
+  ENV_ID_ENV_NAMES: ENV_ID_ENV_NAMES,
+  EXEC_PGSQL_PATH: EXEC_PGSQL_PATH,
   SQL: SQL,
   RECOVERY_ALPHABET: RECOVERY_ALPHABET,
   SNAPSHOT_VERSION: SNAPSHOT_VERSION,

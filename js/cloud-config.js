@@ -9,7 +9,9 @@
  */
 import { CATALOG_KEY } from './accounts.js';
 
-export const baseUrl = '';
+// 腾讯云开发 CloudBase 的 HTTP 访问服务地址。这个地址不是机密：它只是网关入口，
+// 真正的鉴权发生在登录后的 token 上（服务端 API Key 只存在于云函数运行环境里，从不下发到浏览器）。
+export const baseUrl = 'https://hms-d4gnh63iw73f09792.service.tcloudbase.com/api';
 
 /** 本机凭据的键前缀：一个账号一份。 */
 export const CLOUD_AUTH_PREFIX = 'hms.cloud.auth.';

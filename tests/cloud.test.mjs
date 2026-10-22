@@ -602,6 +602,231 @@ async function run() {
   check('cloud-api 五个方法齐全', ['register', 'login', 'reset', 'pull', 'push'].every((k) => typeof client[k] === 'function'), Object.keys(client).join(','));
   check('cloud-api 路径常量与冻结协议一致', clientMod.CLOUD_API_PATHS.register === '/register' && clientMod.CLOUD_API_PATHS.push === '/push', JSON.stringify(clientMod.CLOUD_API_PATHS));
 
+
+  // ==================== 11. 云开发 SQL HTTP API 通道 ====================
+  // 共享集群没有任何数据库网络地址，pg 直连不可用；云函数改走 POST /v1/rdb/exec-pgsql。
+  // 官方契约：https://docs.cloudbase.net/openapi/pgdb.v1.openapi.yaml
+  const FAKE_KEY = 'test-apikey-not-real-0123456789';
+  const FAKE_ENV = 'hms-env-for-test';
+  const redact = (text) => String(text).split(FAKE_KEY).join('<redacted>');
+  const caught = async (promise) => {
+    try {
+      await promise;
+      return null;
+    } catch (err) {
+      return err;
+    }
+  };
+
+  const gwReq = [];
+  const gwEnv = { CLOUDBASE_APIKEY: FAKE_KEY, CLOUDBASE_ENV_ID: FAKE_ENV };
+  const dbApi = api.openDatabaseViaApi({
+    env: gwEnv,
+    fetchImpl: async (url, init) => {
+      gwReq.push({ url: url, init: init });
+      return { ok: true, status: 200, text: async () => JSON.stringify([{ id: 7, expires_at: '2030-01-01T00:00:00.000Z' }]) };
+    },
+  });
+  check('API 通道暴露与 pg 同形的 query(sql, params)', Boolean(dbApi) && typeof dbApi.query === 'function', typeof dbApi);
+
+  const apiRows = await dbApi.query('SELECT user_id, expires_at FROM sessions WHERE token_hash = $1', ['deadbeef']);
+  check(
+    'API 通道打到 POST https://<envId>.api.tcloudbasegateway.com/v1/rdb/exec-pgsql',
+    gwReq[0].url === 'https://hms-env-for-test.api.tcloudbasegateway.com/v1/rdb/exec-pgsql' && gwReq[0].init.method === 'POST',
+    redact(gwReq[0].url) + ' ' + gwReq[0].init.method
+  );
+  check(
+    'API 通道用 Authorization: Bearer <API Key> 鉴权',
+    gwReq[0].init.headers.authorization === 'Bearer ' + FAKE_KEY,
+    'authorization = Bearer <redacted>'
+  );
+  check(
+    'SQL 仍是 $1 占位符，值走 parameters 数组（没有拼进 SQL）',
+    JSON.parse(gwReq[0].init.body).sql === 'SELECT user_id, expires_at FROM sessions WHERE token_hash = $1' &&
+      JSON.stringify(JSON.parse(gwReq[0].init.body).parameters) === '["deadbeef"]',
+    'body keys = ' + Object.keys(JSON.parse(gwReq[0].init.body)).join(',')
+  );
+  check(
+    '写操作显式指定管理角色 cloudbase_postgres（不传会落到只读角色被 42501 拒掉）',
+    JSON.parse(gwReq[0].init.body).role === 'cloudbase_postgres',
+    'role = ' + JSON.parse(gwReq[0].init.body).role
+  );
+  check(
+    '成功时返回裸行数组，firstRow 的语义不变',
+    Array.isArray(apiRows) && apiRows.length === 1 && apiRows[0].id === 7 && apiRows[0].expires_at === '2030-01-01T00:00:00.000Z',
+    JSON.stringify(apiRows)
+  );
+
+  const gwReq2 = [];
+  const dbApi2 = api.openDatabaseViaApi({
+    env: { CLOUDBASE_APIKEY: FAKE_KEY, TCB_ENV: FAKE_ENV },
+    fetchImpl: async (url, init) => {
+      gwReq2.push({ url: url, init: init });
+      return { ok: true, status: 200, text: async () => '[]' };
+    },
+  });
+  await dbApi2.query('INSERT INTO snapshots (user_id, rev, saved_at, payload) VALUES ($1, $2, $3, $4::jsonb)', [
+    1,
+    2,
+    new Date(CLOCK0),
+    { a: 1 },
+  ]);
+  const sent2 = JSON.parse(gwReq2[0].init.body);
+  check(
+    'Date 参数转 ISO 字符串、对象参数转 JSON 文本（$4::jsonb 照旧可用）',
+    sent2.parameters[2] === new Date(CLOCK0).toISOString() && sent2.parameters[3] === '{"a":1}',
+    JSON.stringify(sent2.parameters)
+  );
+  check(
+    '环境 ID 缺失时回落到云函数注入的 TCB_ENV 拼域名',
+    gwReq2[0].url.indexOf('https://' + FAKE_ENV + '.api.tcloudbasegateway.com/v1/rdb/exec-pgsql') === 0,
+    redact(gwReq2[0].url)
+  );
+
+  const gwErr = (status, body) =>
+    api.openDatabaseViaApi({
+      env: gwEnv,
+      fetchImpl: async () => ({ ok: status >= 200 && status < 300, status: status, text: async () => JSON.stringify(body) }),
+    });
+
+  const dupErr = await caught(
+    gwErr(400, {
+      code: 'DATABASE_23505',
+      message: 'duplicate key value violates unique constraint "users_username_lower_key" Key (username_lower)=(alice_01) already exists.',
+      details: 'alice_01',
+      requestId: 'rq-1',
+    }).query(api.SQL.insertUser, [])
+  );
+  check('网关 DATABASE_23505 翻成 SQLSTATE 23505，业务层的唯一冲突判定照旧生效', Boolean(dupErr) && dupErr.code === '23505', redact(String(dupErr && dupErr.code)));
+  check(
+    '数据级错误不回显上游 message/details（可能夹带触发冲突的用户输入）',
+    Boolean(dupErr) && dupErr.message.indexOf('alice_01') === -1 && dupErr.message.indexOf('duplicate key') === -1,
+    redact(String(dupErr && dupErr.message))
+  );
+  check('数据级错误的错误信息保留 SQLSTATE 与 requestId 便于排查', Boolean(dupErr) && dupErr.message.indexOf('23505') !== -1 && dupErr.message.indexOf('rq-1') !== -1, redact(String(dupErr && dupErr.message)));
+
+  const synErr = await caught(gwErr(400, { code: 'DATABASE_42601', message: 'syntax error at or near "SELEC"' }).query('SELEC 1', []));
+  check(
+    '网关 DATABASE_42601 翻成 SQLSTATE 42601，并保留我们自己的 SQL 报错',
+    Boolean(synErr) && synErr.code === '42601' && synErr.message.indexOf('syntax error') !== -1,
+    redact(String(synErr && synErr.message))
+  );
+
+  const authErr = await caught(gwErr(401, { code: 'UNAUTHORIZED', message: 'invalid token' }).query('SELECT 1', []));
+  check(
+    'HTTP 401 UNAUTHORIZED 原样带出，不被吞成 500',
+    Boolean(authErr) && authErr.code === 'UNAUTHORIZED' && authErr.status === 401,
+    redact(String(authErr && authErr.code) + '/' + String(authErr && authErr.status))
+  );
+  const forbidErr = await caught(gwErr(403, { code: 'ACTION_FORBIDDEN' }).query('SELECT 1', []));
+  check('HTTP 403 ACTION_FORBIDDEN 原样带出', Boolean(forbidErr) && forbidErr.code === 'ACTION_FORBIDDEN', redact(String(forbidErr && forbidErr.code)));
+  const shapeErr = await caught(
+    api
+      .openDatabaseViaApi({ env: gwEnv, fetchImpl: async () => ({ ok: true, status: 200, text: async () => '{"rows":[]}' }) })
+      .query('SELECT 1', [])
+  );
+  check('返回体不是行数组时抛错，而不是把错误形状喂给业务层', Boolean(shapeErr) && shapeErr.code === 'MALFORMED', redact(String(shapeErr && shapeErr.code)));
+
+  const netErr = await caught(
+    api
+      .openDatabaseViaApi({
+        env: gwEnv,
+        fetchImpl: async () => {
+          throw new Error('ECONNREFUSED 10.0.0.1:5432 ' + FAKE_KEY);
+        },
+      })
+      .query('SELECT 1', [])
+  );
+  check(
+    '网络失败翻成 NETWORK，不把底层错误原样抛出',
+    Boolean(netErr) && netErr.code === 'NETWORK' && netErr.message.indexOf('5432') === -1,
+    redact(String(netErr && netErr.message))
+  );
+
+  const timeoutStartedAt = Date.now();
+  const timeoutErr = await caught(
+    api
+      .openDatabaseViaApi({ env: gwEnv, timeoutMs: 80, fetchImpl: () => new Promise(() => {}) })
+      .query('SELECT 1', [])
+  );
+  check(
+    'fetch 永不返回时按超时抛错，不会把请求挂死',
+    Boolean(timeoutErr) && timeoutErr.code === 'TIMEOUT' && Date.now() - timeoutStartedAt < 5000,
+    redact(String(timeoutErr && timeoutErr.code)) + ' after ' + (Date.now() - timeoutStartedAt) + 'ms'
+  );
+
+  const missingKeyErr = await caught(
+    (async () => api.openDatabaseViaApi({ env: {} }))()
+  );
+  check(
+    '缺 API Key 时给出中文报错并点名变量',
+    Boolean(missingKeyErr) && missingKeyErr.message.indexOf('CLOUDBASE_APIKEY') !== -1 && missingKeyErr.message.indexOf('缺少') !== -1,
+    redact(String(missingKeyErr && missingKeyErr.message))
+  );
+  const missingEnvErr = await caught((async () => api.openDatabaseViaApi({ env: { CLOUDBASE_APIKEY: FAKE_KEY } }))());
+  check(
+    '缺环境 ID 时同样给出可执行的中文报错',
+    Boolean(missingEnvErr) && missingEnvErr.message.indexOf('CLOUDBASE_ENV_ID') !== -1,
+    redact(String(missingEnvErr && missingEnvErr.message))
+  );
+  const badEnvIdErr = await caught(
+    (async () => api.openDatabaseViaApi({ env: { CLOUDBASE_APIKEY: FAKE_KEY, CLOUDBASE_ENV_ID: 'https://evil.example.com' } }))()
+  );
+  check(
+    '环境 ID 里塞完整 URL 被拒（环境变量不能把请求带去别处）',
+    Boolean(badEnvIdErr) && badEnvIdErr.message.indexOf('不是合法的环境 ID') !== -1,
+    redact(String(badEnvIdErr && badEnvIdErr.message))
+  );
+  check('缺凭证的报错里不含任何密钥或连接串', Boolean(missingKeyErr) && redact(missingKeyErr.message).indexOf('<redacted>') === -1 && missingKeyErr.message.indexOf('://') === -1, redact(String(missingKeyErr && missingKeyErr.message)));
+
+  const aliasConfig = api.resolveGatewayConfig({
+    API_KEY: 'k-generic',
+    CLOUDBASE_API_KEY: 'k-underscore',
+    CLOUDBASE_APIKEY: 'k-official',
+    CLOUDBASE_ENV_ID: FAKE_ENV,
+  });
+  check('API Key 变量名按官方名字优先（CLOUDBASE_APIKEY 排第一）', aliasConfig.keyEnvName === 'CLOUDBASE_APIKEY', aliasConfig.keyEnvName);
+  check('兜底别名表以官方文档写死的名字开头', api.API_KEY_ENV_NAMES[0] === 'CLOUDBASE_APIKEY', api.API_KEY_ENV_NAMES.join(','));
+
+  const leakLogs = [];
+  const leakHandler = api.createHandler({
+    db: api.openDatabaseViaApi({
+      env: gwEnv,
+      fetchImpl: async () => {
+        throw new Error('upstream boom key=' + FAKE_KEY);
+      },
+    }),
+    now: () => CLOCK0,
+    randomBytes: randomBytes,
+    logger: {
+      log: function () {
+        leakLogs.push(Array.prototype.map.call(arguments, (a) => String(a)).join(' '));
+      },
+    },
+  });
+  const leakRes = await leakHandler({ httpMethod: 'POST', path: '/login', body: JSON.stringify({ username: 'leak_user', password: 'secret-pass-1' }) });
+  const leakBlob = [leakLogs.join('\n'), leakRes.body, String(netErr && netErr.message), String(authErr && authErr.message), String(dupErr && dupErr.message), gwReq[0].url].join('\n');
+  check('API Key 不出现在日志、响应体与任何错误信息里', leakBlob.indexOf(FAKE_KEY) === -1, '已脱敏文本长度 ' + leakBlob.length);
+  check('云函数请求仍然被兜成 500 server-error', leakRes.statusCode === 500 && JSON.parse(leakRes.body).error === 'server-error', String(leakRes.statusCode));
+
+  check('旧的 pg 直连路径仍然导出（升级独享集群后可切回）', typeof api.openDatabase === 'function', typeof api.openDatabase);
+  const legacyErr = await caught((async () => api.openDatabase({ fresh: true, env: {} }))());
+  check(
+    '旧 pg 路径缺 DATABASE_URL / PGHOST 时仍抛错且不泄露内容',
+    Boolean(legacyErr) && legacyErr.message.indexOf('DATABASE_URL') !== -1 && legacyErr.message.indexOf('://') === -1,
+    String(legacyErr && legacyErr.message)
+  );
+  check(
+    'main() 已经改用 API 通道，源码里不再有 pg 直连调用点',
+    String(api.main).indexOf('openDatabase(') === -1 && String(api.main).indexOf('openDatabaseViaApi(') !== -1,
+    'main 的调用点已切换'
+  );
+  check(
+    '本机没有安装 pg，模块仍能 import 并导出整条新通道',
+    typeof api.openDatabaseViaApi === 'function' && typeof api.createApiDatabase === 'function' && typeof api.resolveGatewayConfig === 'function',
+    'ok'
+  );
+
   return { passed: passed, failed: failures.length, failures: failures };
 }
 
