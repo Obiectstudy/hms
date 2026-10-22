@@ -1,4 +1,5 @@
 # 部署到 GitHub Pages（逐字步骤）
+> 云同步的后端（CloudBase）接入实录与踩坑清单见 **[CLOUD-DEPLOY.md](./CLOUD-DEPLOY.md)**。
 
 站点是纯静态文件，仓库根目录就是站点根目录。
 
