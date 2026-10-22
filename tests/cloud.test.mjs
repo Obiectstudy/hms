@@ -827,6 +827,80 @@ async function run() {
     'ok'
   );
 
+  // ==================== 12. CORS（真机 WebView 跨域：预检短路 + 所有响应带头） ====================
+  // 现场：APK 里页面 origin 是 https://appassets.androidplatform.net，接口在 *.service.tcloudbase.com，
+  // 请求又带 authorization 头 → 浏览器必发预检 OPTIONS。平台侧没有可用开关，只能函数自己发头。
+  const WEBVIEW_ORIGIN = 'https://appassets.androidplatform.net';
+  const rawReq = (env, event) => env.handler(Object.assign({ httpMethod: 'POST', path: '/login', body: '{}', headers: {} }, event));
+  const corsEnv = makeEnv();
+  await corsEnv.req('/register', { username: 'cors_user', password: 'cors-pass-1234' });
+  const corsToken = (await corsEnv.req('/login', { username: 'cors_user', password: 'cors-pass-1234' })).body.token;
+
+  const preflight = await rawReq(corsEnv, {
+    httpMethod: 'OPTIONS',
+    path: '/register',
+    body: undefined,
+    headers: {
+      Origin: WEBVIEW_ORIGIN,
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'content-type,authorization',
+    },
+  });
+  check('预检 OPTIONS → 204（不再是 404）', preflight.statusCode === 204, preflight.statusCode + ' ' + preflight.body);
+  check('预检带 access-control-allow-origin（反射请求 Origin）', preflight.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, String(preflight.headers['access-control-allow-origin']));
+  check('预检带 access-control-allow-methods: POST, OPTIONS', preflight.headers['access-control-allow-methods'] === 'POST, OPTIONS', String(preflight.headers['access-control-allow-methods']));
+  check('预检带 access-control-allow-headers: content-type, authorization', preflight.headers['access-control-allow-headers'] === 'content-type, authorization', String(preflight.headers['access-control-allow-headers']));
+  check('预检带 access-control-max-age: 86400', preflight.headers['access-control-max-age'] === '86400', String(preflight.headers['access-control-max-age']));
+  check('预检带 vary: origin', preflight.headers.vary === 'origin', String(preflight.headers.vary));
+  check('预检主体为空、不含业务 404 错误体（没被当成「非 POST 一律 404」）', preflight.body === '' && preflight.body.indexOf('not-found') === -1, JSON.stringify(String(preflight.body).slice(0, 80)));
+
+  const unknownPreflight = await rawReq(corsEnv, { httpMethod: 'OPTIONS', path: '/no-such-route', headers: { Origin: WEBVIEW_ORIGIN } });
+  const preflightQueries = corsEnv.db.queries.length;
+  check('任意路径的 OPTIONS 都短路成 204（与业务路由无关）', unknownPreflight.statusCode === 204 && unknownPreflight.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, unknownPreflight.statusCode + ' ' + JSON.stringify(unknownPreflight.headers));
+  check('预检不读 body、不碰数据库（零 SQL）', preflightQueries === (await (async () => corsEnv.db.queries.length)()) && corsEnv.db.queries.length === preflightQueries, 'SQL 条数 ' + corsEnv.db.queries.length);
+
+  const preflightLogs = corsEnv.logs.slice(-2);
+  const preflightLogKeys = preflightLogs.length ? Object.keys(JSON.parse(preflightLogs[preflightLogs.length - 1])).sort().join(',') : '';
+  check('预检日志与普通请求同字段（tag,at,route,status,ms 一个不多一个不少）', preflightLogKeys === 'at,ms,route,status,tag' && preflightLogs[preflightLogs.length - 1].indexOf('"status":204') !== -1, preflightLogKeys);
+
+  const mainPreflight = await api.main({ httpMethod: 'OPTIONS', path: '/register', headers: { origin: WEBVIEW_ORIGIN } });
+  check('云函数入口 main() 的预检在连数据库之前短路（本机没有凭证也照样 204）', mainPreflight.statusCode === 204 && mainPreflight.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, JSON.stringify(mainPreflight));
+
+  const withOrigin = await rawReq(corsEnv, { path: '/login', body: JSON.stringify({ username: 'cors_user', password: 'cors-pass-1234' }), headers: { Origin: WEBVIEW_ORIGIN } });
+  check('POST 成功响应（200）带 access-control-allow-origin', withOrigin.statusCode === 200 && withOrigin.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, withOrigin.statusCode + ' ' + String(withOrigin.headers['access-control-allow-origin']));
+  check(
+    '加 CORS 头后原有响应头与协议字段不变',
+    withOrigin.headers['content-type'] === 'application/json; charset=utf-8' &&
+      withOrigin.headers['cache-control'] === 'no-store' &&
+      Object.keys(JSON.parse(withOrigin.body)).sort().join(',') === 'expiresAt,token,userId' &&
+      typeof corsToken === 'string',
+    withOrigin.body.slice(0, 40)
+  );
+
+  const errWithOrigin = async (event) => rawReq(corsEnv, Object.assign({ headers: { Origin: WEBVIEW_ORIGIN } }, event));
+  const badReq = await errWithOrigin({ path: '/login', body: JSON.stringify({ username: 'cors_user', password: 'nope-nope-1' }) });
+  check('401 错误响应同样带 access-control-allow-origin', badReq.statusCode === 401 && badReq.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, badReq.statusCode + ' ' + String(badReq.headers['access-control-allow-origin']));
+  const conflict = await errWithOrigin({ path: '/register', body: JSON.stringify({ username: 'cors_user', password: 'cors-pass-1234' }) });
+  check('409 错误响应同样带 access-control-allow-origin', conflict.statusCode === 409 && conflict.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, conflict.statusCode + ' ' + String(conflict.headers['access-control-allow-origin']));
+  const notFoundRes = await errWithOrigin({ path: '/no-such-route', body: '{}' });
+  check('404 业务错误同样带 CORS 头，且错误体仍是统一形状', notFoundRes.statusCode === 404 && notFoundRes.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN && JSON.parse(notFoundRes.body).error === 'not-found', notFoundRes.body);
+  for (let i = 0; i < 10; i += 1) await env2.req('/login', { username: 'lockee_01', password: 'nope-nope-1' });
+  const lockedRes = await rawReq(env2, { path: '/login', body: JSON.stringify({ username: 'lockee_01', password: 'lock-pass-123' }), headers: { Origin: WEBVIEW_ORIGIN } });
+  check('423 锁定错误响应同样带 access-control-allow-origin', lockedRes.statusCode === 423 && lockedRes.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, lockedRes.statusCode + ' ' + String(lockedRes.headers['access-control-allow-origin']));
+
+  const noOrigin = await rawReq(corsEnv, { path: '/login', body: JSON.stringify({ username: 'cors_user', password: 'cors-pass-1234' }) });
+  check('请求没有 Origin 头时回落到 access-control-allow-origin: *', noOrigin.headers['access-control-allow-origin'] === '*', String(noOrigin.headers['access-control-allow-origin']));
+  const lowerOrigin = await rawReq(corsEnv, { path: '/login', body: JSON.stringify({ username: 'cors_user', password: 'cors-pass-1234' }), headers: { origin: WEBVIEW_ORIGIN } });
+  check('头名大小写不敏感：小写 origin 也被反射', lowerOrigin.headers['access-control-allow-origin'] === WEBVIEW_ORIGIN, String(lowerOrigin.headers['access-control-allow-origin']));
+  const errNoOrigin = await rawReq(corsEnv, { path: '/login', body: JSON.stringify({ username: 'cors_user', password: 'nope-nope-1' }) });
+  check(
+    '同一失败请求带不带 Origin，状态码与响应体逐字节相同（CORS 只加头，不改协议）',
+    errNoOrigin.statusCode === badReq.statusCode && errNoOrigin.body === badReq.body,
+    errNoOrigin.body + ' vs ' + badReq.body
+  );
+  check('不输出 access-control-allow-credentials（不用 cookie，鉴权走 authorization）', !('access-control-allow-credentials' in preflight.headers) && !('access-control-allow-credentials' in noOrigin.headers), Object.keys(noOrigin.headers).join(','));
+  check('CORS 头在 createHandler 与 main 两层的取值一致', api.corsHeaders({ headers: { Origin: WEBVIEW_ORIGIN } })['access-control-allow-origin'] === WEBVIEW_ORIGIN && api.corsHeaders({})['access-control-allow-origin'] === '*', JSON.stringify(api.corsHeaders({})));
+
   return { passed: passed, failed: failures.length, failures: failures };
 }
 

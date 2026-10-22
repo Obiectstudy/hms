@@ -37,7 +37,10 @@
 - `push` 是原子的：只有服务器当前 `rev` 仍等于 `baseRev` 时才写成 `rev + 1`，否则返回
   `409 { "error": "rev-conflict", "rev": <服务器当前 rev> }` —— 这是协议里唯一不走统一错误体的响应。
 - 未注册用户名与密码错误返回**完全相同**的 401，避免用户名枚举。
-- 非 `POST` 方法一律 404 `not-found`。
+- 非 `POST` 方法一律 404 `not-found`；唯一例外是预检 `OPTIONS`（见第 14 节）。
+- 所有响应（含 4xx / 5xx）都带 CORS 头：`access-control-allow-origin`（反射请求 `Origin`，没有该头时回落 `*`）、
+  `access-control-allow-methods`、`access-control-allow-headers`、`access-control-max-age` 与 `vary: origin`。
+  协议字段、状态码与错误体不受影响 —— CORS 只加头。
 
 ## 2. 部署前准备
 
@@ -187,6 +190,7 @@ E. 推送，再故意冲突一次
 | 所有接口 `401` | token 过期（30 天）或重置后旧 token 被清 | 重新登录 |
 | `423 locked` | 连续输错 10 次，锁 15 分钟 | 等 15 分钟，或用恢复码 `/reset` 重置（重置会顺带解锁） |
 | 网关返回 404 但不是我们的 JSON | 路径没绑定 / 函数名不符 | 回第 5 步检查绑定与「集成响应」开关 |
+| APP 里点任何按钮都提示「网络不可用」，但浏览器同源页面正常 | 真机页面 origin 是 `https://appassets.androidplatform.net`（WebViewAssetLoader），与接口域名跨域，预检 `OPTIONS` 被挡 | 确认函数已带 CORS 头（第 14 节的两条 curl）；若 `access-control-*` 没出现在响应里，说明网关剥掉了上游自定义头，改走第 14 节的同源替代方案 |
 
 云函数日志在「云函数 → hms-api → 日志」里看。日志只记路由、状态码、耗时与错误类别 / SQLSTATE，
 **不会**记录密码、token、连接串或参数值。
@@ -218,7 +222,42 @@ E. 推送，再故意冲突一次
 代码里旧的 `openDatabase()`（`require('pg')` + `DATABASE_URL` / `PGHOST` 那套）**原样保留**，
 方便将来升级到独享集群后一行切回去；但 `main()` 已经不再调用它。
 
-## 13. 已知限制（部署后自行确认）
+## 13. CORS（真机 WebView 跨域）
+
+真机里页面由 `WebViewAssetLoader` 提供，origin 是 `https://appassets.androidplatform.net`，而接口在
+`https://<环境ID>.service.tcloudbase.com/api` —— **跨域**。我们的请求带 `authorization` 头，浏览器/WebView
+会先发**预检 OPTIONS**，预检不过就表现为「网络不可用」（前端拿到的是网络层错误，不是我们的 JSON 错误体）。
+
+平台侧两条路都已封死：`tcb cors add` 在免费体验版报 `[CreateAuthDomain] 当前套餐无法执行此操作`，
+控制台也没有别的 CORS 开关。**所以 CORS 由函数自己发头**（网关会原样透传上游的自定义响应头）：
+
+- `OPTIONS` 任意路径：直接 204，带 `access-control-allow-methods: POST, OPTIONS`、
+  `access-control-allow-headers: content-type, authorization`、`access-control-max-age: 86400`，
+  **不进业务路由**（不会被当成「非 POST 一律 404」）。
+- 其余所有响应（200 / 400 / 401 / 404 / 409 / 423 / 500）：带 `access-control-allow-origin`
+  （反射请求的 `Origin`，头名大小写不敏感；请求没带该头时回落 `*`）与 `vary: origin`。
+- 不用 cookie（鉴权走 `authorization: Bearer`），因此**不输出** `access-control-allow-credentials`。
+
+部署后逐条核对（Windows 用 `curl.exe`）：
+
+    curl.exe -s -i -X OPTIONS "https://<环境ID>.service.tcloudbase.com/api/register" ^
+      -H "Origin: https://appassets.androidplatform.net" ^
+      -H "Access-Control-Request-Method: POST" ^
+      -H "Access-Control-Request-Headers: content-type,authorization"
+
+期望：`HTTP/1.1 204`，并且响应里有 `access-control-allow-origin: https://appassets.androidplatform.net`。
+**如果这一行（连同下面的 POST 响应）都没有 `access-control-*`，说明网关把上游自定义头剥掉了** ——
+那就别在前端绕，改走同源：把 API 放到页面自己的域名下（PWA 在 `hms-....tcloudbaseapp.com` 上时，
+同一域名下加一条 `/api` 的 HTTP 访问服务路径），此时浏览器认为是同源请求，既不预检也不需要 CORS 头。
+
+实际请求同样要带头：
+
+    curl.exe -s -D - -o NUL -X POST "https://<环境ID>.service.tcloudbase.com/api/ping" ^
+      -H "Origin: https://appassets.androidplatform.net" -H "content-type: application/json" -d "{}"
+
+期望：状态行 + `access-control-allow-origin`（`/ping` 不是接口，404 也一样带头）。
+
+## 14. 已知限制（部署后自行确认）
 
 1. 本地测试用的是内存假数据库，**真实数据库上尚未执行过这些 SQL**（只有建表语句在控制台跑过）。
    第 1 步执行 `schema.sql` 后，按第 8 步 A→E 走一遍即可覆盖所有语句。

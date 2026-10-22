@@ -52,6 +52,18 @@ const RESET_FAIL_MESSAGE = '用户名或恢复码不正确';
 const SESSION_FAIL_MESSAGE = '登录已失效，请重新登录';
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
+/**
+ * CORS：真机 WebView 的页面 origin 是 https://appassets.androidplatform.net，而接口在
+ * *.service.tcloudbase.com —— 跨域。平台侧没有任何可用的 CORS 开关（tcb cors add 在免费体验版报
+ * [CreateAuthDomain] 当前套餐无法执行此操作），所以由函数自己发头。
+ * 鉴权只走 authorization: Bearer，不用 cookie，因此反射 Origin 即可，不需要 allow-credentials。
+ */
+const CORS_ALLOW_METHODS = 'POST, OPTIONS';
+const CORS_ALLOW_HEADERS = 'content-type, authorization';
+const CORS_MAX_AGE = '86400';
+/** 预检固定 204：网关只透传上游自定义头，状态码也由这里决定。 */
+const PREFLIGHT_STATUS = 204;
+
 const RECOVERY_NORMALIZED_RE = new RegExp('^[' + RECOVERY_ALPHABET + ']{' + RECOVERY_LEN + '}$');
 
 // ---------- SQL（唯一真相：假数据库按这些语句的语义实现） ----------
@@ -112,6 +124,37 @@ function revConflict(rev) {
 
 function isRecord(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+/** 头名大小写不敏感：网关给的是 Origin 还是 origin 都要认；取不到返回空串。 */
+function headerValue(headers, name) {
+  if (!isRecord(headers)) return '';
+  const want = String(name).toLowerCase();
+  const keys = Object.keys(headers);
+  for (let i = 0; i < keys.length; i += 1) {
+    if (keys[i].toLowerCase() !== want) continue;
+    const value = headers[keys[i]];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (Array.isArray(value) && typeof value[0] === 'string' && value[0].trim()) return value[0].trim();
+  }
+  return '';
+}
+/** 反射请求的 Origin；请求没带 Origin（非浏览器调用、curl 手测）时回落到 *。 */
+function resolveOrigin(event) {
+  return headerValue(event && event.headers, 'origin') || '*';
+}
+/** 每个响应（含错误与预检）都要带的 CORS 头；vary: origin 保证中间缓存按 Origin 分开。 */
+function corsHeaders(event) {
+  return {
+    'access-control-allow-origin': resolveOrigin(event),
+    'access-control-allow-methods': CORS_ALLOW_METHODS,
+    'access-control-allow-headers': CORS_ALLOW_HEADERS,
+    'access-control-max-age': CORS_MAX_AGE,
+    vary: 'origin',
+  };
+}
+/** 请求方法判定：预检与业务路由共用同一套兜底（httpMethod / method，缺省 POST）。 */
+function methodOf(event) {
+  return String((event && (event.httpMethod || event.method)) || 'POST').toUpperCase();
 }
 function toInt(value) {
   const n = Number(value);
@@ -431,8 +474,7 @@ function readJsonBody(event) {
 }
 
 async function dispatch(event, ctx) {
-  const method = String(event.httpMethod || event.method || 'POST').toUpperCase();
-  if (method !== 'POST') throw notFound('接口不存在（所有接口都只支持 POST）');
+  if (methodOf(event) !== 'POST') throw notFound('接口不存在（所有接口都只支持 POST）');
   const route = routeOf(event);
   const body = readJsonBody(event);
   switch (route) {
@@ -482,6 +524,13 @@ function createHandler(options) {
     const event = isRecord(rawEvent) ? rawEvent : {};
     const startedAt = now();
     const route = routeOf(event);
+    const cors = corsHeaders(event);
+    const method = methodOf(event);
+    // 预检短路：不读 body、不进 dispatch，所以不会被当成「非 POST 一律 404」的业务错误。
+    if (method === 'OPTIONS') {
+      log({ route, status: PREFLIGHT_STATUS, ms: Math.max(0, now() - startedAt) });
+      return { statusCode: PREFLIGHT_STATUS, headers: cors, body: '' };
+    }
     let status;
     let body;
     try {
@@ -500,7 +549,9 @@ function createHandler(options) {
       }
     }
     log({ route, status: status, ms: Math.max(0, now() - startedAt) });
-    return { statusCode: status, headers: JSON_HEADERS, body: JSON.stringify(body), json: body };
+    // 成功与失败一视同仁地带 CORS 头（JSON 主体与状态码不变）
+    const headers = Object.assign({}, JSON_HEADERS, cors);
+    return { statusCode: status, headers: headers, body: JSON.stringify(body), json: body };
   };
 }
 
@@ -764,8 +815,12 @@ function openDatabaseViaApi(options) {
   return createApiDatabase(options);
 }
 
-function jsonFail(status, code, message) {
-  return { statusCode: status, headers: JSON_HEADERS, body: JSON.stringify({ error: code, message: message }) };
+function jsonFail(status, code, message, event) {
+  return {
+    statusCode: status,
+    headers: Object.assign({}, JSON_HEADERS, corsHeaders(event)),
+    body: JSON.stringify({ error: code, message: message }),
+  };
 }
 
 function safeLog(record) {
@@ -778,19 +833,24 @@ function safeLog(record) {
 
 /** CloudBase HTTP 访问服务入口。事件：{ path, httpMethod, headers, body, isBase64Encoded }。 */
 async function main(event) {
+  const safeEvent = isRecord(event) ? event : {};
+  // 预检必须在连数据库之前短路：env 没配 / 数据库不可用时，预检失败会让真机连"网络不可用"都分不清。
+  if (methodOf(safeEvent) === 'OPTIONS') {
+    return { statusCode: PREFLIGHT_STATUS, headers: corsHeaders(safeEvent), body: '' };
+  }
   let handler;
   try {
     handler = createHandler({ db: openDatabaseViaApi(), logger: console });
   } catch (err) {
     safeLog({ tag: 'hms-api', status: 500, error: 'server-error', name: errorName(err), phase: 'connect' });
-    return jsonFail(500, 'server-error', '服务端数据库未配置或不可用，请联系管理员');
+    return jsonFail(500, 'server-error', '服务端数据库未配置或不可用，请联系管理员', safeEvent);
   }
   try {
-    const res = await handler(event || {});
+    const res = await handler(safeEvent);
     return { statusCode: res.statusCode, headers: res.headers, body: res.body };
   } catch (err) {
     safeLog({ tag: 'hms-api', status: 500, error: 'server-error', name: errorName(err), phase: 'handle' });
-    return jsonFail(500, 'server-error', '服务器内部错误，请稍后再试');
+    return jsonFail(500, 'server-error', '服务器内部错误，请稍后再试', safeEvent);
   }
 }
 
@@ -803,6 +863,8 @@ module.exports = {
   resolveGatewayConfig: resolveGatewayConfig,
   resolveDatabaseUrl: resolveDatabaseUrl,
   normalizeParams: normalizeParams,
+  corsHeaders: corsHeaders,
+  resolveOrigin: resolveOrigin,
   sqlStateOf: sqlStateOf,
   API_KEY_ENV_NAMES: API_KEY_ENV_NAMES,
   ENV_ID_ENV_NAMES: ENV_ID_ENV_NAMES,
