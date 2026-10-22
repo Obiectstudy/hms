@@ -3198,6 +3198,74 @@ export async function run() {
       assert.ok(offResult.message.includes('未配置'), '未配置要说清是未配置：' + offResult.message);
     });
 
+    // 合并后 js/cloud-transport.js 只是 js/cloud-api.js 的薄适配：下面两条专盯「委托真的发生了」。
+    await checkAsync('传输层：委托证据（一）——URL 与请求形状逐字段等于 cloud-api 自己发出的请求', async () => {
+      const cloudApi = await import('../js/cloud-api.js');
+      const paths = cloudApi.CLOUD_API_PATHS;
+      const sent = [];
+      const spy = async (url, options) => {
+        sent.push({ url, options });
+        return { ok: true, status: 200, json: async () => ({ rev: 4 }) };
+      };
+      const transport = cloudTransport.createCloudTransport({ baseUrl: CLOUD_URL, fetchImpl: spy });
+
+      await transport.register({ username: ' xiaolin ', password: 'sup3rsecret' });
+      await transport.login({ username: 'xiaolin', password: 'sup3rsecret' });
+      await transport.reset({ username: 'xiaolin', recoveryCode: 'rc-1', newPassword: 'sup3rsecret2' });
+      await transport.pull({ token: 'tok' });
+      await transport.push({ token: 'tok', baseRev: 1, payload: { a: 1 } });
+
+      assert.deepEqual(
+        sent.map((s) => s.url),
+        [paths.register, paths.login, paths.reset, paths.pull, paths.push].map((p) => CLOUD_URL + p),
+        '五个接口的地址必须是 base + CLOUD_API_PATHS：' + sent.map((s) => s.url).join(' | '),
+      );
+      assert.deepEqual(JSON.parse(sent[0].options.body), { username: 'xiaolin', password: 'sup3rsecret' }, '注册体形状不对：' + sent[0].options.body);
+
+      // 同一个 push：transport 发出的 method / headers / body 与直接调 cloud-api 逐字段一致
+      const direct = [];
+      const directSpy = async (url, options) => {
+        direct.push({ url, options });
+        return { ok: true, status: 200, json: async () => ({ rev: 4 }) };
+      };
+      await cloudApi.createCloudApi({ baseUrl: CLOUD_URL, fetchImpl: directSpy }).push('tok', 1, { a: 1 });
+      const mine = sent[4].options;
+      const theirs = direct[0].options;
+      assert.equal(sent[4].url, direct[0].url, '两个入口必须打到同一个 URL');
+      assert.equal(mine.method, 'POST');
+      assert.deepEqual(JSON.parse(mine.body), { token: 'tok', baseRev: 1, payload: { a: 1 } }, '推送体形状不对：' + mine.body);
+      assert.deepEqual(
+        { method: mine.method, headers: mine.headers, body: mine.body },
+        { method: theirs.method, headers: theirs.headers, body: theirs.body },
+        'transport 的请求形状必须与 cloud-api 逐字段一致（连 headers 键名都一样，说明不是自己拼的）',
+      );
+    });
+
+    await checkAsync('传输层：委托证据（二）——适配层没有第二份 HTTP 实现，409 的字段来自 CloudApiError', async () => {
+      const cloudApi = await import('../js/cloud-api.js');
+      const { readFileSync } = await import('node:fs');
+      const src = readFileSync(new URL('../js/cloud-transport.js', import.meta.url), 'utf8');
+      assert.ok(/import\s*\{\s*createCloudApi\s*\}\s*from\s*'\.\/cloud-api\.js'/.test(src), '适配层必须 import cloud-api.js 的 createCloudApi');
+      for (const smell of ['fetch(', 'JSON.parse', 'JSON.stringify', 'AbortController', 'Content-Type', "'/register'", "'/login'", "'/reset'", "'/pull'", "'/push'"]) {
+        assert.ok(!src.includes(smell), '适配层不该再写一份 HTTP（出现了 ' + smell + '）');
+      }
+
+      const conflictFetch = async () => ({ ok: false, status: 409, json: async () => ({ error: 'rev-conflict', rev: 9 }) });
+      const got = await cloudTransport
+        .createCloudTransport({ baseUrl: CLOUD_URL, fetchImpl: conflictFetch })
+        .push({ token: 'tok', baseRev: 1, payload: { a: 1 } });
+      let thrown = null;
+      try {
+        await cloudApi.createCloudApi({ baseUrl: CLOUD_URL, fetchImpl: conflictFetch }).push('tok', 1, { a: 1 });
+      } catch (err) {
+        thrown = err;
+      }
+      assert.ok(thrown instanceof cloudApi.CloudApiError, 'cloud-api 对 409 应抛 CloudApiError');
+      assert.equal(got.error, thrown.code, 'rev-conflict 必须取自 CloudApiError.code');
+      assert.equal(got.rev, thrown.rev, 'rev 必须取自 CloudApiError.rev');
+      assert.equal(got.status, thrown.status, 'status 必须取自 CloudApiError.status');
+    });
+
     await checkAsync('同步：syncDigestOf 与 store.getSyncPayload 同形（易变字段抹除规则不许漂）', async () => {
       await withStorage(async () => {
         await accountsMod.ensureDefaultAccount();

@@ -40,6 +40,7 @@ export class CloudApiError extends Error {
     this.status = typeof data.status === 'number' ? data.status : 0;
     this.body = data.body === undefined ? null : data.body;
     if (data.rev !== undefined) this.rev = data.rev;
+    if (data.cause !== undefined) this.cause = data.cause;
   }
 
   get isAuthError() {
@@ -79,6 +80,15 @@ async function readText(res) {
       return '';
     }
   }
+  // 有的替身/精简环境只实现了 json()：序列化回文本，下面统一按文本解析。
+  if (typeof res.json === 'function') {
+    try {
+      const data = await res.json();
+      return typeof data === 'undefined' ? '' : JSON.stringify(data);
+    } catch (err) {
+      return '';
+    }
+  }
   return '';
 }
 
@@ -109,6 +119,7 @@ export function createCloudApi(options) {
         message: DEFAULT_MESSAGES['network-error'],
         status: 0,
         body: null,
+        cause: err,
       });
     } finally {
       if (timer !== null) clearTimeout(timer);
@@ -124,21 +135,23 @@ export function createCloudApi(options) {
       }
     }
 
-    if (!res.ok) {
+    const status = typeof res.status === 'number' ? res.status : 0;
+    // 成败判定按 HTTP 语义：显式 ok:false，或状态码不在 2xx（只有状态码的替身也能判对）。
+    if (res.ok === false || (status && (status < 200 || status > 299))) {
       const code = body && typeof body.error === 'string' ? body.error : 'server-error';
       throw new CloudApiError({
         code: code,
         message: body && typeof body.message === 'string' ? body.message : DEFAULT_MESSAGES[code] || '请求失败',
-        status: typeof res.status === 'number' ? res.status : 0,
+        status: status,
         body: body,
         rev: body ? body.rev : undefined,
       });
     }
-    if (!body || typeof body !== 'object') {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
       throw new CloudApiError({
         code: 'bad-response',
         message: DEFAULT_MESSAGES['bad-response'],
-        status: res.status,
+        status: status,
         body: null,
       });
     }

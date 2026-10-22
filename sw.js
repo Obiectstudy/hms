@@ -2,7 +2,7 @@
    改任何文件都要同时改 CACHE_NAME 的版本号，否则用户拿到的是旧缓存。
    所有路径均为相对路径：站点可能挂在 GitHub Pages 的子路径下。 */
 
-const CACHE_NAME = 'hms-v1.0.16';
+const CACHE_NAME = 'hms-v1.0.17';
 
 const PRECACHE = [
   './',
@@ -27,6 +27,7 @@ const PRECACHE = [
   './js/accounts.js',
   './js/sync.js',
   './js/cloud-config.js',
+  './js/cloud-api.js',
   './js/cloud-transport.js',
   './views/account.js',
   './views/debug.js',
