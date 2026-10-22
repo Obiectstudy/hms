@@ -2442,17 +2442,36 @@ export async function run() {
       });
     });
 
-    await checkAsync('账号页：登录入口是禁用占位 + 「下一阶段」说明，不是假表单', async () => {
+    await checkAsync('账号页：登录入口是真的（不再是禁用占位），表单只在弹层里出现', async () => {
       await withStorage(async () => {
         clearOverlays();
-        const root = await renderView('account');
-        const login = buttonsWithText(root, '登录 / 注册')[0];
-        assert.ok(login, '没有「登录 / 注册」入口占位');
-        assert.equal(login.disabled, true, '登录入口不是禁用状态');
-        assert.equal(login.getAttribute('aria-disabled'), 'true', '禁用的登录入口缺少 aria-disabled');
-        assert.ok(nodeText(root).includes('下一阶段开放'), '缺少「下一阶段开放」说明');
-        assert.equal(root.walk().some((n) => n.tagName === 'form'), false, '登录占位不该是假表单');
-        assert.equal(root.walk().filter((n) => n.tagName === 'input').length, 0, '登录占位不该有输入框');
+        await accountsMod.ensureDefaultAccount();
+        const calls = [];
+        const transport = {
+          register: async (args) => { calls.push(args); return { ok: false, error: 'server-error', message: '不该发请求' }; },
+          login: async (args) => { calls.push(args); return { ok: false, error: 'server-error', message: '不该发请求' }; },
+          reset: async () => { calls.push(1); return { ok: false, error: 'server-error', message: '不该发请求' }; },
+          pull: async () => ({ ok: false, error: 'server-error', message: '不该发请求' }),
+          push: async () => ({ ok: false, error: 'server-error', message: '不该发请求' }),
+        };
+        const root = new dom.FakeNode('div');
+        await accountView.render(root, { baseUrl: 'https://cloud.test/api', transport });
+        const login = buttonsWithText(root, '登录')[0];
+        assert.ok(login, '没有登录入口');
+        assert.equal(login.disabled, false, '登录入口不该是禁用的');
+        assert.equal(root.walk().some((n) => n.tagName === 'form'), false, '登录入口不该在页面上放表单');
+        assert.equal(root.walk().filter((n) => n.tagName === 'input').length, 0, '页面上不该有输入框（表单只在弹层里）');
+        fireClick(login);
+        await tick();
+        const sheet = latestOverlay('sheet-backdrop');
+        assert.ok(sheet, '点登录之后没有弹出表单');
+        const inputs = byClass(sheet, 'input');
+        assert.equal(inputs.length, 2, '登录弹层应该有用户名 / 密码两个输入框');
+        assert.equal(inputs[1].type, 'password', '密码框应该是 password 类型');
+        assert.equal(calls.length, 0, '还没提交就不该发请求');
+        fireClick(buttonsWithText(sheet, '取消')[0]);
+        await tick();
+        assert.equal(latestOverlay('sheet-backdrop'), null, '取消后弹层应该关掉');
       });
     });
 
@@ -2613,6 +2632,707 @@ export async function run() {
       });
     });
 
+
+
+    // ---- 7. 云同步界面：未配置降级 / 注册 / 登录 / 找回密码 / 退出 / 同步状态 ----
+    // 云端一律用注入的假 transport（绝不真发请求）：断言只看「调了哪些接口、带了什么参数、界面说了什么」。
+    const syncMod = await import('../js/sync.js');
+    const cloudConfig = await import('../js/cloud-config.js');
+    const cloudTransport = await import('../js/cloud-transport.js');
+
+    const CLOUD_URL = 'https://cloud.test/api';
+
+    /** 假 transport：按名字查 handlers，调用记录进 calls（handlers 可中途替换，用来模拟「云端又更新了」）。 */
+    function fakeTransport(handlers = {}) {
+      const calls = [];
+      const make = (name) => async (args) => {
+        calls.push({ name, args });
+        const handler = handlers[name];
+        if (typeof handler !== 'function') return { ok: false, error: 'not-implemented', message: name + ' 未实现' };
+        return handler(args);
+      };
+      return { calls, handlers, register: make('register'), login: make('login'), reset: make('reset'), pull: make('pull'), push: make('push') };
+    }
+
+    const sheetOf = () => latestOverlay('sheet-backdrop');
+    const clickIn = (container, label) => {
+      const btn = container ? buttonsWithText(container, label)[0] : null;
+      assert.ok(btn, '找不到「' + label + '」按钮');
+      fireClick(btn);
+      return btn;
+    };
+    const clickSheet = (label) => clickIn(sheetOf(), label);
+    const fillSheet = (values) => {
+      const sheet = sheetOf();
+      assert.ok(sheet, '当前没有打开的弹层');
+      const inputs = byClass(sheet, 'input');
+      assert.equal(inputs.length, values.length, '弹层应有 ' + values.length + ' 个输入框，实际 ' + inputs.length);
+      inputs.forEach((input, index) => { input.value = values[index]; });
+    };
+    const renderCloud = async (transport, overrides = {}) => {
+      const node = new dom.FakeNode('div');
+      await accountView.render(node, { baseUrl: CLOUD_URL, transport, ...overrides });
+      return node;
+    };
+
+    /** 云端那份数据：拉取覆盖本机时就长这样（一条体重 + 一份档案）。 */
+    const REMOTE_PAYLOAD = {
+      app: 'hms',
+      schemaVersion: 1,
+      meta: { profile: { nickname: '云端用户', sex: 'male', birthday: '1990-01-01', heightCm: 170, activity: 'light' } },
+      weights: [{ id: 1, date: '2010-10-10', weightKg: 58.5, createdAt: 1700000000000 }],
+      meals: [],
+      exercises: [],
+      waters: [],
+      photoCount: 0,
+    };
+
+    /** 走一遍真实登录（填弹层 → 点登录 → 等异步跑完 → 重新渲染），返回重新渲染后的页面。 */
+    async function loginWith(transport, username = 'xiaolin', password = 'sup3rsecret') {
+      const root = await renderCloud(transport);
+      clickIn(root, '登录');
+      await tick();
+      fillSheet([username, password]);
+      clickSheet('登录');
+      await tick(80);
+      return renderCloud(transport);
+    }
+
+    await checkAsync('云同步：baseUrl 为空时显示「未配置」，零请求、不影响本地功能', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.logWeight({ date: '2004-04-04', weightKg: 64 });
+        const fake = fakeTransport();
+        const fetchBefore = fetchCalls;
+        const root = new dom.FakeNode('div');
+        await accountView.render(root, { baseUrl: '', transport: fake });
+        const text = nodeText(root);
+        assertNoLeak(text, 'account(云未配置)');
+        assert.ok(text.includes('云同步未配置'), '缺少「云同步未配置」说明：' + text.slice(0, 200));
+        assert.equal(fake.calls.length, 0, '未配置时不该调用任何云端接口');
+        assert.equal(fetchCalls, fetchBefore, '未配置时不该发出网络请求');
+        assert.equal(buttonsWithText(root, '登录').length, 0, '未配置时不该有登录按钮');
+        assert.equal(buttonsWithText(root, '注册').length, 0, '未配置时不该有注册按钮');
+        assert.equal(buttonsWithText(root, '立即同步').length, 0, '未配置时不该有同步按钮');
+        assert.ok(byClass(root, 'account-row').length >= 1, '未配置时账号列表也要正常');
+        assert.ok((await db.dumpAll()).weights.some((w) => w.date === '2004-04-04'), '未配置不该影响本机数据');
+      });
+    });
+
+    await checkAsync('云同步：注册成功展示恢复码，× 关掉会再弹一次，必须点「我已保存」', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const account = await accountsMod.ensureDefaultAccount();
+        const fake = fakeTransport({ register: () => ({ ok: true, userId: 'u_1001', recoveryCode: 'RC-ABCD-1234' }) });
+        const root = await renderCloud(fake);
+
+        clickIn(root, '注册');
+        await tick();
+        fillSheet(['xiaolin', 'sup3rsecret', 'sup3rsecret']);
+        clickSheet('注册');
+        await tick(40);
+
+        assert.deepEqual(fake.calls.map((c) => c.name), ['register'], '注册只该调一次 register');
+        assert.equal(fake.calls[0].args.username, 'xiaolin');
+        assert.equal(fake.calls[0].args.password, 'sup3rsecret');
+
+        let sheet = sheetOf();
+        assert.ok(sheet, '注册成功后没有弹出恢复码');
+        const codeText = nodeText(sheet);
+        assert.ok(codeText.includes('RC-ABCD-1234'), '恢复码没有显示出来：' + codeText.slice(0, 200));
+        assert.ok(codeText.includes('只出现一次'), '没有说明恢复码只出现一次');
+        assert.ok(codeText.includes('忘了密码只能靠它'), '没有说明忘了密码只能靠恢复码');
+        assert.ok(byClass(sheet, 'cloud-code__value')[0], '恢复码缺少专用展示块');
+
+        // 用 × 关掉：恢复码不能就这么丢了 —— 必须再弹一次并提醒
+        fireClick(byClass(sheet, 'sheet__close')[0]);
+        await tick(20);
+        assert.ok(toasts().some((t) => t.includes('请点「我已保存」')), '关闭恢复码时没有提醒：' + toasts().join(' | '));
+        sheet = sheetOf();
+        assert.ok(sheet && nodeText(sheet).includes('RC-ABCD-1234'), '关掉之后恢复码弹层没有回来');
+
+        clickSheet('我已保存');
+        await tick(60);
+        assert.equal(byClass(dom.body, 'cloud-code').length, 0, '点「我已保存」之后恢复码展示块应该消失');
+        assert.equal(accountsMod.listAccounts()[0].serverId, 'u_1001', '注册后 serverId 没有写回账号目录');
+        assert.equal(cloudConfig.readCloudAuth(account.id).serverId, 'u_1001');
+        assert.equal(cloudConfig.readCloudAuth(account.id).token, '', '注册不返回令牌，本机不该凭空多一个 token');
+        assert.deepEqual(fake.calls.map((c) => c.name), ['register'], '注册后不该自动同步');
+        assert.ok(toasts().some((t) => t.includes('注册成功')), '缺少注册成功提示：' + toasts().join(' | '));
+
+        // 顺手带出登录框，用户名已填好（注册不返回令牌，得再登录一次）
+        const loginSheet = sheetOf();
+        assert.ok(loginSheet && nodeText(loginSheet).includes('登录云账号'), '注册后没有带出登录框');
+        assert.equal(byClass(loginSheet, 'input')[0].value, 'xiaolin', '登录框没有预填用户名');
+        clickSheet('取消');
+        await tick();
+        assert.equal(sheetOf(), null, '取消后弹层应该关掉');
+      });
+    });
+
+    await checkAsync('云同步：注册后没确认的恢复码留在本机，卡片能提醒并再看一次', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const account = await accountsMod.ensureDefaultAccount();
+        const fake = fakeTransport();
+        // 模拟「注册完就切走了」：恢复码留在本机，但还没点「我已保存」
+        cloudConfig.writeCloudAuth(account.id, { serverId: 'u_pending', username: 'xiaolin', pendingRecoveryCode: 'RC-PENDING-9' });
+        cloudConfig.bindAccountServerId(account.id, 'u_pending'); // 注册时是同一步写入的
+
+        const root = await renderCloud(fake);
+        const warn = byClass(root, 'cloud-warn').find((node) => node.textOf().includes('还没确认保存'));
+        assert.ok(warn, '缺少「恢复码还没确认保存」提醒：' + nodeText(root).slice(0, 200));
+        assert.equal(buttonsWithText(root, '查看恢复码').length, 1, '缺少「查看恢复码」入口');
+
+        clickIn(root, '查看恢复码');
+        await tick();
+        const sheet = sheetOf();
+        assert.ok(sheet && nodeText(sheet).includes('RC-PENDING-9'), '重新查看时没有显示恢复码');
+        fireClick(byClass(sheet, 'sheet__close')[0]); // 想关掉也不行，必须点「我已保存」
+        await tick(20);
+        assert.ok(toasts().some((t) => t.includes('请点「我已保存」')), '关闭恢复码时没有提醒：' + toasts().join(' | '));
+        clickSheet('我已保存');
+        await tick(60);
+
+        assert.equal(cloudConfig.readCloudAuth(account.id).pendingRecoveryCode, '', '确认后本机不该再留着恢复码');
+        assert.equal(accountsMod.listAccounts()[0].serverId, 'u_pending', '账号绑定不该受恢复码确认影响');
+        const after = await renderCloud(fake);
+        assert.equal(byClass(after, 'cloud-warn').filter((node) => node.textOf().includes('还没确认保存')).length, 0, '确认后提醒应该消失');
+        assert.equal(fake.calls.length, 0, '这条路径不该发任何请求');
+      });
+    });
+
+    await checkAsync('云同步：登录成功记录 serverId / token，并立刻同步一次（空云端 → 上传本机数据）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const account = await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await store.logWeight({ date: '2001-08-08', weightKg: 67 });
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-login', userId: 'u_2002', expiresAt: 1700000000000 }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await loginWith(fake);
+
+        assert.deepEqual(fake.calls.map((c) => c.name), ['login', 'pull', 'push'], '登录后应该是 login → pull → push');
+        assert.equal(fake.calls[1].args.token, 'tok-login', 'pull 没有带上登录令牌');
+        assert.equal(fake.calls[2].args.baseRev, 0, '第一次上传的 baseRev 应该是 0');
+        assert.ok(Array.isArray(fake.calls[2].args.payload.weights), '上传载荷里应该有本机体重数据');
+        assert.ok(fake.calls[2].args.payload.weights.some((w) => w.date === '2001-08-08'), '上传的载荷不含刚写的记录');
+
+        assert.equal(accountsMod.listAccounts()[0].serverId, 'u_2002', 'serverId 没有写回账号目录（accounts.listAccounts 读不到）');
+        const auth = cloudConfig.readCloudAuth(account.id);
+        assert.equal(auth.token, 'tok-login', '令牌没有留在本机');
+        assert.equal(auth.username, 'xiaolin');
+        assert.equal(auth.serverId, 'u_2002');
+
+        const state = await store.getSyncState();
+        assert.equal(state.rev, 1, '上传成功后 rev 应该记成 1');
+        assert.ok(state.checksum, '上传成功后应该记下内容校验和锚点');
+        assert.ok(state.savedAt > 0, '上传成功后应该记下同步时间');
+        assert.ok(toasts().some((t) => t.includes('已登录：xiaolin')), '缺少登录提示：' + toasts().join(' | '));
+        assert.ok(toasts().some((t) => t.includes('已上传本机数据')), '缺少上传提示：' + toasts().join(' | '));
+
+        const text = nodeText(shown);
+        assertNoLeak(text, 'account(已登录)');
+        assert.ok(text.includes('已登录'), '同步卡片没有显示登录状态');
+        assert.ok(byClass(shown, 'account-row').some((row) => row.textOf().includes('已登录 xiaolin')), '账号行没有显示云端登录状态');
+        assert.ok(text.includes('已全部同步'), '刚推完应该显示「已全部同步」：' + text.slice(0, 200));
+      });
+    });
+
+    await checkAsync('云同步：状态卡片显示上次同步时间 / rev / 数据规模 / 未同步改动，并有「立即同步」', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await store.logWeight({ date: '2001-09-09', weightKg: 66 });
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-state', userId: 'u_state' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await loginWith(fake);
+
+        const rowText = (label) => {
+          const row = byClass(shown, 'cloud-status__row').find((r) => r.textOf().includes(label));
+          assert.ok(row, '状态卡片缺少「' + label + '」一行');
+          return row.textOf();
+        };
+        assert.ok(/\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2}/.test(rowText('上次同步')), '上次同步时间格式不对：' + rowText('上次同步'));
+        assert.ok(rowText('云端版本').includes('rev 1'), '云端版本不对：' + rowText('云端版本'));
+        assert.ok(/本机数据 \d+ 条 · [\d.]+ (B|KB|MB)/.test(rowText('本机数据')), '数据规模不对：' + rowText('本机数据'));
+        assert.ok(rowText('本机改动').includes('已全部同步'), '刚推完应显示已同步：' + rowText('本机改动'));
+        assert.equal(buttonsWithText(shown, '立即同步').length, 1, '缺少「立即同步」按钮');
+        assert.equal(byClass(shown, 'cloud-card').length, 1, '云同步卡片缺少稳定的结构性 class');
+
+        // 本机又改了 → 标记变成「有未同步改动」
+        await store.logWeight({ date: '2001-10-10', weightKg: 65 });
+        const dirty = await renderCloud(fake);
+        assert.ok(nodeText(dirty).includes('有未同步改动'), '本机改动后没有显示未同步标记：' + nodeText(dirty).slice(0, 200));
+      });
+    });
+
+    await checkAsync('云同步：「立即同步」推成功 → rev 递增、锚点更新、标记回到已同步', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-push', userId: 'u_push' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        await loginWith(fake);
+        assert.equal((await store.getSyncState()).rev, 1);
+
+        await store.logWeight({ date: '2002-02-02', weightKg: 64 });
+        const dirty = await renderCloud(fake);
+        clickIn(dirty, '立即同步');
+        await tick(80);
+
+        const state = await store.getSyncState();
+        assert.equal(state.rev, 2, '第二次上传后 rev 应该是 2');
+        const pushes = fake.calls.filter((c) => c.name === 'push');
+        assert.equal(pushes.length, 2, '应该推了两次');
+        assert.equal(pushes[0].args.baseRev, 0, '第一次上传的 baseRev 应该是 0');
+        assert.equal(pushes[1].args.baseRev, 1, '第二次上传应该以 rev 1 为基线');
+        assert.equal(pushes[1].args.token, 'tok-push');
+        assert.ok(pushes[1].args.payload.weights.some((w) => w.date === '2002-02-02'), '第二次上传没带上新记录');
+        assert.equal(state.checksum, syncMod.checksum(await store.getSyncPayload()), '锚点校验和应该等于当前本机内容');
+
+        const after = await renderCloud(fake);
+        assert.ok(nodeText(after).includes('已全部同步'), '推完应该回到已同步');
+        assert.ok(nodeText(after).includes('rev 2'), '界面上的 rev 没更新：' + nodeText(after).slice(0, 200));
+        assert.ok(toasts().some((t) => t.includes('已上传本机数据（云端 rev 2）')), '缺少上传提示：' + toasts().join(' | '));
+      });
+    });
+
+    await checkAsync('云同步：远端更新且本机没改动 → 拉取覆盖本机', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.logWeight({ date: '2005-05-05', weightKg: 61 });
+        await store.clearSyncState();
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-pull', userId: 'u_pull' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await loginWith(fake);
+        assert.equal((await store.getSyncState()).rev, 1);
+
+        // 另一台设备在云端又写了一次：rev=2，本机自上次同步后一个字节都没动
+        fake.handlers.pull = () => ({ ok: true, rev: 2, savedAt: 1700000000000, payload: REMOTE_PAYLOAD });
+        clickIn(shown, '立即同步');
+        await tick(250); // 这条路径要 loadAll + 重新 dump，比纯 push 多一倍往返
+
+        assert.equal(fake.calls.filter((c) => c.name === 'push').length, 1, '本机没改动时不该再上传');
+        const state = await store.getSyncState();
+        assert.equal(state.rev, 2, '拉取成功后 rev 应该记成 2');
+        assert.equal(state.savedAt, 1700000000000, '同步时间应该用云端那份的时间');
+        const dump = await db.dumpAll();
+        assert.ok(dump.weights.some((w) => w.date === '2010-10-10'), '云端数据没有落到本机');
+        assert.ok(!dump.weights.some((w) => w.date === '2005-05-05'), '本机旧数据应被云端覆盖');
+        assert.equal((await store.getProfile()).nickname, '云端用户', '档案没有跟着快照恢复');
+        assert.ok(toasts().some((t) => t.includes('已用云端数据')), '缺少拉取提示：' + toasts().join(' | '));
+
+        const after = await renderCloud(fake);
+        const sizeRow = byClass(after, 'cloud-status__row').find((r) => r.textOf().includes('本机数据'));
+        assert.ok(sizeRow.textOf().includes('1 条'), '覆盖后数据规模应反映云端那份：' + sizeRow.textOf());
+        assert.ok(nodeText(after).includes('已全部同步'), '拉完锚点应该对齐');
+      });
+    });
+
+    await checkAsync('云同步：两边都改过 → 先存冲突副本再覆盖，界面提示「存在冲突副本」', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await db.del('meta', 'conflictBackup');
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-conflict', userId: 'u_conflict' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await loginWith(fake);
+
+        // 本机改了（锚点还停在 rev 1），云端也涨到 3 → conflict-pull
+        await store.logWeight({ date: '2006-06-06', weightKg: 63 });
+        await db.setMeta('marker', 'local-only');
+        fake.handlers.pull = () => ({ ok: true, rev: 3, savedAt: 1700000000001, payload: REMOTE_PAYLOAD });
+        clickIn(shown, '立即同步');
+        await tick(250); // 先写冲突副本再 loadAll，链路最长
+
+        const backup = await db.getMeta('conflictBackup', null);
+        assert.ok(syncMod.isConflictBackup(backup), '没有生成冲突副本：' + JSON.stringify(backup).slice(0, 160));
+        assert.ok(backup.payload.weights.some((w) => w.date === '2006-06-06'), '冲突副本里应该是被覆盖掉的那份本机数据');
+        assert.equal(backup.payload.meta.marker, 'local-only', '冲突副本应该是整份本机快照');
+        assert.ok(syncMod.checksum(backup.payload), '副本内容要能再算校验和');
+
+        const state = await store.getSyncState();
+        assert.equal(state.rev, 3, '覆盖后 rev 应该记成 3');
+        const dump = await db.dumpAll();
+        assert.ok(!dump.weights.some((w) => w.date === '2006-06-06'), '冲突时本机应被云端覆盖（副本已留存）');
+        assert.ok(dump.weights.some((w) => w.date === '2010-10-10'), '云端数据没有落到本机');
+        assert.ok(toasts().some((t) => t.includes('冲突副本')), '缺少冲突提示：' + toasts().join(' | '));
+
+        const after = await renderCloud(fake);
+        const warn = byClass(after, 'cloud-warn')[0];
+        assert.ok(warn, '界面上没有冲突副本提示');
+        assert.ok(warn.textOf().includes('存在冲突副本'), '冲突副本提示文案不对：' + warn.textOf());
+        assertNoLeak(nodeText(after), 'account(冲突副本)');
+      });
+    });
+
+    await checkAsync('云同步：push 撞 409 → 界面说清「云端已有更新（rev N）」，本机数据一个字节不动', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await db.del('meta', 'conflictBackup');
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-409', userId: 'u_409' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await loginWith(fake);
+        assert.equal((await store.getSyncState()).rev, 1);
+
+        // 本机改了，但云端被别人推到了 rev 7（本机锚点还停在 1）→ 上传必撞 409
+        await store.logWeight({ date: '2007-07-07', weightKg: 62 });
+        fake.handlers.push = () => ({ ok: false, error: 'rev-conflict', rev: 7 });
+        const dirty = await renderCloud(fake);
+        clickIn(dirty, '立即同步');
+        await tick(80);
+
+        const toastText = toasts().join(' | ');
+        assert.ok(toastText.includes('云端已有更新（rev 7）'), '409 提示没说清服务器当前 rev：' + toastText);
+        assert.ok(toastText.includes('冲突副本'), '409 提示没告诉用户下一步会先备份：' + toastText);
+        const state = await store.getSyncState();
+        assert.equal(state.rev, 1, '409 之后本机锚点不该被改写');
+        assert.ok((await db.dumpAll()).weights.some((w) => w.date === '2007-07-07'), '409 之后本机数据不该动');
+        assert.equal(await db.getMeta('conflictBackup', null), null, '409 阶段还不该生成冲突副本');
+      });
+    });
+
+    await checkAsync('云同步：网络失败 → 一句中文，本机数据与 rev 都不动；页面还能继续用', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-net', userId: 'u_net' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await loginWith(fake);
+        await store.logWeight({ date: '2008-08-08', weightKg: 60 });
+
+        fake.handlers.pull = () => ({ ok: false, error: 'network', message: '网络不可用，请检查网络后重试' });
+        const dirty = await renderCloud(fake);
+        clickIn(dirty, '立即同步');
+        await tick(80);
+
+        assert.ok(toasts().some((t) => t.includes('网络不可用，请检查网络后重试')), '网络失败没有可读中文：' + toasts().join(' | '));
+        assert.equal((await store.getSyncState()).rev, 1, '网络失败不该改本机锚点');
+        assert.ok((await db.dumpAll()).weights.some((w) => w.date === '2008-08-08'), '网络失败不该动本机数据');
+        assertNoLeak(nodeText(dirty), 'account(网络失败)');
+        assert.ok(byClass(dirty, 'account-row').length >= 1, '网络失败后账号列表还要在');
+      });
+    });
+
+    await checkAsync('云同步：退出登录只清令牌，本机数据与绑定记录都留着', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        const account = await accountsMod.ensureDefaultAccount();
+        await store.logWeight({ date: '2009-09-09', weightKg: 59 });
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-logout', userId: 'u_logout' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await loginWith(fake);
+        const before = await db.dumpAll();
+
+        clickIn(shown, '退出登录');
+        await tick();
+        const modal = latestOverlay('modal-backdrop');
+        assert.ok(modal, '退出登录没有二次确认');
+        assert.ok(nodeText(modal).includes('本机数据仍在'), '确认框没有写明「本机数据仍在」：' + nodeText(modal));
+        clickIn(modal, '退出登录');
+        await tick(60);
+
+        const auth = cloudConfig.readCloudAuth(account.id);
+        assert.equal(auth.token, '', '退出登录后本机不该还留着令牌');
+        assert.equal(auth.serverId, 'u_logout', 'serverId 是账号绑定信息，退出登录不该丢');
+        assert.equal(accountsMod.listAccounts()[0].serverId, 'u_logout', '账号目录里的 serverId 不该被清掉');
+        const after = await db.dumpAll();
+        assert.deepEqual(after.weights, before.weights, '退出登录动了本机体重数据');
+        assert.deepEqual(after.meals, before.meals, '退出登录动了本机饮食数据');
+        assert.ok(toasts().some((t) => t.includes('本机数据未动')), '缺少「本机数据未动」提示：' + toasts().join(' | '));
+
+        const back = await renderCloud(fake);
+        assert.ok(buttonsWithText(back, '登录').length >= 1, '退出后应该能重新登录');
+        assert.equal(buttonsWithText(back, '立即同步').length, 0, '退出后不该再显示同步按钮');
+        assert.ok(nodeText(back).includes('数据只存在这台设备'), '退出后应说明数据仍在这台设备');
+      });
+    });
+
+    await checkAsync('云同步：找回密码（用户名 + 恢复码 + 新密码）→ 重置成功后带出登录框', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const fake = fakeTransport({ reset: () => ({ ok: true }) });
+        const root = await renderCloud(fake);
+
+        clickIn(root, '找回密码');
+        await tick();
+        assert.ok(nodeText(sheetOf()).includes('忘了密码只能靠它'), '找回密码弹层没有说明恢复码的作用');
+        fillSheet(['xiaolin', 'RC-ABCD-1234', 'brandnewpass']);
+        clickSheet('重置密码');
+        await tick(60);
+
+        assert.equal(fake.calls.length, 1, '重置密码只该调一次 reset');
+        assert.deepEqual(fake.calls[0].args, { username: 'xiaolin', recoveryCode: 'RC-ABCD-1234', newPassword: 'brandnewpass' });
+        assert.ok(toasts().some((t) => t.includes('密码已重置，请用新密码登录')), '缺少重置提示：' + toasts().join(' | '));
+        const loginSheet = sheetOf();
+        assert.ok(loginSheet && nodeText(loginSheet).includes('登录云账号'), '重置后没有带出登录框');
+        assert.equal(byClass(loginSheet, 'input')[0].value, 'xiaolin', '登录框没有预填用户名');
+        clickSheet('取消');
+        await tick();
+      });
+    });
+
+    await checkAsync('云同步：表单校验在后端之前拦下（用户名 / 密码 / 两次不一致），零请求', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const fake = fakeTransport({ register: () => ({ ok: false, error: 'unauthorized', message: '这个用户名已经被占用了' }) });
+        const root = await renderCloud(fake);
+
+        clickIn(root, '注册');
+        await tick();
+        fillSheet(['ab', 'sup3rsecret', 'sup3rsecret']);
+        clickSheet('注册');
+        await tick(20);
+        assert.equal(fake.calls.length, 0, '用户名不合法时不该发请求');
+        assert.ok(toasts().some((t) => t.includes('用户名需 3–32 位')), '缺少用户名校验提示：' + toasts().join(' | '));
+
+        fillSheet(['xiaolin', 'short', 'short']);
+        clickSheet('注册');
+        await tick(20);
+        assert.equal(fake.calls.length, 0, '密码太短时不该发请求');
+        assert.ok(toasts().some((t) => t.includes('密码至少 8 位')), '缺少密码校验提示：' + toasts().join(' | '));
+
+        fillSheet(['xiaolin', 'sup3rsecret', 'sup3rsecrET']);
+        clickSheet('注册');
+        await tick(20);
+        assert.equal(fake.calls.length, 0, '两次密码不一致时不该发请求');
+        assert.ok(toasts().some((t) => t.includes('两次输入的密码不一致')), '缺少两次密码校验提示：' + toasts().join(' | '));
+
+        // 校验通过才发请求；后端的中文报错原样显示，弹层保持打开让用户改
+        fillSheet(['xiaolin', 'sup3rsecret', 'sup3rsecret']);
+        clickSheet('注册');
+        await tick(40);
+        assert.equal(fake.calls.length, 1, '校验通过后应该发一次注册请求');
+        assert.ok(toasts().some((t) => t.includes('这个用户名已经被占用了')), '后端中文报错没有原样显示：' + toasts().join(' | '));
+        assert.ok(sheetOf(), '后端报错时弹层应保持打开');
+        clickSheet('取消');
+        await tick();
+      });
+    });
+
+    await checkAsync('传输层：409 带 rev、非 JSON / 网络异常 / 超时都归一成中文，未配置连 fetchImpl 都不调', async () => {
+      const sent = [];
+      const jsonFetch = (payload, status = 200) => async (url, options) => {
+        sent.push({ url, options, body: JSON.parse(options.body) });
+        return { ok: status < 400, status, json: async () => payload };
+      };
+
+      const ok = cloudTransport.createCloudTransport({ baseUrl: CLOUD_URL, fetchImpl: jsonFetch({ rev: 4 }) });
+      const pushed = await ok.push({ token: 'tok', baseRev: 1, payload: { a: 1 } });
+      assert.deepEqual(pushed, { ok: true, rev: 4 });
+      assert.equal(sent[0].url, CLOUD_URL + '/push', '推送地址不对：' + sent[0].url);
+      assert.equal(sent[0].options.method, 'POST');
+      assert.deepEqual(sent[0].body, { token: 'tok', baseRev: 1, payload: { a: 1 } });
+
+      const conflict = cloudTransport.createCloudTransport({ baseUrl: CLOUD_URL, fetchImpl: jsonFetch({ error: 'rev-conflict', rev: 9 }, 409) });
+      const got = await conflict.push({ token: 'tok', baseRev: 1, payload: { a: 1 } });
+      assert.equal(got.ok, false);
+      assert.equal(got.error, 'rev-conflict');
+      assert.equal(got.rev, 9, '409 要把服务器当前 rev 带出来');
+
+      const notJson = cloudTransport.createCloudTransport({
+        baseUrl: CLOUD_URL,
+        fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new Error('不是 JSON'); } }),
+      });
+      const broken = await notJson.pull({ token: 'tok' });
+      assert.equal(broken.error, 'network', '非 JSON 响应应归一成 network');
+      assert.ok(/[\u4e00-\u9fa5]/.test(broken.message), '错误提示必须是中文：' + broken.message);
+
+      const boom = cloudTransport.createCloudTransport({ baseUrl: CLOUD_URL, fetchImpl: async () => { throw new Error('断网了'); } });
+      const network = await boom.login({ username: 'xiaolin', password: 'sup3rsecret' });
+      assert.equal(network.ok, false);
+      assert.equal(network.error, 'network');
+      assert.ok(network.message.includes('网络'), '网络错误要说人话：' + network.message);
+
+      const timeout = cloudTransport.createCloudTransport({
+        baseUrl: CLOUD_URL,
+        fetchImpl: async () => { const err = new Error('超时'); err.name = 'TimeoutError'; throw err; },
+      });
+      const late = await timeout.pull({ token: 'tok' });
+      assert.equal(late.error, 'network');
+      assert.ok(late.message.includes('超时'), '超时要说清是超时：' + late.message);
+
+      let called = 0;
+      const off = cloudTransport.createCloudTransport({
+        baseUrl: '   ',
+        fetchImpl: async () => { called += 1; return { ok: true, status: 200, json: async () => ({}) }; },
+      });
+      const offResult = await off.register({ username: 'xiaolin', password: 'sup3rsecret' });
+      assert.equal(offResult.ok, false);
+      assert.equal(called, 0, '未配置时不该发请求');
+      assert.ok(offResult.message.includes('未配置'), '未配置要说清是未配置：' + offResult.message);
+    });
+
+    await checkAsync('同步：syncDigestOf 与 store.getSyncPayload 同形（易变字段抹除规则不许漂）', async () => {
+      await withStorage(async () => {
+        await accountsMod.ensureDefaultAccount();
+        await store.logWeight({ date: '2011-11-11', weightKg: 70 });
+        await db.del('meta', 'lastExportedAt');
+        await store.setSyncState({ rev: 5, savedAt: 1700000000000, checksum: 'deadbeef' });
+        const digest = syncMod.syncDigestOf(await db.dumpAll());
+        assert.equal('syncState' in digest.payload.meta, false, 'syncState 不该进数据体');
+        assert.equal('lastExportedAt' in digest.payload.meta, false, 'lastExportedAt 不该进数据体');
+        assert.equal('exportedAt' in digest.payload, false, 'exportedAt 不该进数据体');
+        // 只读：算指纹不该顺手记一笔「上次备份」（那会把设置页的备份提醒静默关掉）。
+        // 这条必须排在 getSyncPayload 之前 —— 那个函数自己就会写 lastExportedAt。
+        assert.equal(await db.getMeta('lastExportedAt', null), null, 'syncDigestOf 不该写 meta');
+        const payload = await store.getSyncPayload();
+        assert.deepEqual(digest.payload, payload, 'syncDigestOf 与 getSyncPayload 内容不一致');
+        assert.equal(digest.checksum, syncMod.checksum(payload));
+        await store.clearSyncState();
+      });
+    });
+
+    await checkAsync('同步：runSyncOnce 八条决策路径的返回值（真实 store/db + 假 transport，绝不抛）', async () => {
+      await withStorage(async () => {
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await db.del('meta', 'conflictBackup');
+        const storage = {
+          dumpAll: db.dumpAll,
+          getSyncState: store.getSyncState,
+          setSyncState: store.setSyncState,
+          loadAll: db.loadAll,
+          getMeta: db.getMeta,
+          setMeta: db.setMeta,
+        };
+        let remoteRev = 0;
+        let remotePayload = {};
+        const makeTransport = (overrides = {}) => ({
+          async pull() { return { ok: true, rev: remoteRev, savedAt: remoteRev ? 1700000000000 : 0, payload: remotePayload }; },
+          async push({ baseRev, payload }) { remoteRev = baseRev + 1; remotePayload = payload; return { ok: true, rev: remoteRev }; },
+          ...overrides,
+        });
+        const run = (overrides) => syncMod.runSyncOnce({ accountId: 'acc', transport: makeTransport(overrides), token: 'tok', storage });
+        const log = [];
+
+        log.push(await syncMod.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: '', storage })); // 没登录
+        log.push(await syncMod.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: 'tok' })); // 没接上存储
+
+        await store.logWeight({ date: '2012-12-12', weightKg: 72 });
+        log.push(await syncMod.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: 'tok', now: () => 1000, storage })); // push
+        log.push(await syncMod.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: 'tok', now: () => 2000, storage })); // none
+
+        remoteRev = 5;
+        remotePayload = REMOTE_PAYLOAD;
+        log.push(await syncMod.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: 'tok', now: () => 3000, storage })); // pull
+
+        await store.logWeight({ date: '2013-01-01', weightKg: 71 });
+        remoteRev = 6;
+        log.push(await syncMod.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: 'tok', now: () => 4000, storage })); // conflict-pull
+
+        await store.logWeight({ date: '2013-02-02', weightKg: 70 });
+        log.push(await run({ async push() { return { ok: false, error: 'rev-conflict', rev: 9 }; } })); // 409
+        log.push(await run({ async pull() { return { ok: false, error: 'network', message: '网络不可用，请检查网络后重试' }; } })); // 网络失败
+
+        const shape = log.map((item) => ({ ok: item.ok, action: item.action, rev: item.rev, error: item.error, message: item.message }));
+        assert.deepEqual(shape.map((item) => item.action), ['failed', 'failed', 'push', 'none', 'pull', 'conflict-pull', 'push', 'failed']);
+        assert.deepEqual(shape.map((item) => item.ok), [false, false, true, true, true, true, false, false]);
+        assert.deepEqual(shape.map((item) => item.error), ['unauthorized', 'no-storage', undefined, undefined, undefined, undefined, 'rev-conflict', 'network']);
+        assert.deepEqual(shape.map((item) => item.rev), [0, 0, 1, 1, 5, 6, 9, 6]);
+        assert.equal(shape[0].message, '还没登录：请先用云账号登录，再同步');
+        assert.ok(shape[1].message.includes('存储接口'));
+        assert.equal(shape[2].message, '已上传本机数据（云端 rev 1）');
+        assert.equal(shape[3].message, '本机与云端已一致，无需同步');
+        assert.equal(shape[4].message, '已用云端数据（rev 5）覆盖本机');
+        assert.equal(shape[5].message, '本机改动已存成冲突副本，并已用云端数据（rev 6）覆盖本机');
+        assert.equal(log[5].backupAt, 4000, 'conflict-pull 要回报冲突副本的存盘时间');
+        assert.equal(shape[6].message, '云端已有更新（rev 9），本机改动还没上传：再点一次「立即同步」会先把本机数据存成冲突副本，再拉取云端');
+        assert.equal(shape[7].message, '网络不可用，请检查网络后重试');
+      });
+    });
+
+    await checkAsync('同步调度：本机改动后防抖 5 秒合并成一次；未登录时静默跳过', async () => {
+      let time = 0;
+      let seq = 0;
+      const tasks = new Map();
+      const clock = {
+        now: () => time,
+        setTimer: (fn, ms) => { seq += 1; tasks.set(seq, { at: time + ms, fn }); return seq; },
+        clearTimer: (id) => { tasks.delete(id); },
+      };
+      const dueAt = (limit) => {
+        const due = [...tasks.entries()].filter((entry) => entry[1].at <= limit).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) return;
+        tasks.delete(due[0]);
+        time = due[1].at;
+        due[1].fn();
+      };
+
+      const contexts = [null]; // 第一次触发 = 未登录
+      const ran = [];
+      const results = [];
+      const scheduler = syncMod.createSyncScheduler({
+        delayMs: 5000,
+        now: clock.now,
+        setTimer: clock.setTimer,
+        clearTimer: clock.clearTimer,
+        resolveContext: () => contexts.shift() ?? null,
+        runner: async (context) => { ran.push(context.token); return { ok: true, action: 'push', rev: 1, message: 'ok' }; },
+        onResult: (result) => results.push(result),
+      });
+
+      scheduler.schedule('未登录');
+      assert.equal(scheduler.pending(), true);
+      dueAt(5000);
+      await scheduler.whenIdle();
+      assert.equal(ran.length, 0, '未登录时不该跑同步');
+      assert.equal(results.length, 0, '跳过的触发不该产生结果');
+
+      contexts.push({ accountId: 'a1', transport: {}, token: 'tok-sched' });
+      scheduler.schedule('c1');
+      time += 1000;
+      scheduler.schedule('c2');
+      assert.equal(tasks.size, 1, '连续改动应只留一个定时器');
+      dueAt(9000);
+      assert.equal(ran.length, 0, '不到 5 秒不该触发（第二次 schedule 会把计时重置）');
+      dueAt(11000);
+      await scheduler.whenIdle();
+      assert.deepEqual(ran, ['tok-sched'], '防抖后应该只同步一次');
+      assert.equal(scheduler.pending(), false);
+      assert.equal(results.length, 1);
+
+      contexts.push({ accountId: 'a1', transport: {}, token: 'tok-flush' });
+      scheduler.schedule('flush');
+      scheduler.flush();
+      await scheduler.whenIdle();
+      assert.deepEqual(ran, ['tok-sched', 'tok-flush'], 'flush() 应该立刻同步一次');
+    });
 
   } finally {
     if (urlSnapshot) {

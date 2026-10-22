@@ -1,0 +1,13 @@
+{
+  "name": "hms-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HMS 云同步后端：CloudBase 云函数（注册 / 登录 / 恢复码重置 / 快照推拉）",
+  "main": "index.js",
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "pg": "^8.11.5"
+  }
+}

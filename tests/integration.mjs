@@ -16,6 +16,8 @@ const MODULES = [
   'js/pure.js',
   'js/accounts.js',
   'js/sync.js',
+  'js/cloud-config.js',
+  'js/cloud-transport.js',
   'js/db.js',
   'js/store.js',
   'js/foods.js',

@@ -270,3 +270,266 @@ export function snapshotSummary(snapshot) {
     bytes,
   };
 }
+
+// ---------- 云同步编排（阶段 3：网络与存储都由外面注入） ----------
+// transport 由界面注入（js/cloud-transport.js），存储接口由调用方注入（js/store.js + js/db.js）。
+// 本文件因此依旧零网络、零 DOM、零本地存储：全部依赖都可换成假实现，决策路径能确定性重放。
+
+/** 冲突副本在 meta 里的键名（SPEC §15.2）：形状是 { savedAt, payload }，不带 v/accountId/rev。 */
+export const CONFLICT_BACKUP_KEY = 'conflictBackup';
+
+/** 每次同步都会变、但内容上不该算「本机改动」的 meta 键；规则必须与 store.getSyncPayload 一致。 */
+export const SYNC_VOLATILE_META_KEYS = ['syncState', 'lastExportedAt'];
+
+/**
+ * 把 db.dumpAll() 的输出折成与 store.getSyncPayload() 完全同形的数据体，并给出校验和。
+ * 纯函数（不碰存储），所以「本机有没有改动」的判断不会写任何 meta：
+ * getSyncPayload 会顺手记一笔导出时间，用它做只读判断会把设置页的备份提醒静默关掉。
+ * 与 store.getSyncPayload() 的内容等价由 ui.smoke 的一条用例钉死。
+ */
+export function syncDigestOf(dump) {
+  const src = dump && typeof dump === 'object' ? dump : {};
+  const meta = { ...(src.meta && typeof src.meta === 'object' ? src.meta : {}) };
+  for (const key of SYNC_VOLATILE_META_KEYS) delete meta[key];
+  const payload = { app: 'hms', ...src, meta };
+  delete payload.exportedAt;
+  return { payload, checksum: checksum(payload) };
+}
+
+/** runSyncOnce 需要的存储接口：全部是函数，缺一个就明确报错，不去猜。 */
+export const SYNC_STORAGE_METHODS = ['dumpAll', 'getSyncState', 'setSyncState', 'loadAll', 'getMeta', 'setMeta'];
+
+function missingMethods(storage, names) {
+  const src = storage && typeof storage === 'object' ? storage : {};
+  return names.filter((name) => typeof src[name] !== 'function');
+}
+
+function reasonOf(error) {
+  return error && error.message ? String(error.message) : String(error);
+}
+
+function failed(action, error, message, rev = 0) {
+  return { ok: false, action, error, rev, message };
+}
+
+/** 非负整数 rev，其余一律 0。 */
+function safeRev(value) {
+  return Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * 同步一次。返回 { ok, action, rev, message }（外加 savedAt / backupAt / reason 之类的上下文），永不抛：
+ * 界面把 message 原样显示出来就是一句可读的中文。
+ *
+ * @param {object} options
+ * @param {string} options.accountId 本机账号 id
+ * @param {object} options.transport  { pull, push } —— 见 js/cloud-transport.js
+ * @param {string} options.token      本机保存的登录令牌
+ * @param {Function} [options.now]    时钟注入，默认 Date.now
+ * @param {object} options.storage    { dumpAll, getSyncState, setSyncState, loadAll, getMeta, setMeta }
+ */
+export async function runSyncOnce({ accountId, transport, token, now, storage } = {}) {
+  const clock = typeof now === 'function' ? now : () => Date.now();
+  const missing = missingMethods(storage, SYNC_STORAGE_METHODS);
+  if (missing.length) {
+    return failed('failed', 'no-storage', `同步所需的本地存储接口没接上（缺 ${missing.join('、')}），请刷新页面后重试`);
+  }
+  if (!transport || typeof transport.pull !== 'function' || typeof transport.push !== 'function') {
+    return failed('failed', 'not-configured', '云同步未配置：没有可用的网关地址');
+  }
+  const auth = typeof token === 'string' ? token.trim() : '';
+  if (!auth) return failed('failed', 'unauthorized', '还没登录：请先用云账号登录，再同步');
+
+  // 1) 本机：内容 + 上次成功的锚点
+  let digest;
+  let localRev = 0;
+  let syncedChecksum = null;
+  try {
+    digest = syncDigestOf(await storage.dumpAll());
+    const state = await storage.getSyncState();
+    localRev = safeRev(state?.rev);
+    syncedChecksum = typeof state?.checksum === 'string' && state.checksum ? state.checksum : null;
+  } catch (error) {
+    return failed('failed', 'local-error', `读取本机数据失败：${reasonOf(error)}`);
+  }
+
+  // 2) 云端：rev 与 payload 都认得出才参与决策。认不出就当「远端没有可用快照」交给 planSync 走上传——
+  //    上传撞上 409 时会给出明确中文，本机数据一个字节都不会动。
+  let remote = null;
+  try {
+    remote = await transport.pull({ token: auth });
+  } catch (error) {
+    return failed('failed', 'network', `无法连接云端：${reasonOf(error)}`, localRev);
+  }
+  if (!remote || remote.ok !== true) {
+    return failed('failed', remote?.error ?? 'network', remote?.message || '拉取云端数据失败', localRev);
+  }
+  const remoteSnap = parseSnapshot({
+    v: SNAPSHOT_VERSION,
+    accountId: typeof accountId === 'string' && accountId.trim() ? accountId.trim() : 'remote',
+    rev: safeRev(remote.rev),
+    savedAt: Number(remote.savedAt) || clock(),
+    payload: remote.payload,
+  });
+  const usableRemote = remoteSnap && remoteSnap.rev > 0 ? remoteSnap : null;
+
+  // 3) 决策：全交给 planSync，本文件不重写一遍规则
+  const plan = planSync({ localRev, localChecksum: digest.checksum, syncedChecksum, remote: usableRemote });
+
+  // 4a) 上传
+  if (plan.action === 'push') {
+    let pushed = null;
+    try {
+      pushed = await transport.push({ token: auth, baseRev: localRev, payload: digest.payload });
+    } catch (error) {
+      return failed('push', 'network', `上传失败：${reasonOf(error)}`, localRev);
+    }
+    if (!pushed || pushed.ok !== true) {
+      const serverRev = safeRev(pushed?.rev) || localRev;
+      if (pushed?.error === 'rev-conflict') {
+        return {
+          ok: false,
+          action: 'push',
+          error: 'rev-conflict',
+          rev: serverRev,
+          message: `云端已有更新（rev ${serverRev}），本机改动还没上传：再点一次「立即同步」会先把本机数据存成冲突副本，再拉取云端`,
+        };
+      }
+      return failed('push', pushed?.error ?? 'network', pushed?.message || '上传失败', serverRev);
+    }
+    const nextRev = Number.isInteger(pushed.rev) && pushed.rev >= 0 ? pushed.rev : localRev + 1;
+    const savedAt = clock();
+    try {
+      await storage.setSyncState({ rev: nextRev, savedAt, checksum: digest.checksum });
+    } catch (error) {
+      return failed('push', 'local-error', `数据已上传，但本机同步锚点没保存（${reasonOf(error)}），下次可能重复上传一次`, nextRev);
+    }
+    return { ok: true, action: 'push', rev: nextRev, savedAt, message: `已上传本机数据（云端 rev ${nextRev}）`, reason: plan.reason };
+  }
+
+  // 4b) 下载：conflict-pull 先留冲突副本，绝不静默丢本机数据
+  if (plan.action === 'pull' || plan.action === 'conflict-pull') {
+    if (!usableRemote) {
+      return failed(plan.action, 'bad-remote', '云端快照无法识别（版本或字段不对），本机数据没有被改动', localRev);
+    }
+    let backupAt = null;
+    if (plan.action === 'conflict-pull') {
+      const backup = makeConflictBackup({ payload: digest.payload, savedAt: clock() });
+      try {
+        await storage.setMeta(CONFLICT_BACKUP_KEY, backup);
+        backupAt = backup.savedAt;
+      } catch (error) {
+        return failed(plan.action, 'local-error', `本机数据备份成冲突副本失败（${reasonOf(error)}），已放弃拉取以免丢数据`, localRev);
+      }
+    }
+    try {
+      await storage.loadAll(usableRemote.payload, 'replace');
+    } catch (error) {
+      return failed(plan.action, 'local-error', `写入云端数据失败：${reasonOf(error)}`, localRev);
+    }
+    // 锚点按「云端数据落到本机之后」重新算：loadAll 的合并语义可能与快照内容不完全一致
+    let appliedChecksum = digest.checksum;
+    try {
+      appliedChecksum = syncDigestOf(await storage.dumpAll()).checksum;
+    } catch {
+      // 算不出来就用拉取前的值：最坏是下次再推一次，绝不会凭空变成「已同步」
+    }
+    const savedAt = Number(usableRemote.savedAt) > 0 ? usableRemote.savedAt : clock();
+    try {
+      await storage.setSyncState({ rev: usableRemote.rev, savedAt, checksum: appliedChecksum });
+    } catch (error) {
+      return failed(plan.action, 'local-error', `云端数据已写入本机，但同步锚点没保存：${reasonOf(error)}`, usableRemote.rev);
+    }
+    return {
+      ok: true,
+      action: plan.action,
+      rev: usableRemote.rev,
+      savedAt,
+      backupAt,
+      reason: plan.reason,
+      message: plan.action === 'conflict-pull'
+        ? `本机改动已存成冲突副本，并已用云端数据（rev ${usableRemote.rev}）覆盖本机`
+        : `已用云端数据（rev ${usableRemote.rev}）覆盖本机`,
+    };
+  }
+
+  // 4c) 两边一致：只把 savedAt 记成「刚确认过」
+  const savedAt = clock();
+  try {
+    await storage.setSyncState({ rev: localRev, savedAt, checksum: digest.checksum });
+  } catch (error) {
+    return failed('none', 'local-error', `同步状态没保存：${reasonOf(error)}`, localRev);
+  }
+  return { ok: true, action: 'none', rev: localRev, savedAt, message: '本机与云端已一致，无需同步', reason: plan.reason };
+}
+
+/** 读本机的冲突副本（按既有形状校验）：脏数据、取不到、存储不可用都返回 null，不抛。 */
+export async function readConflictBackup(storage) {
+  const src = storage && typeof storage === 'object' ? storage : {};
+  if (typeof src.getMeta !== 'function') return null;
+  let raw = null;
+  try {
+    raw = await src.getMeta(CONFLICT_BACKUP_KEY, null);
+  } catch {
+    return null;
+  }
+  return isConflictBackup(raw) ? raw : null;
+}
+
+/**
+ * 本机改动后的防抖同步：连续改动合并成一次，默认延迟 5 秒（由 createDebouncer 保证）。
+ * resolveContext() 返回 { accountId, transport, token, storage }；返回 null（未登录 / 未配置 / 没账号）
+ * 就静默跳过这次触发——没登录不该被弹一堆错误。
+ * fire() 立即同步一次（不等防抖）；whenIdle() 用来等正在跑的那次结束。
+ */
+export function createSyncScheduler({
+  delayMs = 5000,
+  resolveContext,
+  runner,
+  now,
+  setTimer,
+  clearTimer,
+  onResult,
+  onError,
+} = {}) {
+  const run = typeof runner === 'function' ? runner : runSyncOnce;
+  let inflight = null;
+
+  function fire(reason) {
+    const task = Promise.resolve()
+      .then(() => (typeof resolveContext === 'function' ? resolveContext() : null))
+      .then((context) => (context ? run({ ...context, now }) : null))
+      .then((result) => {
+        if (result && typeof onResult === 'function') onResult(result, reason);
+        return result;
+      })
+      .catch((error) => {
+        if (typeof onError === 'function') onError(error, reason);
+        return null;
+      });
+    inflight = task;
+    return task;
+  }
+
+  const debouncer = createDebouncer({ delayMs, now, setTimer, clearTimer, onFire: (reason) => fire(reason) });
+
+  return {
+    schedule(reason) {
+      debouncer.schedule(reason);
+    },
+    cancel() {
+      debouncer.cancel();
+    },
+    pending() {
+      return debouncer.pending();
+    },
+    flush() {
+      debouncer.flush();
+      return inflight;
+    },
+    fire,
+    whenIdle() {
+      return inflight ?? Promise.resolve(null);
+    },
+  };
+}

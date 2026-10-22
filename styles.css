@@ -1127,6 +1127,50 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 
 .account-row__note { flex-basis: 100%; font-size: 12px; color: var(--text-2); }
 
+/* ---------- 云同步（账号页） ---------- */
+
+.cloud-note { font-size: 13px; color: var(--text); line-height: 1.5; }
+.cloud-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.cloud-account { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.cloud-account__name { font-weight: 600; overflow-wrap: anywhere; }
+.cloud-account__id { font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
+
+.cloud-status { display: flex; flex-direction: column; gap: 6px; }
+.cloud-status__row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 24px; }
+.cloud-status__label { flex: none; font-size: 12px; color: var(--text-2); }
+.cloud-status__value { font-size: 13px; font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+
+.cloud-warn {
+  padding: 10px 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* 恢复码：一眼看清、能整段选中（手机上抄写 / 截图就靠它） */
+.cloud-code {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--card-line);
+  border-radius: var(--radius-sm);
+  background: var(--brand-soft);
+  text-align: center;
+}
+.cloud-code__label { font-size: 12px; color: var(--text-2); }
+.cloud-code__value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
 @media (max-width: 359px) {
   .bmi-value__num { font-size: 34px; }
   .bmi-figure__svg { width: 48px; height: 66px; }

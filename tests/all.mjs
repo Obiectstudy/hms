@@ -1,6 +1,7 @@
 import { run as runLogic } from './logic.test.mjs';
 import { run as runVision } from './vision.test.mjs';
 import { run as runFoodsData } from './foods.data.test.mjs';
+import { run as runCloud } from './cloud.test.mjs';
 import { run as runUi } from './ui.smoke.mjs';
 import { run as runIntegration } from './integration.mjs';
 
@@ -9,6 +10,7 @@ const suites = [
   ['logic', runLogic],
   ['vision', runVision],
   ['foods-data', runFoodsData],
+  ['cloud', runCloud],
   ['ui', runUi],
   ['integration', runIntegration],
 ];
