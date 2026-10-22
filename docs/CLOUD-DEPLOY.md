@@ -139,3 +139,34 @@ const stmts = text.replace(/\r\n?/g, '\n')
 4. 删除 `CLOUDBASE_APIKEY`（可选）
 
 代码里两条通道并存，切换只改一行。
+## 七、静态网站托管：两个"下载慢"问题的解法（2026-10-22）
+
+### 问题
+客户端内点「立即更新」下载极慢。实测本机从 **GitHub Pages 只有 5.5 KB/s**（1.79MB 的 APK 需 **317 秒**），
+而同一文件走 **CloudBase 静态托管是 1400 KB/s（1.2 秒）—— 快 254 倍**。
+原因不是用户带宽，是 GitHub Pages 走国际线路（Fastly）；家人没装梯子时将无法忍受。
+
+### 做法
+1. **更新包**：`tools/release.ps1` 每次发版自动 `tcb hosting deploy` 到静态托管，并把 `version.json` 的
+   `apkUrl` 指向该地址；上传失败则自动回退到 GitHub 地址（不因一次失败发不出版）。
+2. **整个前端**也搬到静态托管，得到国内直连的网址：
+
+   | | 地址 | 说明 |
+   | --- | --- | --- |
+   | 主站（国内直连） | https://hms-d4gnh63iw73f09792-1513758162.tcloudbaseapp.com/ | 家人用这个 |
+   | 备用（国际线路） | https://obiectstudy.github.io/hms/ | 保留，国外访问更快 |
+
+### 搬迁时要小心的两件事
+- **绝不能上传整个仓库根目录**——`.git`（仓库历史）与 `android/`（构建产物）会一并暴露在公网。
+  正确做法是先做**只含前端文件的干净暂存目录**（index.html / app.js / styles.css / sw.js / manifest / version.json / js / views / icons / dist），
+  上传前清点文件数并断言没有危险路径。
+- **换域名 = 换 origin**，而 IndexedDB 按 origin 隔离：**老用户在原地址的数据不会自动跟过去**。
+  好在安卓 APK 的内置页面用的是 `appassets.androidplatform.net`，与这两个网址都无关，**手机上的数据不受影响**；
+  只有曾在手机浏览器里直接用过网页版的人需要导出/导入一次。
+
+### 命令备忘
+```bash
+tcb hosting detail -e <envId>                    # 查看托管状态与默认域名
+tcb hosting deploy <本地目录> <云端路径> -e <envId>  # 上传
+tcb hosting list / -e <envId>                    # 列出云端文件
+```
