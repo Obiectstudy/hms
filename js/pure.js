@@ -8,6 +8,14 @@
 
 import { round1, sumItems, netKcal, groupByDate, localDateStr, parseDateStr } from './nutrition.js';
 
+/**
+ * 云同步的密钥边界（SYNC_EXCLUDED_SETTINGS / stripSyncSecrets / mergeRemoteIntoLocal）
+ * 实现住在 js/sync.js：那边被既有断言钉死「源码零网络零 DOM 且不含跨模块引用」，实现只能放在那边。
+ * 这里原样再导出，所以 db.js / store.js 拿到的与 sync.js 用的是同一份实现
+ * （logic 用例钉住三个名字身份相等，杜绝两份实现漂移）。
+ */
+export { SYNC_EXCLUDED_SETTINGS, stripSyncSecrets, mergeRemoteIntoLocal } from './sync.js';
+
 export const SLOTS = ['breakfast', 'lunch', 'dinner', 'snack'];
 export const BUSINESS_STORES = ['weights', 'meals', 'exercises', 'waters'];
 

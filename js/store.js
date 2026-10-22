@@ -31,6 +31,7 @@ import {
   buildDaySummary,
   buildRangeRows,
   buildCSV,
+  stripSyncSecrets,
 } from './pure.js';
 
 // 与 js/vision.js 的 DEFAULT_* 保持一致；这里写字面量是为了不跨边界 import 别人的文件
@@ -531,6 +532,7 @@ export async function clearSyncState() {
  * 同步用的数据体：复用 exportJSON（全量 dump + 记导出时间），只抹掉三个每次都变的字段——
  * 顶层 exportedAt、meta.syncState、meta.lastExportedAt。
  * 不抹的话 checksum() 每次都不同，「本地有没有改动」就永远是「有」，同步退化成每次全量对推。
+ * 最后再 stripSyncSecrets：这条链路产出的东西就是要上云的那份，密钥一个字节都不出去。
  */
 export async function getSyncPayload() {
   const payload = await exportJSON();
@@ -538,5 +540,5 @@ export async function getSyncPayload() {
   for (const key of SYNC_VOLATILE_META_KEYS) delete meta[key];
   const out = { ...payload, meta };
   delete out.exportedAt;
-  return out;
+  return stripSyncSecrets(out);
 }

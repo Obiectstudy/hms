@@ -1,0 +1,17 @@
+{
+  "version": "2.0",
+  "envId": "hms-d4gnh63iw73f09792",
+  "functionRoot": "./cloud/functions",
+  "functions": [
+    {
+      "name": "hms-api",
+      "runtime": "Nodejs18.15",
+      "handler": "index.main",
+      "timeout": 10,
+      "memorySize": 256,
+      "installDependency": true,
+      "description": "HMS 健康云同步 API（register/login/reset/pull/push）",
+      "envVariables": {}
+    }
+  ]
+}

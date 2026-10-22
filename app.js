@@ -298,11 +298,36 @@ export async function prepareAccounts() {
   }
 }
 
+// ---------- 自动同步接线 ----------
+/**
+ * 写数据 → 防抖调度器（5 秒窗口内的连续写入合并成一次上传）。
+ *
+ * db.js 是唯一的写入口，注册在那里的通知在每次落库后回调这里；调度器本身由账号页
+ * 在「网关已配置且已登录」时装到 window.HMS.cloud 上，所以这里每次都是惰性看一眼：
+ * 没有它就立刻返回 —— 未配置 / 未登录时零请求，也不建任何定时器。
+ * 应用远端快照 / 导入备份 / 清空数据期间的静默由 db.js 的 withMutedMutations 保证（这里不重复判断）。
+ * 返回值是注销函数，测试与账号切换时可以摘掉。
+ */
+export async function setupAutoSync(env = {}) {
+  const win = env.win ?? (typeof window !== 'undefined' ? window : null);
+  if (!win) return null;
+  const db = env.db ?? (await import('./js/db.js'));
+  return db.onMutation(() => {
+    const cloud = win.HMS && win.HMS.cloud;
+    if (!cloud || typeof cloud.schedule !== 'function') return;
+    cloud.schedule('local-change');
+  });
+}
+
 export function boot() {
   window.HMS = { navigate, refresh };
   window.addEventListener('hashchange', () => { renderRoute(); });
   registerServiceWorker();
   probeStorage();
+  // 不 await：通知注册是异步的（要加载 db.js），晚一点挂上也不影响正确性
+  setupAutoSync().catch((error) => {
+    if (typeof console !== 'undefined') console.warn('[HMS] 自动同步接线失败：', error);
+  });
   requestPersistentStorage(); // 不 await：拿不到持久化也不能挡住首屏
   setupIosInstallHint();
   if (!window.location.hash) {

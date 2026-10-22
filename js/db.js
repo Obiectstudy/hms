@@ -3,13 +3,19 @@
  * 每个导出函数≈一个 IDB 请求，聚合/去重/整形一律交给 pure.js，这样 Node 里能测到的部分尽量大。
  */
 
-import { normalizeRecord, planImport, BUSINESS_STORES } from './pure.js';
+import { normalizeRecord, planImport, BUSINESS_STORES, mergeRemoteIntoLocal } from './pure.js';
 import { getActiveAccount, dbNameForAccount, connectDb, LEGACY_DB_NAME } from './accounts.js';
 
 const DB_VERSION = 1;
 const ALL_STORES = ['meta', ...BUSINESS_STORES, 'photos'];
-// 导入时只恢复档案与目标：API Key 属于设备本地凭据，不该被一份备份文件悄悄装进来
-const IMPORTABLE_META = ['profile', 'goals'];
+// 导入备份 / 拉取云端快照时恢复哪些 meta：档案、目标、套餐模板、设置都要跟着账号走。
+// 照片本体不进快照（二进制太大），API Key 属于设备本地凭据（见 pure.js 的密钥边界），两者都不在这里。
+const IMPORTABLE_META = ['profile', 'goals', 'mealTemplates', 'settings'];
+// 每次同步都会变、内容上不算「本机改动」的 meta 键（与 store.js / sync.js 的 SYNC_VOLATILE_META_KEYS 一致）。
+// 写同步锚点 / 导出时间不通知：否则「同步写锚点 → 通知 → 再同步」会自我循环。
+const QUIET_META_KEYS = ['syncState', 'lastExportedAt'];
+// 只有进得了快照的表才算「本机改动」：photos 不进快照，单独存一张照片不该触发一次同步。
+const NOTIFY_STORES = [...BUSINESS_STORES, 'meta'];
 
 export const IDB_UNAVAILABLE_MESSAGE = '当前浏览器禁用了本地存储，数据无法保存';
 
@@ -78,6 +84,54 @@ function ensureSwitchHook() {
 
 function unavailable() {
   return new Error(IDB_UNAVAILABLE_MESSAGE);
+}
+
+// ---------- 写入通知（自动同步的接线点） ----------
+// db.js 是所有写操作的唯一通道：put / del / setMeta / deleteAll / loadAll / clearBusinessData 全部落在 writeOp 上。
+// 通知只在事务真的 oncomplete 之后发出，「有改动」因此永远不会是假的；
+// handler 的异常只吞掉它自己，绝不影响已经落库的写入结果。
+
+const mutationHandlers = new Set();
+let muteDepth = 0;
+
+/** 注册「本机有改动」通知，返回注销函数。handler 抛错 / 返回 rejected promise 都不影响写入。 */
+export function onMutation(handler) {
+  if (typeof handler !== 'function') return () => {};
+  mutationHandlers.add(handler);
+  return () => {
+    mutationHandlers.delete(handler);
+  };
+}
+
+/**
+ * 期间不触发任何 handler（支持嵌套）。应用云端快照 / 导入备份 / 清空数据都必须包在这里面跑，
+ * 否则「刚拉下来就立刻推回去」会变成回环。异常路径也在 finally 里把计数放回去。
+ */
+export async function withMutedMutations(fn) {
+  muteDepth += 1;
+  try {
+    return await (typeof fn === 'function' ? fn() : undefined);
+  } finally {
+    muteDepth -= 1;
+  }
+}
+
+function notifyMutation(stores) {
+  const touched = stores.filter((name) => NOTIFY_STORES.includes(name));
+  if (muteDepth > 0 || !touched.length || !mutationHandlers.size) return;
+  for (const handler of [...mutationHandlers]) {
+    try {
+      const result = handler({ stores: touched });
+      if (result && typeof result.then === 'function') result.catch(() => {});
+    } catch {
+      /* 通知失败不能把已落库的写入连累成失败 */
+    }
+  }
+}
+
+/** 写同步锚点 / 导出时间不算本机改动（见 QUIET_META_KEYS）。 */
+function isQuietMetaKey(key) {
+  return QUIET_META_KEYS.includes(typeof key === 'string' ? key : '');
 }
 
 function toDbError(err) {
@@ -258,8 +312,11 @@ async function readOp(store, fn) {
   return fn(os);
 }
 
-/** 写操作：等事务 oncomplete 才 resolve，保证调用方拿到的是「真的落库了」。 */
-async function writeOp(stores, fn) {
+/**
+ * 写操作：等事务 oncomplete 才 resolve，保证调用方拿到的是「真的落库了」。
+ * quiet = 这次写入在内容上不算「本机改动」（同步锚点等），不触发写入通知。
+ */
+async function writeOp(stores, fn, quiet = false) {
   const list = Array.isArray(stores) ? stores : [stores];
   for (const name of list) assertStore(name);
   const db = await openDb();
@@ -272,7 +329,11 @@ async function writeOp(stores, fn) {
       return;
     }
     const box = { value: undefined };
-    t.oncomplete = () => resolve(box.value);
+    t.oncomplete = () => {
+      // 事务真的落库之后才通知：失败 / 中止的写入不会被误报成「有改动」
+      if (!quiet) notifyMutation(list);
+      resolve(box.value);
+    };
     t.onerror = () => reject(toDbError(t.error));
     t.onabort = () => reject(toDbError(t.error));
     try {
@@ -308,18 +369,20 @@ export async function get(store, key) {
 }
 
 export async function put(store, obj) {
+  const quiet = store === 'meta' && isQuietMetaKey(obj && obj.key);
   return writeOp(store, (s, box) => {
     const req = s(store).put(obj);
     req.onsuccess = () => {
       box.value = req.result;
     };
-  });
+  }, quiet);
 }
 
 export async function del(store, key) {
+  const quiet = store === 'meta' && isQuietMetaKey(key);
   await writeOp(store, (s) => {
     s(store).delete(key);
-  });
+  }, quiet);
 }
 
 export async function getOneByIndex(store, index, value) {
@@ -388,20 +451,34 @@ function metaToMap(meta) {
   return meta && typeof meta === 'object' ? meta : {};
 }
 
+/**
+ * settings 的恢复也要过一遍密钥边界：备份 / 云端带来的 settings 覆盖本机，
+ * 但排除键（apiKey）永远只认本机现有的那份——绝不让空值或别人的密钥把本机密钥冲掉。
+ */
+async function settingsForRestore(incoming) {
+  const current = await getMeta('settings', null);
+  const merged = mergeRemoteIntoLocal({ remote: { settings: incoming }, local: { settings: current } });
+  const value = merged && merged.settings;
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+
 async function restoreMeta(src, replace) {
   const meta = metaToMap(src.meta);
   for (const key of IMPORTABLE_META) {
     if (!(key in meta) || meta[key] == null) continue;
     if (!replace && (await getMeta(key, null)) != null) continue;
-    await setMeta(key, meta[key]);
+    const value = key === 'settings' ? await settingsForRestore(meta[key]) : meta[key];
+    if (value == null) continue;
+    await setMeta(key, value);
   }
 }
 
 /**
  * 导入。replace 先清空业务表；merge 只补缺失（已有键一律不覆盖），因此同一份备份
- * 重复导入不会让数据翻倍。返回实际写入条数。
+ * 重复导入不会让数据翻倍。返回实际写入条数。meta 按 IMPORTABLE_META 恢复（settings 走密钥边界）。
+ * 内部实现：对外入口在下面，整段包在 withMutedMutations 里。
  */
-export async function loadAll(payload, mode = 'merge') {
+async function loadAllInner(payload, mode = 'merge') {
   const src = payload && typeof payload === 'object' ? payload : {};
   const replace = mode === 'replace';
   const incoming = {};
@@ -433,15 +510,23 @@ export async function loadAll(payload, mode = 'merge') {
   return counts;
 }
 
+/**
+ * 对外的导入入口：导入备份与应用云端快照都走这里，整段静默 ——
+ * 这些写入是「本机数据被外部来源替换」，通知出去就会变成「刚拉下来就立刻推回去」的回环。
+ */
+export async function loadAll(payload, mode = 'merge') {
+  return withMutedMutations(() => loadAllInner(payload, mode));
+}
+
 async function clearStores(names) {
   await writeOp(names, (s) => {
     for (const name of names) s(name).clear();
   });
 }
 
-/** 清空 5 个业务 store（4 张明细 + photos），保留 meta。 */
+/** 清空 5 个业务 store（4 张明细 + photos），保留 meta。清空期间静默（不触发写入通知）。 */
 export async function clearBusinessData() {
-  await clearStores([...BUSINESS_STORES, 'photos']);
+  return withMutedMutations(() => clearStores([...BUSINESS_STORES, 'photos']));
 }
 
 export { BUSINESS_STORES, normalizeRecord };

@@ -79,6 +79,97 @@ export function checksum(value) {
   return typeof text === 'string' ? fnv1a(text) : CHECKSUM_FALLBACK;
 }
 
+// ---------- 云同步的密钥边界 ----------
+
+/**
+ * 云同步绝不携带的设置键：API Key 是设备本地凭据，用户明确选择「不同步」。
+ * 实现落在本文件而不是 js/pure.js，是因为本文件被既有断言钉死「源码零网络零 DOM 且不含跨模块引用」；
+ * js/pure.js 把这三个导出原样再导出，所以别处拿到的与这里用的是同一份实现（logic 用例钉住身份相等）。
+ */
+export const SYNC_EXCLUDED_SETTINGS = ['apiKey'];
+
+/** 深拷贝：优先用环境的克隆能力，拿不到（老浏览器 / 含函数的数据体）时退回逐键克隆。 */
+function deepCopy(value) {
+  if (!value || typeof value !== 'object') return value;
+  const clone = globalThis.structuredClone;
+  if (typeof clone === 'function') {
+    try {
+      return clone(value);
+    } catch {
+      /* 含函数值的数据体克不动，退回逐键克隆 */
+    }
+  }
+  if (Array.isArray(value)) return value.map(deepCopy);
+  const out = {};
+  for (const key of Object.keys(value)) out[key] = deepCopy(value[key]);
+  return out;
+}
+
+function dropExcludedKeys(settings) {
+  if (!isDataObject(settings)) return;
+  for (const key of SYNC_EXCLUDED_SETTINGS) delete settings[key];
+}
+
+/**
+ * 返回一份深拷贝副本，并删掉 settings 里的排除键（顶层 settings 与 meta.settings 都处理：
+ * 快照里设置其实住在 meta.settings）。非对象入参返回安全空对象，绝不抛。
+ */
+export function stripSyncSecrets(payload) {
+  const out = deepCopy(payload);
+  if (!isDataObject(out)) return {};
+  dropExcludedKeys(out.settings);
+  dropExcludedKeys(out.meta && out.meta.settings);
+  return out;
+}
+
+/** 设置容器在快照里的两个可能位置：顶层 settings 与 meta.settings。 */
+const SETTINGS_PATHS = [['settings'], ['meta', 'settings']];
+
+function readPath(source, path) {
+  let cur = source;
+  for (const key of path) {
+    if (!isDataObject(cur)) return undefined;
+    cur = cur[key];
+  }
+  return cur;
+}
+
+function writePath(target, path, value) {
+  let cur = target;
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const key = path[i];
+    if (!isDataObject(cur[key])) cur[key] = {};
+    cur = cur[key];
+  }
+  cur[path[path.length - 1]] = value;
+}
+
+/**
+ * 拉取远端快照之后、落到本机之前：以远端为基准，但密钥只认本机。
+ * 1) 排除键一律不采信远端（哪怕是老版本传上去的密钥），本机有就写回本机的值；
+ * 2) 远端没有 settings（或缺成非对象）时整份沿用本机 settings —— 远端没表态不等于本机设置丢了；
+ * 3) 两边都不是对象时返回安全空对象 {}，绝不抛。
+ */
+export function mergeRemoteIntoLocal({ remote, local } = {}) {
+  const base = isDataObject(remote) ? deepCopy(remote) : {};
+  const localSrc = isDataObject(local) ? local : {};
+  for (const path of SETTINGS_PATHS) {
+    const remoteSettings = readPath(base, path);
+    const localSettings = readPath(localSrc, path);
+    // 「远端没表态」= 缺这个容器、或给了个空对象：此时整份沿用本机设置。
+    // 不这么做的话，一台从没保存过设置的设备推上来的空 settings 会把别人的模型名 / 单位偏好冲成默认值。
+    if (!isDataObject(remoteSettings) || !Object.keys(remoteSettings).length) {
+      if (isDataObject(localSettings)) writePath(base, path, deepCopy(localSettings));
+      continue;
+    }
+    for (const key of SYNC_EXCLUDED_SETTINGS) {
+      if (isDataObject(localSettings) && key in localSettings) remoteSettings[key] = deepCopy(localSettings[key]);
+      else delete remoteSettings[key];
+    }
+  }
+  return base;
+}
+
 // ---------- 快照 ----------
 
 function isDataObject(value) {
@@ -130,23 +221,34 @@ function usableRemote(remote) {
   return isDataObject(remote) && Number.isInteger(remote.rev) && remote.rev >= 0;
 }
 
+/** 业务记录数：快照里四张明细表的条数合计（photos 不进快照，不计入）。 */
+export function businessRecordCount(payload) {
+  const src = isDataObject(payload) ? payload : {};
+  return countRows(src.weights) + countRows(src.meals) + countRows(src.exercises) + countRows(src.waters);
+}
+
 /**
  * 给定本地与远端状态，返回该做什么。conflict-pull 的含义是：
  * 两边都动过 —— 调用方必须先 makeConflictBackup 存下本机数据，再拉远端覆盖，绝不静默丢数据。
  */
-export function planSync({ localRev = 0, localChecksum, syncedChecksum, remote = null } = {}) {
+export function planSync({ localRev = 0, localChecksum, syncedChecksum, remote = null, localRecordCount } = {}) {
   const rev = normalizeRev(localRev);
   if (!usableRemote(remote)) {
     return { action: 'push', reason: '远端没有可用的快照，上传本机数据' };
   }
   const remoteRev = remote.rev;
-  // syncedChecksum 为 null/undefined = 从没成功同步过：本地一律按「有改动」处理
-  const dirty = syncedChecksum == null || localChecksum !== syncedChecksum;
+  // syncedChecksum 为 null/undefined = 从没成功同步过：本地一律按「有改动」处理 —— 除了一种例外：
+  // 本机一条业务记录都没有（新设备首次登录）时没有任何值得备份的本机数据，
+  // 按「有改动」判会白留一份空冲突副本并弹提示，所以按无改动走 pull。
+  const neverSynced = syncedChecksum == null;
+  const pristine = neverSynced && Number(localRecordCount) === 0;
+  const dirty = !pristine && (neverSynced || localChecksum !== syncedChecksum);
 
   if (remoteRev < rev) {
     return { action: 'push', reason: '远端版本落后于本机，上传本机数据纠正远端' };
   }
   if (remoteRev > rev) {
+    if (pristine) return { action: 'pull', reason: '本机没有业务数据且从没同步过，直接拉取远端' };
     return dirty
       ? { action: 'conflict-pull', reason: '本地与远端都有改动，先备份本机数据再拉取远端' }
       : { action: 'pull', reason: '本地无改动，远端版本更新，拉取远端' };
@@ -291,7 +393,8 @@ export function syncDigestOf(dump) {
   const src = dump && typeof dump === 'object' ? dump : {};
   const meta = { ...(src.meta && typeof src.meta === 'object' ? src.meta : {}) };
   for (const key of SYNC_VOLATILE_META_KEYS) delete meta[key];
-  const payload = { app: 'hms', ...src, meta };
+  // 剥密钥的时机在算校验和之前：锚点记的是「云端收到的那份」的指纹，密钥变了不算本机数据改动
+  const payload = stripSyncSecrets({ app: 'hms', ...src, meta });
   delete payload.exportedAt;
   return { payload, checksum: checksum(payload) };
 }
@@ -340,12 +443,15 @@ export async function runSyncOnce({ accountId, transport, token, now, storage } 
   const auth = typeof token === 'string' ? token.trim() : '';
   if (!auth) return failed('failed', 'unauthorized', '还没登录：请先用云账号登录，再同步');
 
-  // 1) 本机：内容 + 上次成功的锚点
+  // 1) 本机：内容 + 上次成功的锚点。localDump 留的是原始 dump（可能含密钥）：
+  //    digest 已经剥过密钥（进云端的是它），合并远端时还要用原始那份把本机设置取回来。
   let digest;
+  let localDump = null;
   let localRev = 0;
   let syncedChecksum = null;
   try {
-    digest = syncDigestOf(await storage.dumpAll());
+    localDump = await storage.dumpAll();
+    digest = syncDigestOf(localDump);
     const state = await storage.getSyncState();
     localRev = safeRev(state?.rev);
     syncedChecksum = typeof state?.checksum === 'string' && state.checksum ? state.checksum : null;
@@ -373,14 +479,22 @@ export async function runSyncOnce({ accountId, transport, token, now, storage } 
   });
   const usableRemote = remoteSnap && remoteSnap.rev > 0 ? remoteSnap : null;
 
-  // 3) 决策：全交给 planSync，本文件不重写一遍规则
-  const plan = planSync({ localRev, localChecksum: digest.checksum, syncedChecksum, remote: usableRemote });
+  // 3) 决策：全交给 planSync，本文件不重写一遍规则。localRecordCount 用来识别
+  //    「新设备首次登录（空库且从没同步过）」——那种情况下不留空冲突副本，直接 pull。
+  const plan = planSync({
+    localRev,
+    localChecksum: digest.checksum,
+    syncedChecksum,
+    remote: usableRemote,
+    localRecordCount: businessRecordCount(digest.payload),
+  });
 
   // 4a) 上传
   if (plan.action === 'push') {
     let pushed = null;
     try {
-      pushed = await transport.push({ token: auth, baseRev: localRev, payload: digest.payload });
+      // 上传前再剥一次：任何要走云端的 payload 都不许带上 settings 里的密钥
+      pushed = await transport.push({ token: auth, baseRev: localRev, payload: stripSyncSecrets(digest.payload) });
     } catch (error) {
       return failed('push', 'network', `上传失败：${reasonOf(error)}`, localRev);
     }
@@ -422,8 +536,10 @@ export async function runSyncOnce({ accountId, transport, token, now, storage } 
         return failed(plan.action, 'local-error', `本机数据备份成冲突副本失败（${reasonOf(error)}），已放弃拉取以免丢数据`, localRev);
       }
     }
+    // 应用到本机之前先合并：以远端为基准，但本机 settings 里的密钥原样留下（远端是被剥过的）
+    const merged = mergeRemoteIntoLocal({ remote: usableRemote.payload, local: localDump });
     try {
-      await storage.loadAll(usableRemote.payload, 'replace');
+      await storage.loadAll(merged, 'replace');
     } catch (error) {
       return failed(plan.action, 'local-error', `写入云端数据失败：${reasonOf(error)}`, localRev);
     }

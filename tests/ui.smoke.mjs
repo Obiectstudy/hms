@@ -318,7 +318,17 @@ function createIndexedDb() {
   }
 
   class FakeTransaction {
-    constructor(stores, mode) { this.stores = stores; this.mode = mode; this.pending = 0; this.settled = false; this.oncomplete = null; this.onerror = null; this.onabort = null; }
+    constructor(stores, mode) {
+      this.stores = stores; this.mode = mode; this.pending = 0; this.settled = false; this.oncomplete = null; this.onerror = null; this.onabort = null;
+    // 真实 IDB 里「一个请求都没发」的写事务照样会提交并触发 oncomplete；
+    // 不补这一条，零请求的写事务（db.loadAll 传空数组时就会出现）会永远挂着，
+    // 整套用例会被静默截断：进程 0 退出、连汇总都不打印。
+    setTimeout(() => {
+      if (this.pending !== 0 || this.settled) return;
+      this.settled = true;
+      setTimeout(() => { if (this.oncomplete) this.oncomplete(); }, 0);
+    }, 0);
+    }
     objectStore(name) {
       const store = this.stores[name];
       if (!store) throw new Error(`没有 store ${name}`);
@@ -3400,6 +3410,317 @@ export async function run() {
       scheduler.flush();
       await scheduler.whenIdle();
       assert.deepEqual(ran, ['tok-sched', 'tok-flush'], 'flush() 应该立刻同步一次');
+    });
+
+    // ---- 8. 自动同步接线（缺口 4）：写数据 → 防抖 5 秒 → 一次上传 ----
+    // 接线在 db.js 的写入口（onMutation）+ app.js 的 setupAutoSync；
+    // 静默窗口（应用快照 / 导入备份 / 清空数据）由 db.js 的 withMutedMutations 保证。
+
+    /** 可控假时钟 + 定时器队列：注入 createSyncScheduler 后 5 秒窗口能确定性推进。 */
+    const makeClock = () => {
+      let time = 0;
+      let seq = 0;
+      const tasks = new Map();
+      return {
+        now: () => time,
+        setTimer: (fn, ms) => {
+          seq += 1;
+          tasks.set(seq, { at: time + ms, fn });
+          return seq;
+        },
+        clearTimer: (id) => {
+          tasks.delete(id);
+        },
+        advance(ms) {
+          const target = time + ms;
+          for (;;) {
+            const due = [...tasks.entries()].filter((entry) => entry[1].at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+            if (!due) break;
+            tasks.delete(due[0]);
+            time = due[1].at;
+            due[1].fn();
+          }
+          time = target;
+        },
+        live: () => tasks.size,
+      };
+    };
+
+    await checkAsync('云同步：真实登录 + 真实上传的 payload 里搜不到 apiKey（其它设置仍在）', async () => {
+      const FAKE_UPLOAD_KEY = 'sk-live-DEADBEEF-0123456789';
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await store.saveSettings({ apiKey: FAKE_UPLOAD_KEY, model: 'qwen3-vl-plus', weightUnit: 'jin' });
+        await store.logWeight({ date: '2017-07-07', weightKg: 61 });
+
+        // 前置：本机 dump 里确实带着密钥（它只该留在本机）
+        const localDump = await db.dumpAll();
+        assert.ok(JSON.stringify(localDump).includes(FAKE_UPLOAD_KEY), '前置：本机数据里应该有密钥');
+        assert.deepEqual(localDump.meta.settings, { apiKey: FAKE_UPLOAD_KEY, model: 'qwen3-vl-plus', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', weightUnit: 'jin' });
+
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-secret', userId: 'u_secret' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        await loginWith(fake); // 登录成功立刻同步一次（这条链路会真的上传）
+
+        const pushes = fake.calls.filter((c) => c.name === 'push');
+        assert.equal(pushes.length, 1, '登录后应该上传一次，实际：' + JSON.stringify(fake.calls.map((c) => c.name)));
+        const sent = pushes[0].args.payload;
+        assert.equal(JSON.stringify(sent).includes(FAKE_UPLOAD_KEY), false, '上传内容里不许出现密钥串');
+        assert.equal('apiKey' in sent.meta.settings, false, 'settings.apiKey 必须被剥掉');
+        assert.deepEqual(sent.meta.settings, { model: 'qwen3-vl-plus', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', weightUnit: 'jin' }, '其它设置必须还在');
+        assert.ok(sent.weights.some((w) => w.date === '2017-07-07'), '业务数据不能跟着丢');
+
+        // 剥离是给「上云的那份」做的：本机设置与 getSyncPayload 都不受影响
+        assert.equal((await store.getSettings()).apiKey, FAKE_UPLOAD_KEY, '本机密钥不能被剥离动作改掉');
+        const payload = await store.getSyncPayload();
+        assert.equal(JSON.stringify(payload).includes(FAKE_UPLOAD_KEY), false, 'getSyncPayload 同样要剥过');
+        assert.equal(payload.meta.settings.model, 'qwen3-vl-plus');
+        assert.equal(payload.meta.settings.weightUnit, 'jin');
+      });
+    });
+
+    await checkAsync('自动同步：账号页装上调度器后，写一条体重就挂上 5 秒防抖（真实链路）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        delete globalThis.window.HMS.cloud;
+        try {
+          const fake = fakeTransport({
+            login: () => ({ ok: true, token: 'tok-auto-real', userId: 'u_auto' }),
+            pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+            push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+          });
+          await loginWith(fake); // 登录成功后账号页会装 window.HMS.cloud
+
+          const cloud = globalThis.window.HMS.cloud;
+          assert.ok(cloud && typeof cloud.schedule === 'function', '已配置且已登录时必须装上调度器');
+          assert.equal(cloud.pending(), false, '刚登录完不该有待触发的同步');
+
+          const callsBefore = fake.calls.length;
+          await store.logWeight({ date: '2012-12-01', weightKg: 62 });
+          assert.equal(cloud.pending(), true, '写一条体重后应该挂上防抖定时器');
+          assert.equal(fake.calls.length, callsBefore, '防抖窗口内不该立刻发请求');
+
+          cloud.cancel();
+          assert.equal(cloud.pending(), false, '取消后不该还挂着定时器');
+        } finally {
+          delete globalThis.window.HMS.cloud;
+        }
+      });
+    });
+
+    await checkAsync('自动同步：两次写入推进 5 秒只上传一次（假时钟）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        delete globalThis.window.HMS.cloud;
+        const clock = makeClock();
+        const ran = [];
+        // 顺序要紧：freshApp() 会跑 boot()，而 boot() 会重建 window.HMS —— 必须在它之后再装调度器
+        const app = await freshApp();
+        const scheduler = syncMod.createSyncScheduler({
+          delayMs: 5000,
+          now: clock.now,
+          setTimer: clock.setTimer,
+          clearTimer: clock.clearTimer,
+          resolveContext: () => ({ accountId: 'acc', transport: {}, token: 'tok-auto', storage: {} }),
+          runner: async (context) => {
+            ran.push(context.token);
+            return { ok: true, action: 'push', rev: 1, message: '已上传本机数据' };
+          },
+        });
+        globalThis.window.HMS.cloud = {
+          schedule: (reason) => scheduler.schedule(reason),
+          flush: () => scheduler.flush(),
+          cancel: () => scheduler.cancel(),
+          pending: () => scheduler.pending(),
+        };
+        const off = await app.setupAutoSync();
+        try {
+          await store.logWeight({ date: '2013-05-05', weightKg: 66 });
+          assert.equal(scheduler.pending(), true, '写数据后应挂上防抖');
+          assert.deepEqual(ran, [], '不到 5 秒不该上传');
+
+          clock.advance(3000);
+          await store.logWeight({ date: '2013-05-06', weightKg: 65 }); // 窗口内再写一次
+          clock.advance(4999);
+          assert.deepEqual(ran, [], '第二次写入会把 5 秒窗口重置');
+          assert.equal(scheduler.pending(), true);
+
+          clock.advance(1);
+          await scheduler.whenIdle();
+          assert.deepEqual(ran, ['tok-auto'], '连续写入只能合并成一次上传');
+          assert.equal(scheduler.pending(), false);
+        } finally {
+          off?.();
+          delete globalThis.window.HMS.cloud;
+        }
+      });
+    });
+
+    await checkAsync('自动同步：导入备份期间静默，导入之后照常通知', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        delete globalThis.window.HMS.cloud;
+        const scheduled = [];
+        // 先 import：boot() 会重建 window.HMS，调度器必须在这之后再挂上去
+        const app = await freshApp();
+        globalThis.window.HMS.cloud = {
+          schedule: (reason) => scheduled.push(reason),
+          flush() {},
+          cancel() {},
+          pending: () => false,
+        };
+        const off = await app.setupAutoSync();
+        try {
+          await store.importJSON({
+            meta: {
+              profile: { nickname: '导入的' },
+              settings: { apiKey: 'key-from-backup', model: '导入模型' },
+              mealTemplates: [{ id: '1', name: '导入套餐', slot: 'breakfast', items: [{ name: '鸡蛋', kcal: 90 }] }],
+            },
+            weights: [{ date: '2014-04-04', weightKg: 61 }],
+            meals: [],
+            exercises: [],
+            waters: [],
+          }, 'replace');
+
+          assert.equal(scheduled.length, 0, '导入备份期间不该触发自动同步');
+          const dump = await db.dumpAll();
+          assert.ok(dump.weights.some((w) => w.date === '2014-04-04'), '导入本身要真的落库');
+          assert.equal((await store.getSettings()).model, '导入模型', '设置跟着备份走');
+          assert.deepEqual((await store.getMealTemplates()).map((t) => t.name), ['导入套餐'], '套餐跟着备份走');
+
+          await store.logWeight({ date: '2014-04-05', weightKg: 60 });
+          assert.ok(scheduled.length >= 1 && scheduled.every((r) => r === 'local-change'), '导入结束后正常写入仍要通知：' + JSON.stringify(scheduled));
+        } finally {
+          off?.();
+          delete globalThis.window.HMS.cloud;
+        }
+      });
+    });
+
+    await checkAsync('自动同步：应用远端快照期间静默（拉下来不会立刻推回去）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await db.del('meta', 'conflictBackup');
+        delete globalThis.window.HMS.cloud;
+        const scheduled = [];
+        // 先 import：boot() 会重建 window.HMS，调度器必须在这之后再挂上去
+        const app = await freshApp();
+        globalThis.window.HMS.cloud = {
+          schedule: (reason) => scheduled.push(reason),
+          flush() {},
+          cancel() {},
+          pending: () => false,
+        };
+        const off = await app.setupAutoSync();
+        try {
+          const storage = {
+            dumpAll: db.dumpAll,
+            getSyncState: store.getSyncState,
+            setSyncState: store.setSyncState,
+            loadAll: db.loadAll,
+            getMeta: db.getMeta,
+            setMeta: db.setMeta,
+          };
+          const pushes = [];
+          await store.logWeight({ date: '2015-06-06', weightKg: 63 });
+          scheduled.length = 0; // 前面这条写入本来就该通知，这里只看同步链路本身
+
+          // 先推一次，让锚点和本机内容对齐（否则后面那次是 conflict-pull）
+          const pushed = await syncMod.runSyncOnce({
+            accountId: 'acc',
+            token: 'tok',
+            storage,
+            transport: {
+              async pull() { return { ok: true, rev: 0, savedAt: 0, payload: {} }; },
+              async push(args) { pushes.push(args); return { ok: true, rev: 1 }; },
+            },
+          });
+          assert.equal(pushed.action, 'push');
+          assert.equal(scheduled.length, 0, '上传写锚点期间也必须静默（锚点不算本机改动）');
+
+          const remotePayload = {
+            app: 'hms',
+            schemaVersion: 1,
+            meta: { settings: { model: '云端模型' }, profile: { nickname: '云端用户' } },
+            weights: [{ id: 1, date: '2010-10-10', weightKg: 58.5, createdAt: 1 }],
+            meals: [],
+            exercises: [],
+            waters: [],
+            photoCount: 0,
+          };
+          const pulled = await syncMod.runSyncOnce({
+            accountId: 'acc',
+            token: 'tok',
+            storage,
+            transport: {
+              async pull() { return { ok: true, rev: 7, savedAt: 1700000000000, payload: remotePayload }; },
+              async push(args) { pushes.push(args); return { ok: true, rev: 8 }; },
+            },
+          });
+          assert.equal(pulled.action, 'pull');
+          assert.equal(pushes.length, 1, '拉取不该顺带再上传一次');
+          assert.equal(scheduled.length, 0, '应用快照 + 写锚点期间必须静默，否则就是回环');
+
+          const dump = await db.dumpAll();
+          assert.ok(dump.weights.some((w) => w.date === '2010-10-10'), '云端数据要落到本机');
+          assert.ok(!dump.weights.some((w) => w.date === '2015-06-06'), '本机数据应被云端覆盖');
+          assert.equal(dump.meta.settings.model, '云端模型', '设置跟着快照恢复');
+          assert.equal((await store.getSyncState()).rev, 7, '锚点要记成 rev 7');
+
+          // 静默是有作用域的，不是永久关掉
+          await store.logWeight({ date: '2015-06-07', weightKg: 62 });
+          assert.ok(scheduled.length >= 1 && scheduled.every((r) => r === 'local-change'), '快照落地后正常写入仍要通知：' + JSON.stringify(scheduled));
+        } finally {
+          off?.();
+          delete globalThis.window.HMS.cloud;
+        }
+      });
+    });
+
+    await checkAsync('自动同步：未配置 / 未登录时零调用零请求（没有调度器就什么都不做）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        delete globalThis.window.HMS.cloud;
+        const app = await freshApp();
+        delete globalThis.window.HMS.cloud; // boot() 重建了 window.HMS，这里确保「未装调度器」的前置成立
+        const off = await app.setupAutoSync();
+        try {
+          const fetchBefore = fetchCalls;
+
+          // 未配置：账号页只给说明，不装调度器
+          const unconfigured = new dom.FakeNode('div');
+          await accountView.render(unconfigured, { baseUrl: '', transport: fakeTransport() });
+          assert.equal(globalThis.window.HMS.cloud, undefined, '未配置时不该有调度器');
+          await store.logWeight({ date: '2016-06-01', weightKg: 60 });
+          assert.equal(fetchCalls, fetchBefore, '未配置时写数据不许发请求');
+
+          // 已配置但没登录：同样不装调度器
+          await renderCloud(fakeTransport());
+          assert.equal(globalThis.window.HMS.cloud, undefined, '未登录时不该有调度器');
+          await store.logWeight({ date: '2016-06-02', weightKg: 59 });
+          assert.equal(fetchCalls, fetchBefore, '未登录时写数据不许发请求');
+
+          const dump = await db.dumpAll();
+          assert.ok(dump.weights.some((w) => w.date === '2016-06-02'), '本机写入不受影响');
+        } finally {
+          off?.();
+          delete globalThis.window.HMS.cloud;
+        }
+      });
     });
 
   } finally {

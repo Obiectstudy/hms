@@ -1243,6 +1243,8 @@ function testPurity() {
 const DB_EXPORTS = [
   'openDb', 'getAll', 'get', 'put', 'del', 'getOneByIndex', 'getAllByIndex',
   'deleteAll', 'getMeta', 'setMeta', 'dumpAll', 'loadAll', 'clearBusinessData',
+  // 自动同步的接线点（缺口 4）：注册 / 注销写入通知与静默窗口
+  'onMutation', 'withMutedMutations',
   // 多账号：库名可切换，否则账号切换对存储层无效
   'getDbName', 'setDbName', 'resetDbConnection', 'prepareDatabase',
 ];
@@ -1464,6 +1466,14 @@ function createFakeIndexedDb(options = {}) {
       this.oncomplete = null;
       this.onerror = null;
       this.onabort = null;
+    // 真实 IDB 里「一个请求都没发」的写事务照样会提交并触发 oncomplete；
+    // 不补这一条，零请求的写事务（db.loadAll 传空数组时就会出现）会永远挂着，
+    // 整套用例会被静默截断：进程 0 退出、连汇总都不打印。
+    setTimeout(() => {
+      if (this.pending !== 0 || this.settled) return;
+      this.settled = true;
+      setTimeout(() => { if (this.oncomplete) this.oncomplete(); }, 0);
+    }, 0);
     }
     objectStore(name) {
       const store = this.stores[name];
@@ -2499,6 +2509,8 @@ async function testAccountsRemoval() {
 const SYNC_EXPORTS = [
   'SNAPSHOT_VERSION', 'SYNC_STATE_KEY', 'checksum', 'buildSnapshot', 'parseSnapshot',
   'planSync', 'makeConflictBackup', 'isConflictBackup', 'createDebouncer', 'snapshotSummary',
+  // 缺口 1 / 缺口 3 新增的三个函数（SYNC_EXCLUDED_SETTINGS 是常量，单独断言）
+  'stripSyncSecrets', 'mergeRemoteIntoLocal', 'businessRecordCount',
 ];
 
 const SNAP_PAYLOAD = {
@@ -2889,6 +2901,345 @@ function testSyncPure() {
   });
 }
 
+// ---------- 云同步的密钥边界（缺口 1）与「空库首次登录」（缺口 3） ----------
+
+/** 假密钥：判据就是「剥离后的序列化结果里搜不到这个串」。 */
+const FAKE_API_KEY = 'sk-live-DEADBEEF-0123456789';
+
+/** runSyncOnce 的最小假存储：只记调用，不碰 IDB（决策与剥离/合并都不需要真库）。 */
+function fakeSyncStorage(dump, state) {
+  const log = { loadAll: [], setMeta: [], setSyncState: [], dumped: 0 };
+  return {
+    log,
+    async dumpAll() {
+      log.dumped += 1;
+      return dump;
+    },
+    async getSyncState() {
+      return state;
+    },
+    async setSyncState(next) {
+      log.setSyncState.push(next);
+    },
+    async loadAll(payload, mode) {
+      log.loadAll.push({ payload, mode });
+    },
+    async getMeta() {
+      return null;
+    },
+    async setMeta(key, value) {
+      log.setMeta.push([key, value]);
+    },
+  };
+}
+
+async function testSyncSecrets() {
+  check('sync/pure: 密钥边界的三个导出是同一份实现（pure.js 只是再导出，不存在两份漂移）', () => {
+    eq(pure.stripSyncSecrets, sync.stripSyncSecrets);
+    eq(pure.mergeRemoteIntoLocal, sync.mergeRemoteIntoLocal);
+    eq(pure.SYNC_EXCLUDED_SETTINGS, sync.SYNC_EXCLUDED_SETTINGS);
+    deep(sync.SYNC_EXCLUDED_SETTINGS, ['apiKey']);
+  });
+
+  check('stripSyncSecrets: 删掉顶层 settings.apiKey，其它设置键原样保留', () => {
+    const out = pure.stripSyncSecrets({
+      settings: { apiKey: FAKE_API_KEY, model: 'qwen3-vl-plus', weightUnit: 'jin' },
+      weights: [],
+    });
+    eq('apiKey' in out.settings, false, 'apiKey 必须消失');
+    eq(out.settings.model, 'qwen3-vl-plus');
+    eq(out.settings.weightUnit, 'jin');
+  });
+
+  check('stripSyncSecrets: 快照真实形状（meta.settings）里的密钥也删掉，其它 meta 不动', () => {
+    const dump = {
+      app: 'hms',
+      meta: {
+        profile: { nickname: '小林' },
+        settings: { apiKey: FAKE_API_KEY, model: 'm', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', weightUnit: 'kg' },
+        mealTemplates: [{ id: '1', name: '早餐' }],
+      },
+      weights: [{ date: '2026-01-01', weightKg: 70 }],
+    };
+    const out = pure.stripSyncSecrets(dump);
+    eq('apiKey' in out.meta.settings, false, 'meta.settings.apiKey 必须消失');
+    eq(out.meta.settings.model, 'm');
+    eq(out.meta.settings.baseUrl, 'https://dashscope.aliyuncs.com/compatible-mode/v1');
+    eq(out.meta.settings.weightUnit, 'kg');
+    deep(out.meta.profile, { nickname: '小林' });
+    deep(out.meta.mealTemplates, [{ id: '1', name: '早餐' }]);
+    eq(out.app, 'hms');
+    eq(out.weights[0].weightKg, 70);
+  });
+
+  check('stripSyncSecrets: 返回深层新对象，改返回值（含嵌套）都不影响入参', () => {
+    const settings = { apiKey: FAKE_API_KEY, model: 'm' };
+    const templates = [{ id: '1', name: '早餐', items: [{ name: '鸡蛋', kcal: 90 }] }];
+    const weights = [{ date: '2026-01-01', weightKg: 70 }];
+    const dump = { meta: { settings, mealTemplates: templates }, weights };
+    const out = pure.stripSyncSecrets(dump);
+
+    ok(out !== dump && out.meta !== dump.meta && out.meta.settings !== settings, '每一层都必须是新对象');
+    ok(out.meta.mealTemplates !== templates && out.meta.mealTemplates[0] !== templates[0], '数组与数组项也要新对象');
+    ok(out.weights[0] !== weights[0], '业务记录也要新对象');
+
+    out.meta.settings.model = '改了';
+    out.meta.mealTemplates[0].name = '改了';
+    out.meta.mealTemplates[0].items[0].kcal = 1;
+    out.weights.push({ date: '2026-01-02' });
+
+    eq(settings.model, 'm', '改返回值不能改到入参');
+    eq(templates[0].name, '早餐');
+    eq(templates[0].items[0].kcal, 90);
+    eq(weights.length, 1);
+    eq('apiKey' in settings, true, '剥离只发生在返回的副本上，入参一个键都不许少');
+  });
+
+  check('stripSyncSecrets: settings 缺失 / null / 非对象都不抛；非对象入参返回安全空对象', () => {
+    for (const payload of [{}, { meta: {} }, { settings: null }, { settings: 'oops' }, { meta: null }, { meta: { settings: 42 } }, { meta: { settings: [] } }, { meta: { settings: null } }]) {
+      const out = pure.stripSyncSecrets(payload);
+      ok(out && typeof out === 'object' && !Array.isArray(out), '应返回对象：' + JSON.stringify(payload));
+    }
+    deep(pure.stripSyncSecrets(null), {});
+    deep(pure.stripSyncSecrets(undefined), {});
+    deep(pure.stripSyncSecrets('x'), {});
+    deep(pure.stripSyncSecrets([]), {});
+  });
+
+  check('stripSyncSecrets: 剥离后的序列化结果里搜不到密钥串，业务数据一个不少', () => {
+    const dump = {
+      meta: { settings: { apiKey: FAKE_API_KEY, model: 'm' } },
+      weights: [{ date: '2026-01-01', weightKg: 70 }],
+      meals: [{ date: '2026-01-01', slot: 'lunch', items: [{ name: '米饭', kcal: 232 }] }],
+    };
+    const before = JSON.stringify(dump);
+    const after = JSON.stringify(pure.stripSyncSecrets(dump));
+    ok(before.includes(FAKE_API_KEY), '前置：原始 dump 里确实有密钥');
+    eq(after.includes(FAKE_API_KEY), false, '剥离后不许再出现密钥串');
+    ok(after.includes('2026-01-01') && after.includes('米饭'), '业务数据不能跟着丢');
+  });
+
+  check('mergeRemoteIntoLocal: 以远端为基准，远端设置覆盖本机', () => {
+    const merged = pure.mergeRemoteIntoLocal({
+      remote: { meta: { settings: { model: '远端模型', weightUnit: 'jin' } }, weights: [{ date: 'R' }] },
+      local: { meta: { settings: { model: '本机模型', weightUnit: 'kg', baseUrl: '本机地址' }, profile: { nickname: '本机' } }, weights: [{ date: 'L' }] },
+    });
+    eq(merged.meta.settings.model, '远端模型');
+    eq(merged.meta.settings.weightUnit, 'jin');
+    eq(merged.meta.settings.baseUrl, undefined, '远端没表态的键不该由本机补上（设置以远端为准）');
+    eq(merged.meta.profile, undefined, '本机没被覆盖的其它 meta 不该混进来');
+    deep(merged.weights.map((w) => w.date), ['R'], '业务数据以远端为准');
+  });
+
+  check('mergeRemoteIntoLocal: 本机的 apiKey 原样保留（远端是被剥过的那份）', () => {
+    const merged = pure.mergeRemoteIntoLocal({
+      remote: { meta: { settings: { model: 'm', baseUrl: 'https://x/v1', weightUnit: 'kg' } } },
+      local: { meta: { settings: { apiKey: FAKE_API_KEY, model: '旧模型', baseUrl: '旧地址', weightUnit: 'jin' } } },
+    });
+    eq(merged.meta.settings.apiKey, FAKE_API_KEY, '本机密钥必须留下');
+    eq(merged.meta.settings.model, 'm', '非密钥键仍然以远端为准');
+    eq(merged.meta.settings.weightUnit, 'kg');
+  });
+
+  check('mergeRemoteIntoLocal: 远端带来的排除键一律丢弃（老版本传上去的密钥不会传回本机）', () => {
+    const merged = pure.mergeRemoteIntoLocal({
+      remote: { meta: { settings: { apiKey: '云端那份密钥', model: 'm' } } },
+      local: { meta: { settings: { model: '本机' } } },
+    });
+    eq('apiKey' in merged.meta.settings, false, '远端密钥不许进本机');
+    eq(merged.meta.settings.model, 'm');
+  });
+
+  check('mergeRemoteIntoLocal: 远端没有 settings（或只有空对象）时本机设置不丢', () => {
+    const local = { meta: { settings: { apiKey: FAKE_API_KEY, model: '本机模型', baseUrl: '本机地址', weightUnit: 'jin' } } };
+
+    const missing = pure.mergeRemoteIntoLocal({ remote: { meta: { profile: { nickname: '云端用户' } } }, local });
+    deep(missing.meta.settings, { apiKey: FAKE_API_KEY, model: '本机模型', baseUrl: '本机地址', weightUnit: 'jin' }, '远端没带设置 → 本机设置整份保留');
+    eq(missing.meta.profile.nickname, '云端用户');
+
+    const empty = pure.mergeRemoteIntoLocal({ remote: { meta: { settings: {} } }, local });
+    eq(empty.meta.settings.model, '本机模型', '远端 settings 为空对象 = 没表态，本机设置照旧');
+    eq(empty.meta.settings.apiKey, FAKE_API_KEY);
+  });
+
+  check('mergeRemoteIntoLocal: 非法输入一律不抛（两边都不是对象 → 安全空对象）', () => {
+    deep(pure.mergeRemoteIntoLocal(), {});
+    deep(pure.mergeRemoteIntoLocal({}), {});
+    deep(pure.mergeRemoteIntoLocal({ remote: null, local: null }), {});
+    deep(pure.mergeRemoteIntoLocal({ remote: 'x', local: 42 }), {});
+    deep(pure.mergeRemoteIntoLocal({ remote: [], local: [] }), {});
+    const out = pure.mergeRemoteIntoLocal({ remote: 'x', local: { settings: { apiKey: FAKE_API_KEY } } });
+    eq(out.settings.apiKey, FAKE_API_KEY, '远端整份不可用时也不能把本机的密钥弄丢');
+  });
+
+  check('mergeRemoteIntoLocal: 结果与两个入参互不共享引用', () => {
+    const remote = { meta: { settings: { model: 'm' } } };
+    const local = { meta: { settings: { apiKey: FAKE_API_KEY } } };
+    const merged = pure.mergeRemoteIntoLocal({ remote, local });
+    ok(merged !== remote && merged.meta !== remote.meta && merged.meta.settings !== remote.meta.settings);
+    merged.meta.settings.model = '改了';
+    eq(remote.meta.settings.model, 'm');
+    eq(local.meta.settings.apiKey, FAKE_API_KEY);
+  });
+
+  // ----- 缺口 3：空库 + 从没同步过 = 新设备首次登录 -----
+
+  check('businessRecordCount: 四张明细表条数合计（照片与 meta 不计入）', () => {
+    eq(sync.businessRecordCount({}), 0);
+    eq(sync.businessRecordCount({ meta: { settings: { apiKey: FAKE_API_KEY } }, photoCount: 9 }), 0, '只有 meta / photoCount 也算空库');
+    eq(sync.businessRecordCount({ weights: [1], meals: [1, 2], exercises: [], waters: [1], photoCount: 9 }), 4);
+    eq(sync.businessRecordCount(null), 0);
+  });
+
+  check('planSync: 空库 + 从没同步过 + 远端更新 → pull（不留空的冲突副本）', () => {
+    const r = sync.planSync({ localRev: 0, localChecksum: 'e3b0c442', syncedChecksum: null, remote: { rev: 5 }, localRecordCount: 0 });
+    eq(r.action, 'pull');
+    eq(r.reason, '本机没有业务数据且从没同步过，直接拉取远端');
+  });
+
+  check('planSync: 空库 + 从没同步过（版本一致 → none；远端没有快照 → push）', () => {
+    eq(sync.planSync({ localRev: 0, localChecksum: 'x', syncedChecksum: null, remote: { rev: 0 }, localRecordCount: 0 }).action, 'none');
+    eq(sync.planSync({ localRev: 0, localChecksum: 'x', syncedChecksum: null, remote: null, localRecordCount: 0 }).action, 'push');
+  });
+
+  check('planSync: 本地有业务记录、或同步过一次，规则照旧（例外没被放宽）', () => {
+    eq(sync.planSync({ localRev: 0, localChecksum: 'x', syncedChecksum: null, remote: { rev: 5 }, localRecordCount: 1 }).action, 'conflict-pull');
+    eq(sync.planSync({ localRev: 0, localChecksum: 'x', syncedChecksum: null, remote: { rev: 5 } }).action, 'conflict-pull', '不传记录数 = 旧调用方，行为必须不变');
+    eq(sync.planSync({ localRev: 2, localChecksum: 'y', syncedChecksum: 'x', remote: { rev: 5 }, localRecordCount: 0 }).action, 'conflict-pull', '空库但同步过一次，再有改动仍先留副本');
+    eq(sync.planSync({ localRev: 2, localChecksum: 'x', syncedChecksum: 'x', remote: { rev: 5 }, localRecordCount: 0 }).action, 'pull');
+  });
+
+  await checkAsync('runSyncOnce: 空库 + 从没同步过 → pull，setMeta(conflictBackup) 一次都没被调用', async () => {
+    const dump = {
+      app: 'hms',
+      schemaVersion: 1,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      meta: { settings: { apiKey: FAKE_API_KEY, model: '本机模型' } },
+      weights: [],
+      meals: [],
+      exercises: [],
+      waters: [],
+      photoCount: 0,
+    };
+    const storage = fakeSyncStorage(dump, { rev: 0, savedAt: null, checksum: null });
+    const remotePayload = {
+      app: 'hms',
+      schemaVersion: 1,
+      meta: { settings: { model: '云端模型' }, profile: { nickname: '云端用户' } },
+      weights: [{ id: 1, date: '2020-01-01', weightKg: 60, createdAt: 1 }],
+      meals: [],
+      exercises: [],
+      waters: [],
+      photoCount: 0,
+    };
+    const result = await sync.runSyncOnce({
+      accountId: 'acc_1',
+      token: 'tok',
+      storage,
+      transport: {
+        async pull() {
+          return { ok: true, rev: 5, savedAt: 1700000000000, payload: remotePayload };
+        },
+        async push() {
+          throw new Error('空库首次登录不该走上传');
+        },
+      },
+    });
+
+    eq(result.ok, true);
+    eq(result.action, 'pull');
+    eq(result.rev, 5);
+    eq(storage.log.setMeta.length, 0, '不该写任何 meta（冲突副本就是走这里）');
+    eq(storage.log.loadAll.length, 1);
+    eq(storage.log.loadAll[0].mode, 'replace');
+    deep(storage.log.loadAll[0].payload.weights.map((w) => w.date), ['2020-01-01'], '云端数据要落到本机');
+    eq(storage.log.loadAll[0].payload.meta.settings.model, '云端模型', '远端设置覆盖本机');
+    eq(storage.log.loadAll[0].payload.meta.settings.apiKey, FAKE_API_KEY, '本机密钥要跟着落库数据一起带上');
+    eq(storage.log.setSyncState.length, 1);
+    eq(storage.log.setSyncState[0].rev, 5);
+    eq(storage.log.setSyncState[0].savedAt, 1700000000000);
+  });
+
+  await checkAsync('runSyncOnce: 本机有记录 + 从没同步过 → 仍然 conflict-pull 且副本里没有密钥', async () => {
+    const dump = {
+      app: 'hms',
+      schemaVersion: 1,
+      meta: { settings: { apiKey: FAKE_API_KEY, model: '本机模型' } },
+      weights: [{ id: 1, date: '2026-05-05', weightKg: 70, createdAt: 1 }],
+      meals: [],
+      exercises: [],
+      waters: [],
+      photoCount: 0,
+    };
+    const storage = fakeSyncStorage(dump, { rev: 0, savedAt: null, checksum: null });
+    const result = await sync.runSyncOnce({
+      accountId: 'acc_1',
+      token: 'tok',
+      storage,
+      transport: {
+        async pull() {
+          return { ok: true, rev: 5, savedAt: 1700000000000, payload: { app: 'hms', meta: {}, weights: [{ id: 9, date: '2020-01-01', weightKg: 60 }], meals: [], exercises: [], waters: [] } };
+        },
+        async push() {
+          throw new Error('conflict-pull 不该走上传');
+        },
+      },
+    });
+
+    eq(result.action, 'conflict-pull');
+    const backups = storage.log.setMeta.filter(([key]) => key === sync.CONFLICT_BACKUP_KEY);
+    eq(backups.length, 1, '本机有数据时必须留下副本');
+    ok(sync.isConflictBackup(backups[0][1]), '副本形状要对');
+    ok(backups[0][1].payload.weights.some((w) => w.date === '2026-05-05'), '副本里是被覆盖掉的本机数据');
+    eq(JSON.stringify(backups[0][1].payload).includes(FAKE_API_KEY), false, '副本里同样不许出现密钥串');
+  });
+
+  await checkAsync('runSyncOnce: 上传的 payload 里搜不到密钥串，锚点也按剥离后的内容算', async () => {
+    const dump = {
+      app: 'hms',
+      schemaVersion: 1,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      meta: {
+        settings: { apiKey: FAKE_API_KEY, model: 'qwen3-vl-plus', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', weightUnit: 'jin' },
+        profile: { nickname: '小林' },
+      },
+      weights: [{ id: 1, date: '2026-01-01', weightKg: 70, createdAt: 1 }],
+      meals: [],
+      exercises: [],
+      waters: [],
+      photoCount: 3,
+    };
+    const storage = fakeSyncStorage(dump, { rev: 0, savedAt: null, checksum: null });
+    const pushed = [];
+    const result = await sync.runSyncOnce({
+      accountId: 'acc_1',
+      token: 'tok',
+      storage,
+      transport: {
+        async pull() {
+          return { ok: true, rev: 0, savedAt: 0, payload: {} };
+        },
+        async push(args) {
+          pushed.push(args);
+          return { ok: true, rev: 1 };
+        },
+      },
+    });
+
+    eq(result.action, 'push');
+    eq(pushed.length, 1);
+    const json = JSON.stringify(pushed[0].payload);
+    eq(json.includes(FAKE_API_KEY), false, '上传内容里不许出现密钥串');
+    eq('apiKey' in pushed[0].payload.meta.settings, false);
+    eq(pushed[0].payload.meta.settings.model, 'qwen3-vl-plus', '其它设置必须还在');
+    eq(pushed[0].payload.meta.settings.baseUrl, 'https://dashscope.aliyuncs.com/compatible-mode/v1');
+    eq(pushed[0].payload.meta.settings.weightUnit, 'jin');
+    eq(pushed[0].payload.weights[0].weightKg, 70, '业务数据不能跟着丢');
+    eq(pushed[0].payload.photoCount, 3);
+    eq(storage.log.setSyncState[0].checksum, sync.checksum(pushed[0].payload), '锚点记的是「云端收到的那份」');
+  });
+}
+
 // ---------- store 的同步锚点与数据体（最小假 IDB，跑完清 db.js 单例） ----------
 
 async function testSyncStore() {
@@ -2968,6 +3319,206 @@ async function testSyncStore() {
   });
 }
 
+// ---------- 写入通知 / 静默窗口（缺口 4 的接线点）与导入恢复范围（缺口 2） ----------
+
+async function testMutationHooks() {
+  await checkAsync('db: onMutation 在写入落库后触发，注销后不再触发', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const seen = [];
+      const off = db.onMutation((info) => seen.push(info));
+      try {
+        await store.logWeight({ date: '2027-01-01', weightKg: 70 });
+        eq(seen.length, 1, '写一条体重应触发一次');
+        deep(seen[0].stores, ['weights']);
+        await db.setMeta('profile', { nickname: 'x' });
+        eq(seen.length, 2, 'meta 写入同样算本机改动');
+        deep(seen[1].stores, ['meta']);
+        off();
+        await store.logWeight({ date: '2027-01-02', weightKg: 71 });
+        eq(seen.length, 2, '注销后不该再有通知');
+      } finally {
+        off();
+      }
+    });
+  });
+
+  await checkAsync('db: withMutedMutations 期间静默、支持嵌套，结束后恢复触发', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const seen = [];
+      const off = db.onMutation(() => seen.push(1));
+      try {
+        await db.withMutedMutations(async () => {
+          await store.logWeight({ date: '2027-02-01', weightKg: 70 });
+          eq(seen.length, 0, '静默期间不该触发');
+          await db.withMutedMutations(async () => {
+            await store.logWeight({ date: '2027-02-02', weightKg: 71 });
+          });
+          eq(seen.length, 0, '内层结束后外层仍然静默（嵌套计数）');
+          await db.setMeta('profile', { nickname: 'y' });
+          eq(seen.length, 0);
+        });
+        eq(seen.length, 0, '静默块结束不该补发通知');
+        await store.logWeight({ date: '2027-02-03', weightKg: 72 });
+        eq(seen.length, 1, '静默结束后恢复正常触发');
+      } finally {
+        off();
+      }
+    });
+  });
+
+  await checkAsync('db: withMutedMutations 异常安全（抛错后静默计数也要放回去）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const seen = [];
+      const off = db.onMutation(() => seen.push(1));
+      try {
+        let msg = '';
+        try {
+          await db.withMutedMutations(async () => {
+            await store.logWeight({ date: '2027-03-01', weightKg: 70 });
+            throw new Error('静默块里炸了');
+          });
+        } catch (err) {
+          msg = err.message;
+        }
+        eq(msg, '静默块里炸了', '异常必须原样抛出');
+        await store.logWeight({ date: '2027-03-02', weightKg: 71 });
+        eq(seen.length, 1, '异常路径后仍要恢复触发（finally 放回计数）');
+      } finally {
+        off();
+      }
+    });
+  });
+
+  await checkAsync('db: handler 抛错 / 返回 rejected promise 都不影响写入，其它 handler 照常收到', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const okStores = [];
+      const off1 = db.onMutation(() => {
+        throw new Error('handler 同步炸了');
+      });
+      const off2 = db.onMutation(() => Promise.reject(new Error('handler 异步炸了')));
+      const off3 = db.onMutation((info) => okStores.push(info.stores.join(',')));
+      try {
+        await store.logWeight({ date: '2027-04-01', weightKg: 68 });
+        deep(okStores, ['weights'], '一个 handler 炸掉不该挡住其它 handler');
+        const dump = await db.dumpAll();
+        ok(dump.weights.some((w) => w.date === '2027-04-01'), '写入必须真的落库');
+      } finally {
+        off1();
+        off2();
+        off3();
+      }
+    });
+  });
+
+  await checkAsync('db: 同步锚点 / 导出时间 / 照片都不算本机改动（否则自动同步自我循环）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const seen = [];
+      const off = db.onMutation((info) => seen.push(info.stores.join(',')));
+      try {
+        await db.setMeta('syncState', { rev: 1, savedAt: 1, checksum: 'aa' });
+        await db.setMeta('lastExportedAt', Date.now());
+        await db.del('meta', 'syncState');
+        await db.put('photos', { id: 'p1', blob: 'fake-blob', mime: 'image/jpeg', createdAt: 1 });
+        eq(seen.length, 0, '锚点 / 导出时间 / 照片都不该通知');
+        await db.setMeta('profile', { nickname: 'z' });
+        eq(seen.length, 1, '真改动仍然照常通知');
+      } finally {
+        off();
+      }
+    });
+  });
+
+  await checkAsync('db: 导入备份 / 应用云端快照（loadAll）与清空数据期间都静默', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const seen = [];
+      const off = db.onMutation(() => seen.push(1));
+      try {
+        await db.loadAll({
+          meta: {
+            profile: { nickname: '导入的' },
+            settings: { apiKey: 'key-from-backup', model: 'backup-model' },
+            mealTemplates: [{ id: '1', name: '早餐', slot: 'breakfast', items: [{ name: '鸡蛋', kcal: 90 }] }],
+          },
+          weights: [{ date: '2026-06-01', weightKg: 66 }],
+        }, 'replace');
+        eq(seen.length, 0, 'loadAll 期间必须静默（否则刚拉下来就推回去）');
+        await db.clearBusinessData();
+        eq(seen.length, 0, '清空数据期间必须静默');
+        await store.logWeight({ date: '2026-06-02', weightKg: 67 });
+        eq(seen.length, 1, '静默结束后恢复正常触发');
+      } finally {
+        off();
+      }
+    });
+  });
+
+  await checkAsync('db: 导入 / 拉取能恢复 meta.settings 与 meta.mealTemplates（密钥按边界处理）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.saveSettings({ apiKey: 'local-key-keep', model: 'local-model', weightUnit: 'kg' });
+      const backup = {
+        meta: {
+          settings: { apiKey: 'key-from-backup', model: 'backup-model', baseUrl: 'https://backup.example/v1', weightUnit: 'jin' },
+          mealTemplates: [
+            { id: '1', name: '减脂早餐', slot: 'breakfast', items: [{ name: '鸡蛋', kcal: 90 }] },
+            { id: '2', name: '整日套餐', kind: 'day', meals: [{ slot: 'lunch', items: [{ name: '米饭', kcal: 232 }] }, { slot: 'dinner', items: [{ name: '鸡胸', kcal: 165 }] }] },
+          ],
+        },
+        weights: [{ date: '2026-06-01', weightKg: 66 }],
+      };
+
+      // merge：已有设置保留（「只补缺失」的老语义），套餐是补进来的
+      await db.loadAll(backup, 'merge');
+      let settings = await store.getSettings();
+      eq(settings.model, 'local-model', 'merge 不该覆盖本机已有设置');
+
+      // replace（云端拉取走的就是它）：设置 / 套餐都跟着备份数据走，但密钥只认本机
+      await db.loadAll(backup, 'replace');
+      settings = await store.getSettings();
+      eq(settings.model, 'backup-model', '模型名要跟着备份/云端走');
+      eq(settings.baseUrl, 'https://backup.example/v1');
+      eq(settings.weightUnit, 'jin', '单位偏好要跟着备份/云端走');
+      eq(settings.apiKey, 'local-key-keep', '备份里的密钥不许装进来，本机密钥不许被冲掉');
+
+      const templates = await store.getMealTemplates();
+      deep(templates.map((t) => t.name), ['减脂早餐', '整日套餐'], '常吃套餐要跟着走');
+      eq(templates[1].kind, 'day');
+      eq(templates[1].meals.length, 2);
+      eq(templates[0].items[0].name, '鸡蛋');
+    });
+  });
+
+  await checkAsync('db: 远端 settings 里的 apiKey 为空值时也不覆盖本机密钥', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.saveSettings({ apiKey: 'local-key-keep', model: 'local-model' });
+      await db.loadAll({ meta: { settings: { apiKey: '', model: 'remote-model', weightUnit: 'jin' } }, weights: [] }, 'replace');
+      const settings = await store.getSettings();
+      eq(settings.apiKey, 'local-key-keep', '空值同样不许覆盖本机密钥');
+      eq(settings.model, 'remote-model', '非密钥键仍然跟着远端走');
+      eq(settings.weightUnit, 'jin');
+    });
+  });
+
+  await checkAsync('db: 照片不进快照（只留 photoCount），导入 / 拉取也不会删本机照片', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await db.put('photos', { id: 'p1', blob: 'fake-blob', mime: 'image/jpeg', createdAt: 1 });
+      const dump = await db.dumpAll();
+      eq(dump.photoCount, 1);
+      eq('photos' in dump, false, '照片本体不进 JSON');
+      await db.loadAll({ meta: {}, weights: [{ date: '2026-07-01', weightKg: 70 }] }, 'replace');
+      eq((await db.dumpAll()).photoCount, 1, '导入 / 拉取不该删照片');
+    });
+  });
+}
+
 // ---------- 入口 ----------
 
 export async function run() {
@@ -2988,6 +3539,7 @@ export async function run() {
   testRoundTrip();
   testPurity();
   testSyncPure();
+  testSyncSecrets();
   await testModules();
   // 放最后：它会临时注入假 indexedDB 并清理，不干扰上面的「IDB 不可用」断言
   await testStoreSettings();
@@ -2996,6 +3548,8 @@ export async function run() {
   await testStoreExerciseLog();
   await testStoreExportStatus();
   await testSyncStore();
+  // 写入通知 / 静默窗口 + 导入恢复范围：同样用最小假 IDB，跑完清单例
+  await testMutationHooks();
   // 账号用例放最后：注入持久化假 IDB + 假 localStorage，每段都在 finally 里把单例与全局还原
   await testAccountsContract();
   await testAccountsCatalog();

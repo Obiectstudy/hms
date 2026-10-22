@@ -513,11 +513,32 @@ function resolveDatabaseUrl(env) {
   return url.trim();
 }
 
+/**
+ * 连接配置：优先 DATABASE_URL（连接串），否则回落到 CloudBase 注入的 libpq 风格变量。
+ * 官方「服务端直连」示例用的就是 process.env.PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE，
+ * 所以两种都认；两者都没有才抛错。
+ */
+function resolveDatabaseConfig(env) {
+  const source = isRecord(env) ? env : process.env;
+  const url = source ? source.DATABASE_URL : undefined;
+  if (typeof url === 'string' && url.trim()) return { connectionString: url.trim() };
+  const text = (value) => (typeof value === 'string' && value.trim() ? value.trim() : '');
+  const host = text(source && source.PGHOST);
+  const user = text(source && source.PGUSER);
+  const database = text(source && source.PGDATABASE);
+  const password = source ? source.PGPASSWORD : undefined;
+  if (host && user && database && typeof password === 'string') {
+    const port = Number(source.PGPORT);
+    return { host: host, port: port > 0 ? port : 5432, user: user, password: password, database: database };
+  }
+  throw new Error('缺少 DATABASE_URL 或 PGHOST/PGUSER/PGPASSWORD/PGDATABASE 环境变量');
+}
+
 /** 真实连接唯一入口：延迟 require('pg')，没有依赖 / 没有环境变量时只在这里失败。 */
 function openDatabase(options) {
   const opts = options || {};
   if (poolSingleton && !opts.fresh) return poolSingleton;
-  const connectionString = resolveDatabaseUrl(opts.env);
+  const config = resolveDatabaseConfig(opts.env);
   let pg;
   try {
     pg = require('pg');
@@ -525,7 +546,7 @@ function openDatabase(options) {
     throw new Error('未安装 pg 依赖，请重新上传并勾选「云端安装依赖」');
   }
   const pool = new pg.Pool({
-    connectionString: connectionString,
+    ...config,
     max: Number(opts.max) > 0 ? Number(opts.max) : 2,
     idleTimeoutMillis: 10000,
     connectionTimeoutMillis: 8000,
