@@ -1,7 +1,7 @@
 {
     "versionCode":  9,
     "versionName":  "1.7.0",
-    "apkUrl":  "https://obiectstudy.github.io/hms/dist/HMS-latest.apk",
+    "apkUrl": "https://hms-d4gnh63iw73f09792-1513758162.tcloudbaseapp.com/HMS-latest.apk",
     "sha256":  "24c88afed3cb9aef279218ccba3a965dfd2a7506de40dfb0e8a41f403c0872c0",
     "size":  1786238,
     "notes":  "新增多账号与云同步：可在设置→账号里注册云账号，换设备登录同一账号即可复原数据（含常吃/整日套餐与设置）；API Key 不上传；同步走腾讯云开发网关，不需要数据库密码。另含 iOS 适配（Safari 添加到主屏幕）。",

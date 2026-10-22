@@ -44,10 +44,21 @@ $hash = (Get-FileHash $latest -Algorithm SHA256).Hash.ToLower()
 $size = (Get-Item $latest).Length
 Write-Output "sha256=$hash size=$size"
 
+# 下载源优先用 CloudBase 静态托管（国内 CDN 直连）：实测 1400 KB/s，GitHub Pages 只有 5.5 KB/s。
+# 家里人没装梯子也能几秒下完；GitHub 那份 dist/ 仍照旧提交，作为备用源。
+$cdnUrl = "https://hms-d4gnh63iw73f09792-1513758162.tcloudbaseapp.com/HMS-latest.apk"
+& tcb hosting deploy $latest /HMS-latest.apk -e hms-d4gnh63iw73f09792 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) {
+  Write-Output "uploaded to CloudBase static hosting"
+} else {
+  Write-Output "WARN: CloudBase upload failed; falling back to GitHub Pages url"
+  $cdnUrl = "https://obiectstudy.github.io/hms/dist/HMS-latest.apk"
+}
+
 $payload = [ordered]@{
   versionCode = $code
   versionName = $name
-  apkUrl      = "https://obiectstudy.github.io/hms/dist/HMS-latest.apk"
+  apkUrl      = $cdnUrl
   sha256      = $hash
   size        = $size
   notes       = $Notes
