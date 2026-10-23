@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$Notes = "",
   [string]$NotesFile = "release-notes.txt",
   [switch]$NoCommit
@@ -67,6 +67,12 @@ $payload = [ordered]@{
 $json = $payload | ConvertTo-Json
 [IO.File]::WriteAllText((Join-Path $root "version.json"), $json, (New-Object System.Text.UTF8Encoding($false)))
 Write-Output "version.json written"
+
+# 清单也要传到静态托管站：前端在 CloudBase 域名下时按同源读 version.json，
+# 只传 APK 不传清单会让那边一直看到旧版本号。（脚本必须存成 UTF-8 with BOM，
+# 否则 PowerShell 5.1 会把中文按 GBK 解码、吞掉赋值语句——踩过一次。）
+& tcb hosting deploy (Join-Path $root "version.json") /version.json -e hms-d4gnh63iw73f09792 2>&1 | Out-Null
+if ($LASTEXITCODE -eq 0) { Write-Output "manifest uploaded to CloudBase" } else { Write-Output "WARN: manifest upload failed" }
 
 if (-not $NoCommit) {
   git add version.json dist/HMS-latest.apk
