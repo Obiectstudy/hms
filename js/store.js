@@ -372,10 +372,25 @@ export async function getWater(date) {
   return row ? Math.max(0, Math.round(num(row.ml))) : 0;
 }
 
-/** 归零即删除该日记录，保证「撤销到 0」不会留下一条 0ml 的脏记录。 */
-export async function setWater(date, ml) {
-  const targetDate = todayOf(date);
-  const value = Math.max(0, Math.round(num(ml)));
+/**
+ * 同一日期的饮水写入串成一条链：addWater 是「读当前值 + 增量 + 写回」，
+ * 两次并发调用会读到同一个旧值，后写覆盖先写 —— 手机端连点就是静默少记一次。
+ * 链上的任务全部执行（前一个失败不能把后面的卡死），所以用 then(task, task)；
+ * 链尾自己清理，不留下无界的 Map。
+ */
+const waterChains = new Map();
+
+function withWaterLock(date, task) {
+  const previous = waterChains.get(date) || Promise.resolve();
+  const run = previous.then(task, task);
+  const tail = run.then(() => {}, () => {});
+  waterChains.set(date, tail);
+  tail.then(() => { if (waterChains.get(date) === tail) waterChains.delete(date); });
+  return run;
+}
+
+/** 真正的写：归零即删除该日记录，保证「撤销到 0」不会留下一条 0ml 的脏记录。 */
+async function writeWater(targetDate, value) {
   if (value <= 0) {
     const existing = await db.getOneByIndex('waters', 'by_date', targetDate);
     if (existing) await db.del('waters', existing.id);
@@ -386,12 +401,25 @@ export async function setWater(date, ml) {
   );
 }
 
-export async function addWater(date, deltaMl) {
+/** 归零即删除该日记录（走同一条链：与并发的 addWater 之间也不会互相覆盖）。 */
+export function setWater(date, ml) {
   const targetDate = todayOf(date);
-  const current = await getWater(targetDate);
-  const next = Math.max(0, Math.round(current + num(deltaMl)));
-  await setWater(targetDate, next);
-  return next;
+  return withWaterLock(targetDate, () => writeWater(targetDate, Math.max(0, Math.round(num(ml)))));
+}
+
+/**
+ * 加/减水量：读当前值、加增量、写回是一个原子操作（同一日期上的调用串行执行），
+ * 所以同一帧里的两次连点会依次落地成 500，而不是互相覆盖成 250。
+ * 返回这次操作之后的当日总量。
+ */
+export function addWater(date, deltaMl) {
+  const targetDate = todayOf(date);
+  return withWaterLock(targetDate, async () => {
+    const current = await getWater(targetDate);
+    const value = Math.max(0, Math.round(current + num(deltaMl)));
+    await writeWater(targetDate, value);
+    return value;
+  });
 }
 
 // ---------- 照片 ----------

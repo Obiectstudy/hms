@@ -1,5 +1,5 @@
 // 饮水页（SPEC §7「饮水」）：大号进度 + 快捷加量 + 自定义 + 撤销。
-import { el, ring, toast, openSheet, confirmDialog, fmtKcal } from '../js/ui.js';
+import { el, ring, toast, openSheet, confirmDialog, fmtKcal, markBusy } from '../js/ui.js';
 import { localDateStr } from '../js/nutrition.js';
 import { daySummary, getGoals, addWater } from '../js/store.js';
 
@@ -20,14 +20,28 @@ export async function render(root) {
     el('button', { className: 'btn btn--ghost icon-btn', text: '⚙', attr: { 'aria-label': '设置目标' }, onClick: () => go('#/settings') }),
   ));
 
-  const apply = async (delta, label) => {
+  /**
+   * 快捷加量 / 撤销。写入本身在 store 层是原子的（同一帧连点两次各记各的，不会互相覆盖），
+   * 这里只负责把「正在提交」这件事画出来：按钮在提交期间不可点，操作结束再恢复。
+   */
+  const apply = async (delta, label, button = null) => {
+    const release = markBusy(button);
     try {
       await addWater(date, delta);
       toast(label, 'ok');
       await window.HMS.refresh();
     } catch (err) {
       toast(`操作失败：${err && err.message ? err.message : err}`, 'error');
+    } finally {
+      release();
     }
+  };
+
+  /** 快捷按钮自己当护栏：文本与标签由增量决定，点击时把节点交给 apply。 */
+  const quickButton = (text, delta, className) => {
+    const button = el('button', { className, text });
+    button.addEventListener('click', () => apply(delta, `已记录 ${delta}ml`, button));
+    return button;
   };
 
   const card = el('div', { className: `card col ${done ? 'card--done' : ''}` },
@@ -37,11 +51,21 @@ export async function render(root) {
     ),
     el('div', { className: 'ring-wrap' }, ring({ value: water, max: target, label: `目标 ${target} ml`, unit: 'ml', color: 'var(--water)' })),
     el('div', { className: 'grid-3' },
-      el('button', { className: 'btn btn--ghost btn--block', text: '+200', onClick: () => apply(200, '已记录 200ml') }),
-      el('button', { className: 'btn btn--primary btn--block', text: '+250', onClick: () => apply(250, '已记录 250ml') }),
-      el('button', { className: 'btn btn--ghost btn--block', text: '+500', onClick: () => apply(500, '已记录 500ml') }),
+      quickButton('+200', 200, 'btn btn--ghost btn--block'),
+      quickButton('+250', 250, 'btn btn--primary btn--block'),
+      quickButton('+500', 500, 'btn btn--ghost btn--block'),
     ),
   );
+
+  // 「撤销」也要自报家门（按钮在提交期间置灰），所以先建节点、再挂监听、最后入树。
+  const undoButton = el('button', { className: 'btn btn--ghost btn--danger', text: '撤销 250ml' });
+  undoButton.addEventListener('click', async () => {
+    if (water <= 0) {
+      toast('今天还没有记录，无法撤销', 'error');
+      return;
+    }
+    await apply(-250, '已撤销 250ml', undoButton);
+  });
 
   card.appendChild(el('div', { className: 'row', style: { marginTop: '4px' } },
     el('button', {
@@ -69,17 +93,7 @@ export async function render(root) {
         await apply(Math.round(ml), `已记录 ${Math.round(ml)}ml`);
       },
     }),
-    el('button', {
-      className: 'btn btn--ghost btn--danger',
-      text: '撤销 250ml',
-      onClick: async () => {
-        if (water <= 0) {
-          toast('今天还没有记录，无法撤销', 'error');
-          return;
-        }
-        await apply(-250, '已撤销 250ml');
-      },
-    }),
+    undoButton,
   ));
   root.appendChild(card);
 

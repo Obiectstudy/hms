@@ -156,8 +156,10 @@ export function mergeRemoteIntoLocal({ remote, local } = {}) {
   for (const path of SETTINGS_PATHS) {
     const remoteSettings = readPath(base, path);
     const localSettings = readPath(localSrc, path);
-    // 「远端没表态」= 缺这个容器、或给了个空对象：此时整份沿用本机设置。
-    // 不这么做的话，一台从没保存过设置的设备推上来的空 settings 会把别人的模型名 / 单位偏好冲成默认值。
+    // 先按排除键清洗远端容器，再判「有没有表态」：老版本连密钥一起传上来的快照剥完就是空的，
+    // 那等于没表态。反过来（先判空再删键）会让这种快照删完变成 {} 却已经跳过了「整份沿用本机」的分支，
+    // 本机的 model / baseUrl / weightUnit 会被空对象静默冲成默认值。
+    if (isDataObject(remoteSettings)) dropExcludedKeys(remoteSettings);
     if (!isDataObject(remoteSettings) || !Object.keys(remoteSettings).length) {
       if (isDataObject(localSettings)) writePath(base, path, deepCopy(localSettings));
       continue;
@@ -281,7 +283,8 @@ export function isConflictBackup(raw) {
 /**
  * 防抖调度：本地改动后延迟触发一次上传，窗口内的连续 schedule 合并成一次（并重置计时）。
  * now / setTimer / clearTimer 默认用 Date.now / setTimeout / clearTimeout，注入假实现后可确定性推进。
- * onFire(reason, waitedMs)：waitedMs 是这次触发实际等了多少毫秒（flush 立即触发时为 0）。
+ * onFire(reason, waitedMs)：waitedMs 是这次触发实际等了多少毫秒。
+ * 定时器自然到点 = clock() − scheduledAt；flush() 是调用方主动立即触发，固定报 0（它没有等过窗口）。
  */
 export function createDebouncer({ delayMs = 5000, onFire, now, setTimer, clearTimer } = {}) {
   const clock = typeof now === 'function' ? now : () => Date.now();
@@ -296,9 +299,9 @@ export function createDebouncer({ delayMs = 5000, onFire, now, setTimer, clearTi
   let reason = null;
   let generation = 0;
 
-  function trigger() {
+  /** waitedMs 由调用方定：定时器到点算真实等待，flush 立即触发固定 0。 */
+  function trigger(waitedMs) {
     if (!armed) return;
-    const waitedMs = Math.max(0, clock() - scheduledAt);
     const text = reason;
     armed = false;
     timer = null;
@@ -321,7 +324,7 @@ export function createDebouncer({ delayMs = 5000, onFire, now, setTimer, clearTi
       timer = arm(() => {
         if (mine !== generation) return; // 已经被 cancel / flush / 再次 schedule 换掉
         timer = null;
-        trigger();
+        trigger(Math.max(0, clock() - scheduledAt));
       }, delay);
     },
     cancel() {
@@ -341,7 +344,7 @@ export function createDebouncer({ delayMs = 5000, onFire, now, setTimer, clearTi
         disarm(timer);
         timer = null;
       }
-      trigger();
+      trigger(0);
     },
   };
 }

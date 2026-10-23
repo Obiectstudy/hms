@@ -638,9 +638,21 @@ export async function run() {
     clipboard: { writeText: async () => {} },
   };
 
-  /** 与 app.js 的 clearOverlays() 逐行等价：切路由时把弹层与 toast 从 body 上摘掉并复原滚动锁。 */
+  // js/ui.js 在后面的 import 块里才加载（同名绑定不能跨块作用域），所以这里先留一个槽位。
+  let ui = null;
+
+  /**
+   * 与 app.js 的 clearOverlays() 等价：app.js 自己不再实现清场，而是委托 js/ui.js 里的同一份实现
+   * （每个弹层先走完 finish()，再摘残留节点；.toast 不在清理范围内 —— 它是 2.9s 自删的提示，
+   * 见 js/ui.js 的 clearOverlays 注释）。这里同样委托过去，避免"测试替身"和实现漂移；
+   * ui.js 还没加载时退化成「只摘节点」，与 app.js 的兜底完全一致。
+   */
   const clearOverlays = () => {
-    for (const node of dom.doc.querySelectorAll('.sheet-backdrop, .modal-backdrop, .toast')) node.remove();
+    if (ui) {
+      ui.clearOverlays();
+      return;
+    }
+    for (const node of dom.doc.querySelectorAll('.sheet-backdrop, .modal-backdrop')) node.remove();
     dom.doc.body.style.overflow = '';
   };
 
@@ -716,6 +728,7 @@ export async function run() {
     URL.revokeObjectURL = () => {};
 
     const store = await import('../js/store.js');
+    ui = await import('../js/ui.js'); // 清场/弹层收尾的唯一实现：clearOverlays 替身委托给它
     const db = await import('../js/db.js');
     const accounts = await import('../js/accounts.js');
     const cloudConfig = await import('../js/cloud-config.js');
@@ -1018,7 +1031,7 @@ export async function run() {
       assert.equal(after, before + 1, '连点两次保存运动落了 ' + (after - before) + ' 条记录（期望 1）');
     });
 
-    note('interaction.guard-contrast', '交互', '运动页/体重页/饮食页的保存按钮都是"先 disabled 再写库"，天然挡住连点；饮水 +250/+500/撤销与今日页 +250ml 三个按钮没有这层保护 —— 这正是 race.water-doubletap / race.dashboard-plus250-doubletap 两条 finding 的成因。');
+    note('interaction.guard-contrast', '交互', '运动页/体重页/饮食页的保存按钮是"先 disabled 再写库"，天然挡住连点；饮水 +250/+500/撤销与今日页 +250ml 原先没有这层保护（race.water-doubletap / race.dashboard-plus250-doubletap 两条 finding 的成因），修复后它们也走同一套护栏（js/ui.js 的 markBusy：置灰发生在当前任务之后的微任务里，所以同一帧已经分发出来的连点仍然记账，由 store 层原子化的 addWater 如实累加，而不是被去抖丢掉）。');
 
     await runCase({
       id: 'interaction.rerender-no-listener-growth',
@@ -1029,6 +1042,9 @@ export async function run() {
       repro: '连续 renderView 8 个视图各 3 轮 → 比 document/window 监听器数与 body.childNodes.length',
       reach: '-',
     }, async () => {
+      // 基线稳定：toast 是 2.9s 后自删的瞬态节点，先等前一批退场，body 子节点数才是可比的基线。
+      // （这条用例查的是"渲染往 body 上堆僵尸节点"，不是"提示会不会自己消失"。）
+      await tick(3100);
       const keys = ['keydown', 'click', 'input', 'change', 'pointerdown', 'pointermove', 'pointerup'];
       const docBefore = keys.map((k) => dom.listenerCount(k));
       const winBefore = keys.map((k) => winListenerCount(k));

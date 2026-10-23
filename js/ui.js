@@ -88,13 +88,70 @@ export function fmtTime(ts) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+// 同屏最多留几条 toast。切页不再清 toast（见 clearOverlays：它是自带生命周期的非阻塞提示），
+// 所以数量上限必须自己管：快速连点 / 连续操作只保留最新的这几条，不会堆成一面墙。
+const MAX_LIVE_TOASTS = 5;
+
 export function toast(msg, type = 'info') {
   const node = el('div', { className: `toast toast--${type}`, attr: { role: 'status' }, text: String(msg) });
   document.body.appendChild(node);
+  // 超出的旧提示立刻退场（只删最老的，最新那条永远在）。
+  const live = [...document.querySelectorAll('.toast')];
+  for (const old of live.slice(0, Math.max(0, live.length - MAX_LIVE_TOASTS))) old.remove();
   // 动画结束后自删；用 timer 而不是 transitionend，避免被 display:none 卡住不触发。
   setTimeout(() => node.classList.add('toast--out'), 2400);
   setTimeout(() => node.remove(), 2900);
   return node;
+}
+
+/* ---------- 弹层收尾登记 + 切页清场 ---------- */
+
+/**
+ * 活着的弹层：每个 finish() 登记一次。
+ * 外部把节点摘掉（切路由、整页重画）不会触发 finish()，滚动锁、document 上的 keydown 与
+ * 那个 Promise 都会留在原地，所以弹层必须自己登记，由 clearOverlays() 统一通知收尾。
+ */
+const liveOverlays = new Set();
+
+function registerOverlay(finish) {
+  liveOverlays.add(finish);
+  return () => { liveOverlays.delete(finish); };
+}
+
+/**
+ * 切页 / 整页重画前的清场：先让每个弹层走完自己的 finish()（解锁滚动、摘 document 监听器、
+ * resolve Promise），再把残留节点摘掉。app.js 的 renderRoute() 第一件事就是调它。
+ *
+ * .toast 刻意不在这里：它是 2.9s 后自删、不锁交互的非阻塞提示，不需要被导航撤销。
+ * 把它一起摘掉会让「先 toast 再 await refresh()」的成功路径在同一个同步任务里
+ * insert + remove —— 浏览器一帧都画不出来，用户于是只在出错时才看得到提示。
+ * 堆积问题由 toast() 里的 MAX_LIVE_TOASTS 兜住，而不是靠切页清屏。
+ */
+export function clearOverlays() {
+  if (typeof document === 'undefined') return;
+  for (const finish of [...liveOverlays]) finish(null);
+  for (const node of document.querySelectorAll('.sheet-backdrop, .modal-backdrop')) node.remove();
+  document.body.style.overflow = '';
+}
+
+/* ---------- 提交期间的按钮护栏 ---------- */
+
+// 微任务：老 WebView 没有 queueMicrotask 时用 Promise 兜一层（时序一样）。
+const defer = typeof queueMicrotask === 'function'
+  ? queueMicrotask
+  : (fn) => { Promise.resolve().then(fn); };
+
+/**
+ * 提交期间的按钮护栏：点下去就进入「不可点」状态，操作结束调用返回的函数恢复。
+ *
+ * 置灰放在当前任务之后的微任务里（不是同步置灰）：同一帧内已经分发出来的连点仍然是有效操作，
+ * 由 store 的原子写入如实记账；之后的点击才被 disabled 真的挡住。这样「连点不丢增量」与
+ * 「提交期不可点」同时成立 —— 而不是用延时/去抖把第二次点击悄悄丢掉。
+ */
+export function markBusy(button) {
+  if (!button || button.disabled === true) return () => {};
+  defer(() => { button.disabled = true; });
+  return () => { button.disabled = false; };
 }
 
 function overlayBase(className) {
@@ -111,9 +168,11 @@ export function confirmDialog({ title = '确认', message = '', okText = '确定
   return new Promise((resolve) => {
     const unlock = lockScroll();
     let settled = false;
+    const unregister = registerOverlay(() => finish(false));
     const finish = (value) => {
       if (settled) return;
       settled = true;
+      unregister();
       unlock();
       document.removeEventListener('keydown', onKey);
       backdrop.remove();
@@ -144,9 +203,11 @@ export function openSheet({ title = '', content = null, actions = [] } = {}) {
   return new Promise((resolve) => {
     const unlock = lockScroll();
     let settled = false;
+    const unregister = registerOverlay(() => finish(null));
     const finish = (value) => {
       if (settled) return;
       settled = true;
+      unregister();
       unlock();
       document.removeEventListener('keydown', onKey);
       backdrop.remove();

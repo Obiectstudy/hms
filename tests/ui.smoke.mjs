@@ -259,7 +259,9 @@ function createDom() {
     addEventListener(type, fn) { (documentListeners[type] = documentListeners[type] || []).push(fn); },
     removeEventListener(type, fn) { documentListeners[type] = (documentListeners[type] || []).filter((x) => x !== fn); },
   };
-  return { FakeNode, body, doc };
+  // 回归断言要数 document 级监听器（弹层被切页丢下时不能留下 keydown 泄漏）
+  const listenerCount = (type) => (documentListeners[type] || []).length;
+  return { FakeNode, body, doc, listenerCount };
 }
 
 /* ---------------- 最小 IndexedDB ---------------- */
@@ -3863,6 +3865,217 @@ export async function run() {
           off?.();
           delete globalThis.window.HMS.cloud;
         }
+
+    /* ------------------------------------------------------------------
+     * 回归：tests/fuzz.ui.mjs 找到的界面/状态机缺陷 —— 每条 finding 都留一条永久断言
+     * （顺序：并发写入 → 成功提示可见性 → 弹层收尾 → 脏记录渲染 → 同步自洽）
+     * ------------------------------------------------------------------ */
+
+    /** 假 document 默认的 querySelectorAll 是空实现；清场断言需要它真的按 class 找节点。 */
+    const withRealQuerySelector = async (fn) => {
+      const previousQuery = dom.doc.querySelector;
+      const previousAll = dom.doc.querySelectorAll;
+      const matchesPart = (node, part) => (part.startsWith('.')
+        ? String(node.className).split(/\s+/).includes(part.slice(1))
+        : String(node.tagName).toLowerCase() === part.toLowerCase());
+      const findAll = (selector) => {
+        const parts = String(selector).split(',').map((s) => s.trim()).filter(Boolean);
+        return dom.body.walk().filter((n) => n !== dom.body && parts.some((part) => matchesPart(n, part)));
+      };
+      dom.doc.querySelectorAll = findAll;
+      dom.doc.querySelector = (selector) => findAll(selector)[0] || null;
+      try {
+        return await fn();
+      } finally {
+        dom.doc.querySelector = previousQuery;
+        dom.doc.querySelectorAll = previousAll;
+      }
+    };
+
+    /** 把原始记录塞进当前库（绕过 store 归一化，专门造半截写入那种脏数据），返回注入用的 store。 */
+    const injectRaw = async (storeName, row) => {
+      await db.getAll(storeName); // 先确保连接已经指向当前库
+      const name = db.getDbName();
+      const candidates = fakeIdb.opened.filter((d) => d.name === name);
+      const database = candidates[candidates.length - 1];
+      assert.ok(database, '假 IDB 里没有库 ' + name);
+      const raw = database.stores.get(storeName);
+      assert.ok(raw, '库 ' + name + ' 里没有 store ' + storeName);
+      raw.seq = Math.max(raw.seq, Number(row.id) || 0);
+      raw.data.set(row.id, structuredClone(row));
+      return raw;
+    };
+
+    await checkAsync('并发回归：同一 tick 两次 addWater 都记账（store 层读-改-写必须原子）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const date = '1998-08-08'; // 专用日期：不碰其他用例的今日水量
+        await store.setWater(date, 0);
+        const twice = await Promise.all([store.addWater(date, 250), store.addWater(date, 250)]);
+        const after = await store.getWater(date);
+        assert.equal(after, 500, '两次并发 +250 只记了 ' + after + ' ml：读-改-写互相覆盖，丢了一次写入');
+        assert.deepEqual(twice, [250, 500], '两次调用的返回值应是各自那一刻的最终值，实际 ' + JSON.stringify(twice));
+        // 增减交错也要串行：串行化必须覆盖任意顺序的增量，而不是只挡住「两次都是加」
+        await Promise.all([store.addWater(date, 100), store.addWater(date, -50), store.addWater(date, 20)]);
+        const mixed = await store.getWater(date);
+        assert.equal(mixed, 570, '并发加/减混合后水量 = ' + mixed + '，期望 570');
+        assert.equal((await db.getAllByIndex('waters', 'by_date', date)).length, 1, '同日并发写入留下了多条记录（应始终 1 条）');
+        await store.setWater(date, 0);
+      });
+    });
+
+    await checkAsync('并发回归：饮水页「+250」同一 tick 连点两次 = +500，且提交期间置灰、成功提示活过重绘', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const uiMod = await import('../js/ui.js');
+        const waterView = await loadView('water');
+        const today = nutrition.localDateStr();
+        await store.setWater(today, 0);
+        const win = globalThis.window;
+        const previousRefresh = win.HMS.refresh;
+        // 与 app.js 的 renderRoute 同序：先清场（摘弹层、保留 toast），再重画
+        win.HMS.refresh = async () => { uiMod.clearOverlays(); };
+        try {
+          const root = new dom.FakeNode('div');
+          await waterView.render(root);
+          const plus = findButton(root, '+250');
+          assert.ok(plus, '饮水页没有 +250 按钮');
+          fireClick(plus);
+          fireClick(plus); // 同一 tick 的第二次点击：也要记账（原子写入），不能用去抖丢掉
+          await Promise.resolve(); // 置灰发生在当前任务之后的微任务里
+          assert.equal(plus.disabled, true, '提交期间 +250 按钮没有置灰：用户看不到「正在提交」，只会反复点');
+          await tick(300);
+          const after = await store.getWater(today);
+          assert.equal(after, 500, '同一 tick 连点两次 +250 只记了 ' + after + ' ml，期望 500');
+          assert.ok(toasts().some((t) => t.includes('已记录 250ml')), '紧接着的重绘把成功提示吃掉了：' + toasts().join(' | '));
+          assert.equal(plus.disabled, false, '提交结束后按钮没有恢复可点');
+        } finally {
+          win.HMS.refresh = previousRefresh;
+          await store.setWater(today, 0);
+        }
+      });
+    });
+
+    await checkAsync('并发回归：今日页「+250 ml」同一 tick 连点两次 = +500', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const dashboardView = await loadView('dashboard');
+        const today = nutrition.localDateStr();
+        await store.setWater(today, 400);
+        const win = globalThis.window;
+        const previousRefresh = win.HMS.refresh;
+        win.HMS.refresh = async () => {};
+        try {
+          const root = new dom.FakeNode('div');
+          await dashboardView.render(root);
+          const plus = findButton(root, '+250 ml');
+          assert.ok(plus, '今日页没有 +250 ml 按钮');
+          fireClick(plus);
+          fireClick(plus);
+          await tick(300);
+          const after = await store.getWater(today);
+          assert.equal(after, 900, '今日页连点两次 +250 ml 后是 ' + after + ' ml，期望 900（与饮水页同一个 addWater 路径）');
+        } finally {
+          win.HMS.refresh = previousRefresh;
+          await store.setWater(today, 0);
+        }
+      });
+    });
+
+    await checkAsync('回归：重绘清场不摘 .toast（成功提示要活过同一次 refresh），弹层必须被摘掉', async () => {
+      const uiMod = await import('../js/ui.js');
+      const win = globalThis.window;
+      const hmsBefore = win.HMS;
+      const app = await freshApp(); // 真实 app.js：清场只有一份实现，断言的就是它调的那份
+      try {
+        await withRealQuerySelector(async () => {
+          clearOverlays();
+          const sheet = uiMod.openSheet({ title: '测试弹层', content: null });
+          const node = uiMod.toast('已记录 250ml', 'ok');
+          assert.equal(node.parentNode, dom.body, '前置：toast 没有挂到 body 上');
+          assert.equal(dom.doc.querySelectorAll('.sheet-backdrop').length, 1, '前置：弹层没有挂上');
+          await app.clearOverlays();
+          assert.equal(dom.doc.querySelectorAll('.sheet-backdrop').length, 0, '清场没有摘掉弹层节点');
+          assert.equal(node.parentNode, dom.body, '清场把 .toast 一起摘掉了：成功提示一帧都画不出来（用户只在出错时看得到提示）');
+          assert.equal(await sheet, null, '弹层没有收到收尾通知：那个 Promise 永远挂着');
+        });
+      } finally {
+        win.HMS = hmsBefore; // freshApp() 会跑 boot()，把 window.HMS 换掉 —— 还回去
+      }
+    });
+
+    await checkAsync('回归：切页丢下弹层时弹层要走完收尾（监听器/滚动锁/Promise 都回到基线）', async () => {
+      const uiMod = await import('../js/ui.js');
+      clearOverlays();
+      const overflowBefore = dom.body.style.overflow;
+      const listenersBefore = dom.listenerCount('keydown'); // 前面的用例可能留下监听器：只断言本用例的相对变化
+      const sheet = uiMod.openSheet({ title: '测试弹层', content: null });
+      assert.equal(dom.listenerCount('keydown'), listenersBefore + 1, '前置：打开弹层应多出 1 个 keydown 监听器，实际 ' + dom.listenerCount('keydown'));
+      uiMod.clearOverlays(); // app.js 的 renderRoute 第一件事就是这个
+      assert.equal(dom.listenerCount('keydown'), listenersBefore, '切页清场后 document 上还残留 ' + (dom.listenerCount('keydown') - listenersBefore) + ' 个 keydown 监听器');
+      assert.equal(dom.body.style.overflow, overflowBefore, '切页清场后 body 的滚动锁没有复原');
+      assert.equal(await sheet, null, '被切走的弹层没有收尾：Promise 永挂（输入内容/照片引用一起挂着）');
+    });
+
+    await checkAsync('回归：meals.items 里混进 null/非对象条目，今日页照常渲染（不整页崩、不上屏脏值）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const dashboardView = await loadView('dashboard');
+        const today = nutrition.localDateStr();
+        const storeBefore = await db.getAll('meals');
+        const injected = [
+          { id: 9001, date: today, slot: 'lunch', source: 'manual', createdAt: Date.now(), items: [null] },
+          { id: 9002, date: today, slot: 'dinner', source: 'manual', createdAt: Date.now(), items: [42] },
+          { id: 9003, date: today, slot: 'snack', source: 'manual', createdAt: Date.now(), items: null },
+        ];
+        const raw = await injectRaw('meals', injected[0]);
+        for (const row of injected.slice(1)) raw.data.set(row.id, structuredClone(row));
+        try {
+          const visible = await db.getAllByIndex('meals', 'by_date', today);
+          assert.equal(visible.filter((m) => m.id >= 9001).length, 3, '前置：脏记录没有真的进库');
+          const root = new dom.FakeNode('div');
+          await dashboardView.render(root); // 修前：TypeError → 整页变成「这个页面加载失败了」
+          const text = nodeText(root);
+          assert.ok(!text.includes('这个页面加载失败了'), '一条脏记录让整页崩了：' + text.slice(0, 200));
+          assert.ok(text.includes('今日总览'), '脏记录下今日页没有正常内容：' + text.slice(0, 200));
+          assertNoLeak(text, 'dashboard(脏 meals)');
+        } finally {
+          for (const row of injected) raw.data.delete(row.id);
+          const after = await db.getAll('meals');
+          assert.equal(after.length, storeBefore.length, '清理脏记录后库里的条数没有回到原样');
+        }
+      });
+    });
+
+    await checkAsync('回归：手动同步成功后同一张卡片立刻显示「已全部同步」（状态行与 toast 自洽）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        const account = await accountsMod.getActiveAccount();
+        cloudConfig.writeCloudAuth(account.id, { username: 'xiaolin', serverId: 'u_rel', token: 'tok-rel' });
+        const fake = fakeTransport({
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const root = await renderCloud(fake);
+        assert.ok(nodeText(root).includes('有未同步改动'), '前置：应显示「有未同步改动」：' + nodeText(root).slice(0, 200));
+        clearOverlays();
+        clickIn(root, '立即同步');
+        await tick(400);
+        const pushes = fake.calls.filter((c) => c.name === 'push');
+        assert.equal(pushes.length, 1, '点一次「立即同步」应上传一次：' + JSON.stringify(fake.calls.map((c) => c.name)));
+        assert.ok(toasts().some((t) => t.includes('已上传本机数据')), '缺少上传成功提示：' + toasts().join(' | '));
+        const text = nodeText(root);
+        assert.ok(text.includes('已全部同步'), '同步成功后同一张卡片没有跟着刷新（文案停在同步前）：' + text.slice(0, 240));
+        assert.ok(!text.includes('尚未同步'), '同一次同步后 toast 说已上传、状态行还说「尚未同步」：' + text.slice(0, 240));
+      });
+    });
+
       });
     });
 

@@ -40,13 +40,27 @@ function text(v) {
   return typeof v === 'string' ? v.trim() : '';
 }
 
+/**
+ * 日期：先过形状，再过日历 —— parseDateStr 会把 2026-02-31 / 13 月 / 0000-01-01 判成 Invalid Date。
+ * 与 nutrition.parseDateStr 同口径，避免「形状合法但不存在」的日期落库后打不开任何一天。
+ */
 function validDate(v) {
   const s = text(v);
-  return DATE_RE.test(s) ? s : '';
+  if (!DATE_RE.test(s)) return '';
+  return Number.isNaN(parseDateStr(s).getTime()) ? '' : s;
 }
 
+/**
+ * 记录有没有「真正的」id：只认有限数值与非空数字串。
+ * 不能用 Number.isFinite(Number(rec.id)) —— Number('') === 0、Number([]) === 0、Number(false) === 0，
+ * 空 id 会被折成 id:0，去重键随之把所有这类记录折叠成一条（导入静默丢行）。
+ */
 function hasId(rec) {
-  return rec && rec.id != null && Number.isFinite(Number(rec.id));
+  if (!rec || typeof rec !== 'object') return false;
+  const id = rec.id;
+  if (typeof id === 'number') return Number.isFinite(id);
+  if (typeof id === 'string') return id.trim() !== '' && Number.isFinite(Number(id));
+  return false;
 }
 
 /** 单条食物条目：kcal 取整，其余 1 位小数；可选字段缺失就不落键，避免脏字段覆盖库值。 */
@@ -153,16 +167,46 @@ export function normalizeRecord(store, rec) {
 }
 
 /**
+ * 内容摘要（FNV-1a 双种子拼成 16 位 hex = 64 位）。
+ * 指纹里不放原始文本：条目名可能自带 'undefined' / '[object Object]' 字面量，键必须干净；
+ * 摘要同时也比整串 items 紧凑得多。
+ */
+function digest16(value) {
+  let a = 0x811c9dc5;
+  let b = 0x7f4a7c15;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    a = Math.imul(a ^ code, 0x01000193) >>> 0;
+    b = Math.imul(b ^ code, 0x85ebca6b) >>> 0;
+  }
+  return a.toString(16).padStart(8, '0') + b.toString(16).padStart(8, '0');
+}
+
+/** 餐次内容指纹：字段顺序固定，先按落库口径整形再摘要（raw 与已落库的记录算出同一个键）。 */
+function mealItemsDigest(items) {
+  const rows = normalizeItems(items).map((it) => [
+    it.name, it.grams, it.kcal, it.carb, it.protein, it.fat,
+    it.fiber ?? null, it.sodium ?? null, it.confidence ?? null, it.foodId ?? null,
+  ]);
+  return digest16(JSON.stringify(rows));
+}
+
+/**
  * 去重键。
  * weights/waters 契约上按 date 唯一 → 用日期。
- * meals/exercises 是可重复条目 → 用自增 id；没 id 的历史数据退回内容指纹，
+ * meals/exercises 是可重复条目 → 用自增 id；没 id 的历史数据退回**内容**指纹，
  * 保证同一份导出重复导入不会翻倍。
+ * meals 的指纹不含 createdAt：那是 normalize 时现生成的 Date.now()，带进指纹的话
+ * 「没有 createdAt 的 JSON」每导入一次都算新记录（当天餐次与热量翻倍）。
  */
 export function keyOf(store, rec) {
   if (!rec || typeof rec !== 'object') return '';
   if (store === 'weights' || store === 'waters') return `date:${text(rec.date)}`;
   if (hasId(rec)) return `id:${Number(rec.id)}`;
-  if (store === 'meals') return `fk:${text(rec.date)}:${text(rec.slot)}:${int(rec.createdAt)}`;
+  if (store === 'meals') {
+    const slot = SLOTS.includes(rec.slot) ? rec.slot : 'snack';
+    return `fk:${text(rec.date)}:${slot}:${mealItemsDigest(rec.items)}`;
+  }
   return `fk:${text(rec.date)}:${text(rec.type)}:${num(rec.minutes)}:${int(rec.kcalBurned)}`;
 }
 
@@ -451,10 +495,20 @@ export function buildRangeRows({
   return [...map.values()].sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? -1 : 1));
 }
 
+// Excel / WPS 打开 CSV 时会把 = + - @ 开头的单元格当公式甚至 DDE 执行，引号包裹挡不住求值。
+// 中和办法：数据单元格前置一个单引号（Excel 当文本），再照常走 RFC4180 转义 —— 标准解析器仍能逐格还原。
+// 纯数字（-1 / +2.5 / 1e308）不是公式，保持数字语义不加前缀（否则 Excel 里会退化成文本）。
+const CSV_NUMBER_ONLY = /^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$/;
+
+function csvNeedsNeutralize(s) {
+  return s.length > 0 && '=+-@'.includes(s[0]) && !CSV_NUMBER_ONLY.test(s);
+}
+
 function csvCell(v) {
   if (v == null) return '';
-  const s = String(v);
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  const raw = String(v);
+  const s = csvNeedsNeutralize(raw) ? "'" + raw : raw;
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
 function csvLine(cells) {

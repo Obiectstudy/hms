@@ -24,11 +24,22 @@ function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
-/** 保留 1 位小数；非有限值一律归 0，避免 NaN 顺着聚合污染整个页面。 */
+/** 取整；非有限值一律归 0（与 round1 同口径：溢出也是「非有限」，不许吐 ±Infinity）。 */
+function safeInt(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? Math.round(v) : 0;
+}
+
+/**
+ * 保留 1 位小数；非有限值一律归 0，避免 NaN 顺着聚合污染整个页面。
+ * 「非有限」既指入参，也指中间量：1e308 这类有限大数乘 10 就溢出成 Infinity，
+ * 只挡入参的话结果会带着 Infinity 漏进聚合，所以舍入后要再挡一次。
+ */
 export function round1(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return 0;
   const r = Math.round(v * 10) / 10;
+  if (!Number.isFinite(r)) return 0;
   return Object.is(r, -0) ? 0 : r;
 }
 
@@ -118,17 +129,17 @@ export function targetMacros(calorieTarget, ratio = {}) {
   };
 }
 
-/** 4/4/9 反算热量，取整。缺字段按 0。 */
+/** 4/4/9 反算热量，取整。缺字段按 0；乘积/加和溢出成 ±Infinity 时归 0。 */
 export function kcalFromMacros({ carb, protein, fat } = {}) {
-  return Math.round(4 * num(carb) + 4 * num(protein) + 9 * num(fat));
+  return safeInt(4 * num(carb) + 4 * num(protein) + 9 * num(fat));
 }
 
-/** 每 100g 营养值 × 实际克数；kcal 取整，其余 1 位小数。 */
+/** 每 100g 营养值 × 实际克数；kcal 取整，其余 1 位小数（比例乘法溢出时归 0）。 */
 export function scaleFood(per100g, grams) {
   const p = per100g && typeof per100g === 'object' ? per100g : {};
   const f = Math.max(0, num(grams)) / 100;
   return {
-    kcal: Math.round(num(p.kcal) * f),
+    kcal: safeInt(num(p.kcal) * f),
     carb: round1(num(p.carb) * f),
     protein: round1(num(p.protein) * f),
     fat: round1(num(p.fat) * f),
@@ -155,7 +166,7 @@ export function sumItems(items) {
     sodium += num(it.sodium);
   }
   return {
-    kcal: Math.round(kcal),
+    kcal: safeInt(kcal),
     carb: round1(carb),
     protein: round1(protein),
     fat: round1(fat),
@@ -164,9 +175,9 @@ export function sumItems(items) {
   };
 }
 
-/** 净值 = 摄入 − 运动消耗，取整。 */
+/** 净值 = 摄入 − 运动消耗，取整；相减溢出（1e308 − (−1e308)）时归 0。 */
 export function netKcal(intakeKcal, burnedKcal) {
-  return Math.round(num(intakeKcal) - num(burnedKcal));
+  return safeInt(num(intakeKcal) - num(burnedKcal));
 }
 
 /** BMI，1 位小数；身高体重非法返回 0。 */
@@ -373,7 +384,8 @@ export function estimateBurn(rec = {}) {
   const minutes = num(src.minutes);
   const weightKg = num(src.weightKg);
   if (!(minutes > 0) || !(weightKg > 0)) return 0;
-  return Math.max(0, Math.round((exerciseMet(src.type, src.intensity) - 1) * weightKg * (minutes / 60)));
+  // 乘积可能溢出成 Infinity（时长/体重是有限大数时），Math.max(0, Infinity) 挡不住 → 先归 0
+  return Math.max(0, safeInt((exerciseMet(src.type, src.intensity) - 1) * weightKg * (minutes / 60)));
 }
 
 function byDateAsc(a, b) {
@@ -467,11 +479,12 @@ function unitKey(unit) {
   return unit === 'jin' ? 'jin' : 'kg';
 }
 
-/** 保留 2 位小数；用途同 round1，把 90.60000000000001 这类浮点尾巴收口。 */
+/** 保留 2 位小数；用途同 round1，把 90.60000000000001 这类浮点尾巴收口，乘 100 溢出同样归 0。 */
 function round2(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return 0;
   const r = Math.round(v * 100) / 100;
+  if (!Number.isFinite(r)) return 0;
   return Object.is(r, -0) ? 0 : r;
 }
 

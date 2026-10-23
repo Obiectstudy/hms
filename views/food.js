@@ -300,7 +300,8 @@ function scaleFood(food, grams) {
   const p = (food && food.per100g) || {};
   const scaled = scalePer100g(p, g);
   const item = {
-    name: food.name,
+    // 缺名字的食物（自定义 / 脏数据）不能把 undefined 漏进条目：渲染层会显示 undefined 字面量
+    name: typeof food.name === 'string' ? food.name : '',
     grams: g,
     kcal: scaled.kcal,
     carb: scaled.carb,
@@ -1057,15 +1058,20 @@ function renderMealCard(meal, reload) {
     ),
   );
   const list = el('div', { className: 'list' });
-  (meal.items || []).forEach((item, index) => {
+  const mealItems = Array.isArray(meal.items) ? meal.items : [];
+  mealItems.forEach((item, index) => {
+    // 脏记录防御：条目不是对象就跳过渲染（索引仍对应原始数组位置，份量按钮靠它定位原条目）。
+    if (!item || typeof item !== 'object') return;
+    const itemName = typeof item.name === 'string' ? item.name.trim() : '';
+    const itemGrams = Number.isFinite(Number(item.grams)) ? String(item.grams) : '—';
     const hint = itemUnitHint(item);
     list.appendChild(el('div', { className: 'list__item' },
       el('div', { className: 'list__item--main' },
         el('div', { className: 'row' },
-          el('span', { className: 'strong', text: item.name }),
+          el('span', { className: 'strong', text: itemName }),
           item.confidence ? confidencePill(item.confidence) : null,
         ),
-        el('div', { className: 'list__item--meta', text: `${item.grams}g${hint ? `（${hint}）` : ''} · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
+        el('div', { className: 'list__item--meta', text: `${itemGrams}g${hint ? `（${hint}）` : ''} · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
       ),
       el('button', {
         className: 'btn btn--ghost btn--sm', text: '份量',

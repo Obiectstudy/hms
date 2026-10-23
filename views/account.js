@@ -279,15 +279,17 @@ export async function render(root, deps = {}) {
   const cloudReady = isCloudConfigured(cloudUrl);
   const transport = deps.transport ?? (cloudReady ? createCloudTransport({ baseUrl: cloudUrl, fetchImpl: deps.fetchImpl }) : null);
 
-  const summary = await readLocalSummary();
+  // 同步成功后卡片要就地重画（见 refreshCloudCard）：这几项会按同一套规则重新读一遍，
+  // 所以用 let —— 卡片上的结论必须和刚发出的那句 toast 出自同一次读。
+  let summary = await readLocalSummary();
   const scale = summary ? summary.counts : null;
-  const cloudAuth = cloudReady ? readCloudAuth(current.id) : null;
-  const loggedIn = Boolean(cloudAuth?.token);
-  const status = await readSyncStatus(summary);
+  let cloudAuth = cloudReady ? readCloudAuth(current.id) : null;
+  let loggedIn = Boolean(cloudAuth?.token);
+  let status = await readSyncStatus(summary);
   // 压缩能力 + 上传体积：卡片要如实说明「这次上传会发出去多少字节、离上限还有多远」。
   // 预估真跑一次编码（含压缩），所以显示的是实际会发出去的大小，不是一个拍脑袋的估算。
   const compressionReady = createStreamCompressor() !== null;
-  const upload = cloudReady ? await readUploadPlan(summary, cloudAuth?.token ?? '', status.rev) : null;
+  let upload = cloudReady ? await readUploadPlan(summary, cloudAuth?.token ?? '', status.rev) : null;
 
   root.appendChild(el('div', { className: 'row row--between' },
     el('div', { className: 'col' },
@@ -324,7 +326,23 @@ export async function render(root, deps = {}) {
   ));
 
   // ---- 云同步 ----
-  root.appendChild(buildCloudCard());
+  const cloudCard = buildCloudCard();
+  root.appendChild(cloudCard);
+
+  /**
+   * 同步成功后卡片就地重画：同一张卡片、同一个位置，只把内容换成刚读到的状态。
+   * 只发 toast 不重画会出现「toast 说已上传、状态行还说尚未同步 / 有未同步改动」的自相矛盾；
+   * 就地重画比整页重绘更快，也不会把用户已经滚动到的位置弹走。
+   */
+  async function refreshCloudCard() {
+    cloudAuth = cloudReady ? readCloudAuth(current.id) : null;
+    loggedIn = Boolean(cloudAuth?.token);
+    summary = await readLocalSummary();
+    status = await readSyncStatus(summary);
+    upload = cloudReady ? await readUploadPlan(summary, cloudAuth?.token ?? '', status.rev) : null;
+    const next = buildCloudCard();
+    cloudCard.replaceChildren(...next.childNodes);
+  }
 
   // ---- 账号列表 ----
   const full = accounts.length >= MAX_ACCOUNTS;
@@ -466,7 +484,26 @@ export async function render(root, deps = {}) {
     }
     const result = await runSyncOnce({ accountId: current.id, transport, token: useToken, storage: SYNC_STORAGE });
     toast(result.message, result.ok ? 'ok' : 'error');
+    if (result.ok) await reflectSyncedState();
     return result;
+  }
+
+  /**
+   * 同步成功后的界面收尾：先把云同步卡片就地重画（状态行立刻变成与 toast 同一个结论），
+   * 再让外壳重画一次整页（本机数据规模、上传体积这些跟着同步一起变）。
+   * 两次重画都单独兜住异常：重画出问题最多让界面陈旧一帧，绝不能把已经成功的同步报成失败。
+   */
+  async function reflectSyncedState() {
+    try {
+      await refreshCloudCard();
+    } catch {
+      /* 卡片重画失败：状态行最多陈旧，同步结果依然是成功的 */
+    }
+    try {
+      await refresh();
+    } catch {
+      /* 外壳重绘失败同样只影响这一帧的显示 */
+    }
   }
 
   async function loginFlow(presetUsername = '') {

@@ -47,8 +47,22 @@ export async function refresh() {
   await renderRoute();
 }
 
-function clearOverlays() {
-  for (const node of document.querySelectorAll('.sheet-backdrop, .modal-backdrop, .toast')) node.remove();
+/**
+ * 切页清场：委托给 js/ui.js 里的唯一一份实现（每个弹层先走完自己的 finish()，
+ * 再摘掉残留节点；.toast 不在清理范围内 —— 它 2.9s 自删，见 ui.clearOverlays 的注释）。
+ * ui.js 是动态加载的，所以这里是 async：renderRoute 里 await 之后必须重新核对渲染令牌。
+ */
+export async function clearOverlays() {
+  try {
+    const ui = await import('./js/ui.js');
+    if (typeof ui.clearOverlays === 'function') {
+      ui.clearOverlays();
+      return;
+    }
+  } catch (error) {
+    if (typeof console !== 'undefined') console.warn('[HMS] 清场失败，退化成只摘节点：', error);
+  }
+  for (const node of document.querySelectorAll('.sheet-backdrop, .modal-backdrop')) node.remove();
   document.body.style.overflow = '';
 }
 
@@ -73,7 +87,9 @@ async function renderRoute() {
   const token = ++renderToken;
   const route = parseRoute(window.location.hash);
 
-  clearOverlays();
+  await clearOverlays();
+  // 清场是异步的（要动态加载 ui.js）：期间又有人触发了新的渲染就交给它，别再动 DOM。
+  if (token !== renderToken) return;
 
   if (route == null) {
     // 未知路由不做静默兜底，先给一次明确跳转再渲染今日，避免用户看到空白。

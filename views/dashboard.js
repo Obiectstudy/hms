@@ -1,5 +1,5 @@
 // 今日总览（SPEC §7「今日」）。只读聚合 + 两个快捷写入（饮水）。
-import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1 } from '../js/ui.js';
+import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1, markBusy } from '../js/ui.js';
 import { localDateStr, targetMacros, weightStats, sumItems, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
 import { daySummary, getGoals, recentWeights, addWater, getSettings, exportStatus } from '../js/store.js';
 // 导出下载只有一份实现（view 之间共用，避免两处逻辑漂移）。
@@ -24,6 +24,22 @@ export function needsBackupReminder(status) {
   if (s.days == null) return true;
   const days = Number(s.days);
   return Number.isFinite(days) && days >= BACKUP_REMIND_DAYS;
+}
+
+/**
+ * 条目标题：只有「是对象、且 name 是有内容的字符串」才算一项。
+ * 半截写入 / 手改过的库里可能有 null 或数字，渲染层要跳过它们 —— 但不上屏 undefined，
+ * 也不因为一条脏记录把整页变成「这个页面加载失败了」。（数据层该怎么校验是数据层的事。）
+ */
+function itemNames(items) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => (item && typeof item === 'object' && typeof item.name === 'string' ? item.name.trim() : ''))
+    .filter(Boolean);
+}
+
+/** 脏条目也一并交给 sumItems 兜底（它按字段逐个取值），但 items 本身不是数组时按「无条目」处理。 */
+function safeItems(items) {
+  return Array.isArray(items) ? items : [];
 }
 
 function macroRow({ label, value, target, color, unit = 'g' }) {
@@ -185,6 +201,26 @@ export async function render(root) {
 
   const waterTarget = Number(goals.waterMl) || 2000;
   const water = Number(summary.water) || 0;
+
+  // 快捷加量：写入在 store 层是原子的（同一帧连点两次各记各的），这里只把「正在提交」
+  // 画出来（按钮置灰），失败时给一句中文提示 —— 不再让异常冒到事件循环外面去。
+  const quickWaterButton = () => {
+    const button = el('button', { className: 'btn btn--primary', text: '+250 ml' });
+    button.addEventListener('click', async () => {
+      const release = markBusy(button);
+      try {
+        await addWater(date, 250);
+        toast('已记录 250ml', 'ok');
+        await window.HMS.refresh();
+      } catch (err) {
+        toast(`记录失败：${err && err.message ? err.message : err}`, 'error');
+      } finally {
+        release();
+      }
+    });
+    return button;
+  };
+
   root.appendChild(el('div', { className: 'card' },
     el('div', { className: 'card__head' },
       el('div', { className: 'card__title', text: '饮水' }),
@@ -192,15 +228,7 @@ export async function render(root) {
     ),
     bar({ value: water, max: waterTarget, color: 'var(--water)' }),
     el('div', { className: 'row', style: { marginTop: '12px' } },
-      el('button', {
-        className: 'btn btn--primary',
-        text: '+250 ml',
-        onClick: async () => {
-          await addWater(date, 250);
-          toast('已记录 250ml', 'ok');
-          await window.HMS.refresh();
-        },
-      }),
+      quickWaterButton(),
       el('button', { className: 'btn btn--ghost', text: '去饮水页', onClick: () => go('#/water') }),
     ),
   ));
@@ -231,11 +259,11 @@ export async function render(root) {
     ));
     mealCard.appendChild(emptyState('今天还没有饮食记录', '拍照记录第一餐', () => go('#/food')));
   } else {
-    const totalKcal = meals.reduce((sum, meal) => sum + sumItems(meal.items || []).kcal, 0);
+    const totalKcal = meals.reduce((sum, meal) => sum + sumItems(safeItems(meal.items)).kcal, 0);
     const list = el('div', { className: 'list meal-fold__list' });
     for (const meal of meals.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))) {
-      const total = sumItems(meal.items || []);
-      const names = (meal.items || []).map((i) => i.name).filter(Boolean);
+      const total = sumItems(safeItems(meal.items));
+      const names = itemNames(meal.items);
       const summaryText = names.length > 2 ? `${names.slice(0, 2).join('、')} 等 ${names.length} 项` : names.join('、');
       list.appendChild(el('div', { className: 'list__item' },
         el('div', { className: 'list__item--main' },

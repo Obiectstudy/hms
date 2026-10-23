@@ -207,6 +207,16 @@ function cellText(v) {
   return v == null ? '' : String(v);
 }
 
+/* 数据单元格的「写出形态」：= + - @ 开头且不是纯数字时，js/pure.js 的 csvCell 会前置一个单引号中和
+   （CSV 的引号包裹挡不住 Excel 求值）。往返用例验证的就是「写出的那一格能被 RFC4180 解析器逐格还原成这个形态」，
+   规则与 pure.js 的 CSV_NUMBER_ONLY 保持同一份口径。 */
+const CELL_NUMBER_ONLY = new RegExp('^[+-]?([0-9]+([.][0-9]+)?|[.][0-9]+)([eE][+-]?[0-9]+)?$');
+function writtenCell(v) {
+  const s = cellText(v);
+  if (!s || '=+-@'.indexOf(s[0]) < 0 || CELL_NUMBER_ONLY.test(s)) return s;
+  return "'" + s;
+}
+
 const FORMULA_TRIGGERS = '=+-@';
 
 function isFormulaStart(cell) {
@@ -716,7 +726,9 @@ export async function run() {
     const mealsSnapshot = JSON.parse(JSON.stringify(arg.meals === undefined ? null : arg.meals));
     const out = pure.buildDaySummary(arg);
     if (!out || typeof out !== 'object') return ['返回非对象 ' + rep(out)];
-    if (out.date !== arg.date) errs.push('date 未透传: ' + rep(out.date));
+    // NaN !== NaN 是 JS 的语义（不是「date 没透传」）：两边都是 NaN 时视为同一个值，其余仍用严格不等
+    const bothNaN = typeof out.date === 'number' && typeof arg.date === 'number' && Number.isNaN(out.date) && Number.isNaN(arg.date);
+    if (out.date !== arg.date && !bothNaN) errs.push('date 未透传: ' + rep(out.date));
     if (!out.intake || typeof out.intake !== 'object') errs.push('intake 不是对象');
     else {
       for (const k of ['kcal', 'carb', 'protein', 'fat', 'fiber', 'sodium']) if (!finite(out.intake[k])) errs.push('intake.' + k + ' = ' + rep(out.intake[k]));
@@ -826,7 +838,7 @@ export async function run() {
 
   function expectedWeightRows(weights) {
     return weights.map(function (w) {
-      return [cellText(w.date), cellText(w.weightKg), cellText(w.bodyFatPct), cellText(w.note), cellText(w.createdAt)];
+      return [writtenCell(w.date), writtenCell(w.weightKg), writtenCell(w.bodyFatPct), writtenCell(w.note), writtenCell(w.createdAt)];
     });
   }
   function expectedMealRows(meals) {
@@ -835,19 +847,19 @@ export async function run() {
       const items = Array.isArray(m.items) && m.items.length ? m.items : [null];
       for (const it of items) {
         const field = function (k) { return it && typeof it === 'object' ? it[k] : undefined; };
-        out.push([cellText(m.date), cellText(m.slot), cellText(field('name')), cellText(field('grams')), cellText(field('kcal')), cellText(field('carb')),
-          cellText(field('protein')), cellText(field('fat')), cellText(field('fiber')), cellText(field('sodium')), cellText(m.source), cellText(m.createdAt)]);
+        out.push([writtenCell(m.date), writtenCell(m.slot), writtenCell(field('name')), writtenCell(field('grams')), writtenCell(field('kcal')), writtenCell(field('carb')),
+          writtenCell(field('protein')), writtenCell(field('fat')), writtenCell(field('fiber')), writtenCell(field('sodium')), writtenCell(m.source), writtenCell(m.createdAt)]);
       }
     }
     return out;
   }
   function expectedExerciseRows(exercises) {
     return exercises.map(function (e) {
-      return [cellText(e.date), cellText(e.type), cellText(e.minutes), cellText(e.kcalBurned), cellText(e.note), cellText(e.createdAt)];
+      return [writtenCell(e.date), writtenCell(e.type), writtenCell(e.minutes), writtenCell(e.kcalBurned), writtenCell(e.note), writtenCell(e.createdAt)];
     });
   }
   function expectedWaterRows(waters) {
-    return waters.map(function (w) { return [cellText(w.date), cellText(w.ml)]; });
+    return waters.map(function (w) { return [writtenCell(w.date), writtenCell(w.ml)]; });
   }
   function rowKey(row) {
     return JSON.stringify(row);
@@ -997,7 +1009,9 @@ export async function run() {
 
   check('normalize* 精确契约（阈值 / 缺键不落 / 非法丢弃）', function () {
     assert.equal(pure.normalizeWeightRecord({ date: '2026-05-01', weightKg: 0 }), null);
-    assert.equal(pure.normalizeWeightRecord({ date: '2026-02-31', weightKg: 70 }).date, '2026-02-31', 'normalize* 的日期只做形状校验（\d{4}-\d{2}-\d{2}），日历非法日期会进库');
+    // DATE_SHAPE_ONLY 修复后：日历非法日期与 nutrition.parseDateStr 同口径，一律判非法（不再落库）
+    assert.equal(pure.normalizeWeightRecord({ date: '2026-02-31', weightKg: 70 }), null, '2026-02-31 必须判非法');
+    assert.equal(pure.normalizeWeightRecord({ date: '2024-02-29', weightKg: 70 }).date, '2024-02-29', '闰年 2-29 仍应合法');
     assert.equal(pure.normalizeWeightRecord({ date: '2026-05-01', weightKg: '70.55' }).weightKg, 70.6);
     assert.equal('bodyFatPct' in pure.normalizeWeightRecord({ date: '2026-05-01', weightKg: 70, bodyFatPct: 'x' }), false);
     assert.equal(pure.normalizeWaterRecord({ date: '2026-05-01', ml: 0 }), null);
@@ -1066,7 +1080,9 @@ export async function run() {
     assert.equal(pure.keyOf('weights', { date: '2026-05-01', weightKg: 70 }), 'date:2026-05-01');
     assert.equal(pure.keyOf('waters', { date: '2026-05-01', ml: 500 }), 'date:2026-05-01');
     assert.equal(pure.keyOf('meals', { date: '2026-05-01', slot: 'lunch', id: 7, createdAt: 1 }), 'id:7');
-    assert.equal(pure.keyOf('meals', { date: '2026-05-01', slot: 'lunch', createdAt: 1 }), 'fk:2026-05-01:lunch:1');
+    // MEAL_REIMPORT_DOUBLES 修复后指纹是内容摘要（不再带现生成的 createdAt），断言的精确值随之更新
+    assert.equal(pure.keyOf('meals', { date: '2026-05-01', slot: 'lunch', createdAt: 1 }), 'fk:2026-05-01:lunch:741638a509dad92d');
+    assert.equal(pure.keyOf('meals', { date: '2026-05-01', slot: 'lunch' }), 'fk:2026-05-01:lunch:741638a509dad92d', 'createdAt 不参与 meals 指纹');
     assert.equal(pure.keyOf('exercises', { date: '2026-05-01', type: '跑步', minutes: 30, kcalBurned: 300 }), 'fk:2026-05-01:跑步:30:300');
     assert.equal(pure.keyOf('meals', null), '');
     assert.equal(pure.keyOf('meals', undefined), '');
@@ -1148,8 +1164,9 @@ export async function run() {
         Date.now = realNow;
       }
     },
-    want: [['fk:2026-05-01:lunch:1700000000000'], [], []],
-    期望: '[[fk:2026-05-01:lunch:1700000000000], [], []]（只有第一次导入落一行）',
+    // 指纹已改为内容摘要（不含现生成的 createdAt），只更新期望里的键字面量，语义仍是「只有第一次导入落一行」
+    want: [['fk:2026-05-01:lunch:4ac6e8f07a736c28'], [], []],
+    期望: '[[fk:2026-05-01:lunch:4ac6e8f07a736c28], [], []]（只有第一次导入落一行；指纹与 createdAt 无关）',
     判断: 'planImport 先 normalize，normalizeMealRecord 给缺失的 createdAt 填 Date.now()，而 keyOf 的 meals 指纹里带了 createdAt → 每次导入都是新指纹，函数注释承诺的「同一份导出重复导入不会翻倍」在缺 createdAt 时失效。exercises 的指纹不含 createdAt，所以没这个问题（不一致）。',
     影响面: '导入「餐具/手改/第三方」JSON（记录没有 createdAt）时，同一份文件重复导入 N 次 → 当天餐次与热量翻 N 倍。应用自身导出的 JSON 带 createdAt，往返导入不翻倍（已用往返用例验证）。',
   });
@@ -1886,7 +1903,7 @@ export async function run() {
     d.schedule('c');
     c.advance(3000);
     d.flush();
-    assert.deepEqual(log[1], ['c', 3000], 'flush 的 waitedMs 语义见 DEBOUNCER_FLUSH_WAITEDMS 探针');
+    assert.deepEqual(log[1], ['c', 0], 'flush 立即触发 → waitedMs 按注释归 0（见 DEBOUNCER_FLUSH_WAITEDMS）');
     assert.equal(d.pending(), false);
 
     d.schedule('d');

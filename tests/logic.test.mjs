@@ -752,7 +752,9 @@ function testNormalize() {
     eq(pure.keyOf('weights', { id: 1, date: '2026-10-01' }), 'date:2026-10-01');
     eq(pure.keyOf('waters', { date: '2026-10-01' }), 'date:2026-10-01');
     eq(pure.keyOf('meals', { id: 3, date: '2026-10-01' }), 'id:3');
-    eq(pure.keyOf('meals', { date: '2026-10-01', slot: 'lunch', createdAt: 9 }), 'fk:2026-10-01:lunch:9');
+    // 指纹格式已随 MEAL_REIMPORT_DOUBLES 修复改为内容摘要（不再带 createdAt），断言同步更新为精确值
+    eq(pure.keyOf('meals', { date: '2026-10-01', slot: 'lunch', createdAt: 9 }), 'fk:2026-10-01:lunch:741638a509dad92d');
+    eq(pure.keyOf('meals', { date: '2026-10-01', slot: 'lunch' }), 'fk:2026-10-01:lunch:741638a509dad92d', 'createdAt 不参与指纹');
     ok(pure.keyOf('exercises', { date: '2026-10-01', type: '慢跑', minutes: 30, kcalBurned: 280 }).startsWith('fk:'));
   });
 
@@ -4046,8 +4048,210 @@ async function testSyncCompression() {
   });
 }
 
+// ---------- 回归：tests/fuzz.data.mjs 找出的 8 条数据层 bug（逐条钉住修复后的契约）----------
+
+/** 迷你 RFC4180 解析器：与 fuzz.data.mjs 同口径（BOM / CRLF / "" 反转义），只用于 CSV 往返验证。 */
+function parseCsvText(text) {
+  const s = text.startsWith('\ufeff') ? text.slice(1) : text;
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (s[i + 1] === '"') { cell += '"'; i += 1; } else inQuotes = false;
+      } else {
+        cell += ch;
+      }
+      continue;
+    }
+    if (ch === '"' && cell === '') inQuotes = true;
+    else if (ch === ',') { row.push(cell); cell = ''; }
+    else if (ch === '\r' && s[i + 1] === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; i += 1; }
+    else if (ch === '\r' || ch === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += ch;
+  }
+  row.push(cell);
+  rows.push(row);
+  if (rows.length > 1 && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === '') rows.pop();
+  return rows;
+}
+
+async function testFuzzDataRegressions() {
+  // M2：ID_EMPTY_BECOMES_ZERO
+  check('回归 ID_EMPTY_BECOMES_ZERO：空串 / [] / false 不算 id，不落 id 键也不折叠去重键', () => {
+    for (const junk of ['', '   ', [], [7], false, true, {}, new Date(0)]) {
+      const w = pure.normalizeWeightRecord({ date: '2026-10-01', weightKg: 70, id: junk });
+      eq('id' in w, false, 'id=' + String(junk) + ' 不该落 id 键');
+      ok(pure.keyOf('meals', { date: '2026-10-01', slot: 'lunch', id: junk }).startsWith('fk:'), 'id=' + String(junk) + ' 应退回内容指纹');
+    }
+    eq(pure.normalizeMealRecord({ date: '2026-10-01', slot: 'lunch', items: [], id: 7 }).id, 7, '数值 id 必须保留');
+    eq(pure.normalizeMealRecord({ date: '2026-10-01', slot: 'lunch', items: [], id: '7' }).id, 7, '数字串 id 归一成数值');
+    eq(pure.normalizeMealRecord({ date: '2026-10-01', slot: 'lunch', items: [], id: null }).id, undefined, 'null 不算 id');
+
+    const plan = pure.planImport('meals', [], [
+      { id: '', date: '2026-05-01', slot: 'lunch', items: [{ name: '米饭', grams: 200, kcal: 232 }] },
+      { id: '', date: '2026-05-01', slot: 'dinner', items: [{ name: '面条', grams: 300, kcal: 330 }] },
+    ]);
+    eq(plan.length, 2, '两条空 id 的不同记录不该被折叠成一条');
+    deep(plan.map((r) => r.items[0].name), ['米饭', '面条']);
+
+    const ex = pure.planImport('exercises', [], [
+      { id: [], date: '2026-05-01', type: '跑步', minutes: 30, kcalBurned: 300 },
+      { id: [], date: '2026-05-01', type: '游泳', minutes: 40, kcalBurned: 400 },
+    ]);
+    eq(ex.length, 2, 'exercises 的空数组 id 也不该折叠');
+  });
+
+  // L3：MEAL_REIMPORT_DOUBLES
+  check('回归 MEAL_REIMPORT_DOUBLES：缺 createdAt 的餐次重复导入不翻倍（指纹不含现生成的 createdAt）', () => {
+    const realNow = Date.now;
+    let t = 1700000000000;
+    Date.now = () => t;
+    try {
+      const raw = { date: '2026-05-01', slot: 'lunch', items: [{ name: '米饭', grams: 200, kcal: 232 }] };
+      const first = pure.planImport('meals', [], [raw]);
+      eq(first.length, 1, '首次导入应落一行');
+      t += 60000;
+      const second = pure.planImport('meals', first, [raw]);
+      eq(second.length, 0, '第二次导入同一份 JSON 不该新增行');
+      t += 60000;
+      eq(pure.planImport('meals', first.concat(second), [raw]).length, 0, '第三次导入不该新增行');
+    } finally {
+      Date.now = realNow;
+    }
+    const lunch = { date: '2026-05-01', slot: 'lunch', items: [{ name: '米饭', grams: 200, kcal: 232 }] };
+    eq(
+      pure.keyOf('meals', lunch),
+      pure.keyOf('meals', { ...lunch, createdAt: 999 }),
+      '指纹不该随 createdAt 变化（与 exercises 的内容指纹口径一致）',
+    );
+    ok(pure.keyOf('meals', lunch) !== pure.keyOf('meals', { ...lunch, slot: 'dinner' }), '餐次不同必须指纹不同');
+    ok(
+      pure.keyOf('meals', lunch) !== pure.keyOf('meals', { ...lunch, items: [{ name: '面条', grams: 300, kcal: 330 }] }),
+      '内容不同必须指纹不同',
+    );
+    ok(pure.keyOf('meals', lunch).startsWith('fk:2026-05-01:lunch:'), '指纹应保留 date/slot 前缀可读性');
+  });
+
+  // M1：CSV_FORMULA_INJECTION
+  check('回归 CSV_FORMULA_INJECTION：= + - @ 开头的单元格被中和，CSV 仍可逐格还原', () => {
+    const csv = pure.buildCSV({
+      weights: [{ date: '2026-10-01', weightKg: 70, note: '=1+1' }],
+      meals: [{
+        date: '2026-10-01',
+        slot: 'lunch',
+        source: 'manual',
+        createdAt: 1,
+        items: [{ name: "=cmd|' /C calc'!A0", grams: 100, kcal: 1 }, { name: '=a,b', grams: 50, kcal: 1 }],
+      }],
+      exercises: [
+        { date: '2026-10-01', type: '+1+1', minutes: 30, kcalBurned: 1, createdAt: 1 },
+        { date: '2026-10-01', type: '@SUM(A1:A2)', minutes: 1, kcalBurned: 1, createdAt: 2 },
+        { date: '2026-10-01', type: '-1+1', minutes: 1, kcalBurned: 1, createdAt: 3 },
+      ],
+      waters: [{ date: '2026-10-01', ml: 500 }],
+    });
+    const rows = parseCsvText(csv);
+    for (const row of rows) for (const cell of row) eq(/^[=+\-@]/.test(cell), false, '公式前缀单元格未中和: ' + cell);
+    const cells = rows.flat();
+    ok(cells.includes("'=1+1"), '备注应被中和成前置单引号');
+    ok(cells.includes("'=cmd|' /C calc'!A0"), '条目名应被中和');
+    ok(cells.includes("'=a,b"), '同时含逗号的公式单元格：中和 + RFC4180 引号包裹后仍应逐格还原');
+    ok(cells.includes("'+1+1") && cells.includes("'@SUM(A1:A2)") && cells.includes("'-1+1"), '四种触发字符都要中和');
+    eq(rows[rows.findIndex((r) => r[0] === '# 运动') + 1].length, 6, '中和不该改变列数');
+    ok(pure.buildCSV({ weights: [{ date: '2026-10-01', weightKg: -5 }] }).includes('2026-10-01,-5,'), '纯数字（-5）保持数字语义，不加前缀');
+  });
+
+  // L1：NUMERIC_OVERFLOW_INFINITY
+  check('回归 NUMERIC_OVERFLOW_INFINITY：有限大数溢出后归 0，不吐 ±Infinity', () => {
+    eq(nutrition.round1(1e308), 0);
+    eq(nutrition.round1(-1e308), 0);
+    eq(nutrition.round1(Number.MAX_VALUE), 0, 'MAX_VALUE 乘 10 溢出后必须归 0');
+    const huge = { kcal: 1e308, carb: 1e308, protein: 1e308, fat: 1e308, fiber: 1e308, sodium: 1e308 };
+    deep(nutrition.sumItems([huge, huge]), { kcal: 0, carb: 0, protein: 0, fat: 0, fiber: 0, sodium: 0 }, '累加溢出必须归 0');
+    ok(Number.isFinite(nutrition.sumItems([huge]).kcal), '没有溢出的有限和要原样保留，不许一刀切归零');
+    deep(
+      nutrition.scaleFood({ kcal: 1e308, carb: 1e308, protein: 1e308, fat: 1e308, fiber: 1e308, sodium: 1e308 }, 1e308),
+      { kcal: 0, carb: 0, protein: 0, fat: 0, fiber: 0, sodium: 0 },
+    );
+    eq(nutrition.kcalFromMacros({ carb: 1e308, protein: 1e308, fat: 1e308 }), 0);
+    eq(nutrition.netKcal(1e308, -1e308), 0);
+    eq(nutrition.estimateBurn({ type: 'jog', minutes: 1e15, weightKg: 1e308 }), 0);
+    eq(nutrition.movingAverage([{ date: 'd1', value: 1e308 }, { date: 'd2', value: 1e308 }], 7)[1].avg, 0);
+    const item = pure.normalizeMealItem({ name: '米饭', grams: 1e308, kcal: 1e308, carb: 1e308, protein: 1e308, fat: 1e308, fiber: 1e308, sodium: 1e308 });
+    // kcal 走 int(Math.round) 不会溢出，1e308 原样保留；其余走 round1（×10 溢出）→ 0。全都必须是有限数。
+    deep(item, { name: '米饭', grams: 0, kcal: 1e308, carb: 0, protein: 0, fat: 0, fiber: 0, sodium: 0 });
+    ok(Object.values(item).every((v) => typeof v === 'string' || Number.isFinite(v)), '整形结果不许出现 ±Infinity');
+    deep(pure.normalizeMealItem(item), item, '溢出输入上 normalizeMealItem 必须幂等');
+    eq(pure.buildDaySummary({ date: '2026-10-01', meals: [{ date: '2026-10-01', items: [{ carb: 1e308, kcal: 1e308 }] }] }).intake.carb, 0);
+  });
+
+  // L2：DATE_SHAPE_ONLY
+  check('回归 DATE_SHAPE_ONLY：日历非法日期与 parseDateStr 口径一致，不落库也不进区间图', () => {
+    eq(pure.normalizeWeightRecord({ date: '2026-02-31', weightKg: 70 }), null);
+    eq(pure.normalizeMealRecord({ date: '2026-13-01', slot: 'lunch', items: [] }), null);
+    eq(pure.normalizeWaterRecord({ date: '2026-02-30', ml: 500 }), null);
+    eq(pure.normalizeExerciseRecord({ date: '2026-04-31', type: '慢跑', minutes: 30 }), null);
+    ok(pure.normalizeWeightRecord({ date: '2024-02-29', weightKg: 70 }), '闰年 2-29 仍应合法');
+    eq(pure.normalizeWeightRecord({ date: '2026-02-29', weightKg: 70 }), null, '平年 2-29 应非法');
+    const w = pure.normalizeWeightRecord({ date: '2026-02-31', weightKg: 70 });
+    deep(pure.buildRangeRows({ fromDate: '2026-02-01', toDate: '2026-03-31', weights: w ? [w] : [] }), [], '非法日期不该出现在区间图里');
+    eq(pure.keyOf('weights', { date: '2026-02-31' }), 'date:2026-02-31', 'weights 仍按日期键（与 normalize 的合法性判定无关）');
+  });
+
+  // M3：MERGE_DROPS_LOCAL_SETTINGS
+  check('回归 MERGE_DROPS_LOCAL_SETTINGS：远端设置只剩密钥时等于没表态，本机设置整份沿用', () => {
+    const local = {
+      settings: { apiKey: FAKE_API_KEY, model: 'qwen3-vl-plus', weightUnit: 'jin' },
+      meta: { settings: { apiKey: FAKE_API_KEY, model: 'qwen3-vl-plus', weightUnit: 'jin' } },
+    };
+    const remote = { settings: { apiKey: '云端那份' }, meta: { settings: { apiKey: '云端那份' } } };
+    const out = pure.mergeRemoteIntoLocal({ remote, local });
+    deep(out.settings, { apiKey: FAKE_API_KEY, model: 'qwen3-vl-plus', weightUnit: 'jin' }, '顶层 settings 不该被掏空');
+    deep(out.meta.settings, { apiKey: FAKE_API_KEY, model: 'qwen3-vl-plus', weightUnit: 'jin' }, 'meta.settings 同上');
+    deep(pure.mergeRemoteIntoLocal({ remote: { settings: { apiKey: '云端那份' } } }), { settings: {} }, '本机没有密钥时远端密钥仍必须被剥掉');
+    const mixed = pure.mergeRemoteIntoLocal({ remote: { settings: { apiKey: '云端那份', model: '远端模型' } }, local });
+    eq(mixed.settings.model, '远端模型', '剥完还有非密钥键 → 仍以远端为准');
+    eq(mixed.settings.apiKey, FAKE_API_KEY, '密钥只认本机');
+    eq(mixed.settings.weightUnit, undefined, '远端没表态的非密钥键不该由本机补上');
+    deep(remote, { settings: { apiKey: '云端那份' }, meta: { settings: { apiKey: '云端那份' } } }, '入参不得被改动');
+  });
+
+  // L5：DEBOUNCER_FLUSH_WAITEDMS
+  check('回归 DEBOUNCER_FLUSH_WAITEDMS：flush 的 waitedMs 恒为 0，定时器到点仍报真实时长', () => {
+    const clock = fakeClock();
+    const fired = [];
+    const d = sync.createDebouncer({ delayMs: 5000, onFire: (r, w) => fired.push([r, w]), now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+    d.schedule('手动同步');
+    clock.advance(3000);
+    d.flush();
+    deep(fired, [['手动同步', 0]], 'flush 立即触发时 waitedMs 必须是 0');
+
+    const clock2 = fakeClock();
+    const fired2 = [];
+    const d2 = sync.createDebouncer({ delayMs: 5000, onFire: (r, w) => fired2.push([r, w]), now: clock2.now, setTimer: clock2.setTimer, clearTimer: clock2.clearTimer });
+    d2.schedule('到点');
+    clock2.advance(5000);
+    deep(fired2, [['到点', 5000]], '定时器自然到点必须报告真实等待时长');
+  });
+
+  // L4：MERGEDISH_NAMELESS_ITEM
+  await checkAsync('回归 MERGEDISH_NAMELESS_ITEM：缺 name 的食物合并后 name 兜底为空串', async () => {
+    const foodView = await import('../views/food.js');
+    const item = foodView.mergeToDish([{ name: '鸡蛋' }], { id: 'x', per100g: { kcal: 100, carb: 1, protein: 1, fat: 1 } }, 100)[0];
+    eq(item.name, '', '缺 name 必须是空串，不是 undefined');
+    eq('name' in item, true);
+    deep(Object.keys(item).sort(), ['carb', 'fat', 'foodId', 'grams', 'kcal', 'name', 'protein']);
+    for (const key of ['grams', 'kcal', 'carb', 'protein', 'fat', 'foodId']) ok(item[key] !== undefined, '合并条目不该带 undefined 值: ' + key);
+  });
+}
+
 export async function run() {
   testDates();
+  await testFuzzDataRegressions();
   testMetabolism();
   testBmiBoundaries();
   testExerciseBurn();
