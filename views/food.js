@@ -327,6 +327,27 @@ export function mergeConfirmMessage(itemCount, food) {
   return `当前 ${Math.max(0, Number(itemCount) || 0)} 项将被替换成「${name}」`;
 }
 
+/**
+ * 替换条目：用户手选了一个新食物，把这一项换成它。
+ * 克数沿用「修改」面板里的当前值；越界（<1 或 >2000）时回落到新食物的默认份量。
+ * 营养按新食物的每 100g 重算，name/foodId 跟着换，confidence 记手选的「高」；
+ * note 等其它字段原样保留（新食物缺 fiber/sodium 就不继承旧值，免得张冠李戴）。
+ * 注：替换成手选食物后**不写 confidence**——那个字段表达的是「AI 识别的可信度」，
+ * 手工挑选没有识别过程，标一个置信度反而是噪音；同时数据层白名单（js/pure.js 的 CONFIDENCE）
+ * 只收 high/medium/low，写「高」会在归一化时被滤掉，等于两处都不一致。
+ */
+export function replaceMealItem(item, food, grams) {
+  const base = item && typeof item === 'object' ? item : {};
+  const value = Number(grams);
+  const keep = Number.isFinite(value) && value >= 1 && value <= 2000 ? clampGrams(value) : pickDefaultGrams(food);
+  const merged = { ...base, ...scaleFood(food, keep) };
+  delete merged.confidence;
+  const per100g = (food && food.per100g) || {};
+  if (per100g.fiber == null) delete merged.fiber;
+  if (per100g.sodium == null) delete merged.sodium;
+  return merged;
+}
+
 /* ---------- 常吃套餐（SPEC §7 饮食：一键记入 + 存为套餐） ---------- */
 
 /** 只渲染前 6 个；脏数据（缺 name）直接丢掉，不占位。 */
@@ -990,8 +1011,16 @@ async function manualFlow(date, reload) {
   }
 }
 
+// 「修改」面板：改克数（单位 chip + 克数 + 实时预览 + 目测参考）/ 替换食物 / 删除这一项。
+// index 始终是原始 items 数组里的位置 —— 列表渲染层传进来的索引语义不变。
 async function editMealPortion(meal, index, reload) {
-  const item = meal.items[index];
+  const items = Array.isArray(meal.items) ? meal.items : [];
+  const item = items[index];
+  // 脏记录防御：非对象条目没有可编辑的内容，提示一句就退，不让 undefined 漏进面板。
+  if (!item || typeof item !== 'object') {
+    toast('这一项读不出来，刷新后再试', 'error');
+    return;
+  }
   const grams = el('input', { className: 'input', type: 'number', value: String(item.grams), min: '1', max: '2000', step: '1' });
   const preview = el('div', { className: 'muted portion-preview' });
   const update = () => {
@@ -1006,24 +1035,95 @@ async function editMealPortion(meal, index, reload) {
     if (chipRow) chipRow.sync();
   });
   update();
+
+  // 替换食物要先记下面板里的当前克数：选完新食物按它重算，越界才回落新食物的默认份量。
+  let gramsAtClose = String(grams.value);
+  let closeSheet = () => {};
   const action = await openSheet({
-    title: `修改份量 · ${item.name}`,
-    content: el('div', { className: 'col' },
-      chipRow ? chipRow.node : null,
-      el('label', { className: 'field' }, el('span', { className: 'field__label', text: '克数' }), grams),
-      preview,
-      el('div', { className: 'portion-ref', text: PORTION_REF_TEXT }),
-    ),
-    actions: [{ text: '保存', value: 'save', primary: true }, { text: '取消', value: null }],
+    title: `修改 · ${item.name}`,
+    content: ({ close }) => {
+      closeSheet = close;
+      return el('div', { className: 'col' },
+        chipRow ? chipRow.node : null,
+        el('label', { className: 'field' }, el('span', { className: 'field__label', text: '克数' }), grams),
+        preview,
+        el('div', { className: 'portion-ref', text: PORTION_REF_TEXT }),
+        el('button', {
+          className: 'btn btn--ghost btn--block', type: 'button', text: '替换食物',
+          attr: { 'aria-label': `把 ${item.name} 换成别的食物` },
+          onClick: () => {
+            gramsAtClose = String(grams.value);
+            closeSheet('replace');
+          },
+        }),
+      );
+    },
+    actions: [
+      { text: '保存', value: 'save', primary: true },
+      { text: '删除这一项', value: 'delete', danger: true },
+      { text: '取消', value: null },
+    ],
   });
+  if (action === 'delete') {
+    // 危险操作：先问一句。删掉最后一条能渲染的条目后这一餐就空了，连整餐一起删。
+    const lastOne = !items.some((it, i) => i !== index && it && typeof it === 'object');
+    const ok = await confirmDialog({
+      title: '删除这一项？',
+      message: lastOne ? `${item.name} · 这是这一餐的最后一项，整餐会一起删掉` : `${item.name} · ${fmtKcal(item.grams)}g`,
+      okText: '删除',
+    });
+    if (!ok) return;
+    await removeMealItem(meal, index, reload);
+    return;
+  }
+  if (action === 'replace') {
+    await replaceMealItemFlow(meal, index, item, gramsAtClose, reload);
+    return;
+  }
   if (action !== 'save') return;
-  const nextItems = meal.items.map((it, i) => (i === index ? rescaleItem(it, grams.value) : it));
+  const nextItems = items.map((it, i) => (i === index ? rescaleItem(it, grams.value) : it));
   try {
     await updateMeal(meal.id, { items: nextItems });
     toast('份量已更新', 'ok');
     await reload();
   } catch (err) {
     toast(`更新失败：${err && err.message ? err.message : err}`, 'error');
+  }
+}
+
+// 删除这一项：剩下的条目里再没有能渲染的对象时，这一餐已经空了，连整餐一起删。
+async function removeMealItem(meal, index, reload) {
+  const items = Array.isArray(meal.items) ? meal.items : [];
+  const rest = items.filter((_, i) => i !== index);
+  const hasItemLeft = rest.some((it) => it && typeof it === 'object');
+  try {
+    if (hasItemLeft) {
+      await updateMeal(meal.id, { items: rest });
+      toast('已删除这一项', 'ok');
+    } else {
+      await deleteMeal(meal.id);
+      toast('已删除最后一项，整餐已移除', 'ok');
+    }
+    await reload();
+  } catch (err) {
+    toast(`删除失败：${err && err.message ? err.message : err}`, 'error');
+  }
+}
+
+// 替换食物：复用既有的食物搜索弹层（openPickFoodSheet），选中后整项换成新食物。
+async function replaceMealItemFlow(meal, index, item, rawGrams, reload) {
+  const pick = await openPickFoodSheet({ title: '换成别的食物', mode: 'pick' });
+  if (!pick || !pick.food) return;
+  const next = replaceMealItem(item, pick.food, rawGrams);
+  // 只替换原始数组里的这一格，其余条目原样带回去。
+  const items = Array.isArray(meal.items) ? meal.items : [];
+  const nextItems = items.map((it, i) => (i === index ? next : it));
+  try {
+    await updateMeal(meal.id, { items: nextItems });
+    toast(`已换成 ${next.name}`, 'ok');
+    await reload();
+  } catch (err) {
+    toast(`替换失败：${err && err.message ? err.message : err}`, 'error');
   }
 }
 
@@ -1074,7 +1174,7 @@ function renderMealCard(meal, reload) {
         el('div', { className: 'list__item--meta', text: `${itemGrams}g${hint ? `（${hint}）` : ''} · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
       ),
       el('button', {
-        className: 'btn btn--ghost btn--sm', text: '份量',
+        className: 'btn btn--ghost btn--sm', text: '修改',
         onClick: () => editMealPortion(meal, index, reload),
       }),
     ));
