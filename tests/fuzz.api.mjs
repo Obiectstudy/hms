@@ -13,6 +13,8 @@
  * 用法：
  *   node tests/fuzz.api.mjs                 # 干跑：不联网，只列出计划
  *   $env:HMS_FUZZ_API='1'; node tests/fuzz.api.mjs
+ *   $env:HMS_FUZZ_API='1'; $env:HMS_FUZZ_CEILING_TARGETS='102400,102401'; node tests/fuzz.api.mjs --ceiling
+ *                                           # 独立入口：只探测网关请求体上限（目标走 env；二分用 HMS_FUZZ_CEILING_BISECT='lo,hi'）
  *
  * 清理（tcb db execute 一次只跑一条语句）：
  *   见 CLEANUP_SQL
@@ -245,6 +247,52 @@ function expectCors(ctx, entry, name, origin) {
   if (!/content-type/i.test(entry.cors['access-control-allow-headers'] || '')) problems.push('allow-headers=' + JSON.stringify(entry.cors['access-control-allow-headers']));
   if (!/origin/i.test(entry.cors.vary || '')) problems.push('vary=' + JSON.stringify(entry.cors.vary));
   return ok(ctx, name, problems.length === 0, 'HTTP ' + entry.status + ' ' + JSON.stringify(entry.cors), '带 acao=' + wantOrigin + ' / allow-methods / allow-headers / vary: origin');
+}
+
+// ---------- 网关请求体上限：已记录的设计契约（不是服务端缺陷） ----------
+
+/**
+ * 事实（已用 --ceiling 入口二分钉死）：POST /api/push 的真实请求体上限由网关决定 = 102400 字节。
+ *   102400 字节 → 200；102401 字节 → 413 EXCEED_MAX_PAYLOAD_SIZE；413 响应不带任何 access-control-* 头。
+ * 网关先于云函数拦截：函数根本没被调用，所以服务端 MAX_PAYLOAD_BYTES=8388608 / MAX_BODY_BYTES=9437184
+ * 这两个常量在真实链路上不可达 —— 这不是服务端缺陷（服务端无从修起；平台侧也改不了：tcb cors add 受
+ * 套餐限制、网关行为不可配置）。
+ *
+ * 已实现的设计对策：客户端 PUSH_BODY_LIMIT_BYTES=100000 前置拦截 + gzip 压缩上传。
+ *   - 阈值来源：js/cloud-api.js（GATEWAY_MAX_REQUEST_BYTES=102400）→ js/sync.js（PUSH_BODY_LIMIT_BYTES=100000，
+ *     给 token 与包装留 2400 字节余量）；
+ *   - 超限时直接返回 payload-too-large、一个请求都不发：js/cloud-transport.js；
+ *   - 压缩把有效上限提到约 610KB~1.4MB（取决于压缩率）；
+ *   - 守门断言在 tests/logic.test.mjs：「sync/压缩: 导出契约完整，安全阈值 = 网关硬上限 − 2400 字节余量」、
+ *     「传输层: push 收到超限载荷 → 中文失败且零请求；小载荷不受影响」（断言「超限时一个请求都不许发」）。
+ *
+ * fuzz 这边的策略：探测照发（证明网关边界仍在），但断言的是「网关当前行为」——期望 413 +
+ * EXCEED_MAX_PAYLOAD_SIZE + 不含 access-control-*，命中即用 note 记录契约、不再报 finding；
+ * 平台哪天变了（放开/调小上限、补 CORS、换错误体）会立刻断言失败报警，届时按新行为更新本契约与客户端阈值。
+ */
+const GATEWAY_LIMIT_BYTES = 102400;
+const GATEWAY_LIMIT_CODE = 'EXCEED_MAX_PAYLOAD_SIZE';
+
+/** 各契约 note 共用的事实段（网关上限是平台行为、服务端不可修、客户端已对策）——四处记录保持一致。 */
+const GATEWAY_CONTRACT_NOTE = '契约：网关 POST /push 硬上限 = 102400 字节（已二分钉死），网关在云函数之前拦截、函数根本没被调用 —— 服务端 MAX_PAYLOAD_BYTES=8388608 / MAX_BODY_BYTES=9437184 在真实链路上不可达，这不是服务端缺陷（服务端无从修起；平台侧也改不了：tcb cors add 受套餐限制、网关行为不可配置）。对策：客户端 PUSH_BODY_LIMIT_BYTES=100000 前置拦截 + gzip 压缩（有效上限约 610KB~1.4MB），超限请求根本不会发出（js/sync.js / js/cloud-transport.js；守门断言在 tests/logic.test.mjs「传输层: push 收到超限载荷 → 中文失败且零请求」断言「超限时一个请求都不许发」）。平台若变更上限或补 CORS，本处断言立刻失败报警。';
+
+/** 断言「超限请求被网关挡下」＝当前契约：413 + EXCEED_MAX_PAYLOAD_SIZE + 无 access-control-* 头。 */
+function expectGatewayOverLimit(ctx, entry, name) {
+  const corsKeys = Object.keys(entry.cors || {}).filter((k) => k.indexOf('access-control-') === 0);
+  const hitOk = ok(ctx, name + '：网关 413（契约：POST /push 请求体上限 ' + GATEWAY_LIMIT_BYTES + ' 字节；平台若放开上限，这里立刻报警）', entry.status === 413, 'HTTP ' + entry.status + ' body=' + clip(entry.text, 160) + ' cors=' + JSON.stringify(entry.cors), 'HTTP 413');
+  const codeOk = ok(ctx, name + '：413 体含 ' + GATEWAY_LIMIT_CODE, String(entry.text || '').indexOf(GATEWAY_LIMIT_CODE) !== -1, 'body=' + clip(entry.text, 160), '含 ' + GATEWAY_LIMIT_CODE);
+  const corsOk = ok(ctx, name + '：响应不含 access-control-*（网关级 413 不带 CORS，属当前平台行为）', corsKeys.length === 0, 'access-control-* = ' + JSON.stringify(corsKeys), '无 access-control-*');
+  return hitOk && codeOk && corsOk;
+}
+
+/** 断言 ceiling 探测目标落在契约的哪一侧：≤ 102400 应 200，> 102400 应 413（网关行为一旦变化立刻报警）。 */
+function expectGatewayBoundary(ctx, entry) {
+  const t = entry.bodyBytes;
+  const name = 'ceiling: body=' + t + ' bytes';
+  if (t <= GATEWAY_LIMIT_BYTES) {
+    return ok(ctx, name + '：≤ ' + GATEWAY_LIMIT_BYTES + ' 字节应为 200（平台若调小上限，这里立刻报警）', entry.status === 200, 'HTTP ' + entry.status + ' body=' + clip(entry.text, 160), 'HTTP 200');
+  }
+  return expectGatewayOverLimit(ctx, entry, name);
 }
 
 function addFinding(ctx, f) {
@@ -633,25 +681,20 @@ async function groupPushValidation(ctx) {
     }
   }
 
-  // 1MB 载荷：网关可能先于云函数拦截。两种结果都记录下来（这是「真实上限」的证据，不是断言失败）
+  // 1MB 载荷：真实上限由网关决定（102400 字节）—— 网关先于云函数拦截。原 f-gateway-body-ceiling finding 写在了
+  // 已废弃的假设上（「服务端 8MiB 允许 1MB」），现改写为「契约 note + 断言网关当前行为」：期望 413 +
+  // EXCEED_MAX_PAYLOAD_SIZE + 无 access-control-*；平台若放开/调小上限或补 CORS，断言立刻失败报警。
   const p1m = { kind: 'fuzz', n: 2, blob: 'm'.repeat(1024 * 1024) };
   const e1m = await push(ctx, 'g5-16 1MB payload', token, ctx.rev, p1m);
-  if (e1m.status === 200) {
+  if (e1m.status === 413) {
+    note(ctx, 'g5-16-413', '1MB payload（请求体 ' + e1m.bodyChars + ' 字节）被网关 413 拦下：' + clip(e1m.text, 160) + ' cors=' + JSON.stringify(e1m.cors) + '。' + GATEWAY_CONTRACT_NOTE + '平台放开限制后可用以下命令复验：' + toCurl(e1m, { builder: 'buildBodyOfExactLength' }) + ' ； ' + toReproCode(e1m, 'buildBodyOfExactLength'));
+    expectGatewayOverLimit(ctx, e1m, 'g5-16 1MB payload');
+  } else if (e1m.status === 200) {
     ctx.rev = e1m.json.rev;
-    note(ctx, 'g5-16-accepted', '1MB payload（请求体 ' + e1m.bodyChars + ' 字节）被接受，rev=' + e1m.json.rev);
-  } else if (e1m.status === 413) {
-    note(ctx, 'g5-16-413', '1MB payload（请求体 ' + e1m.bodyChars + ' 字节）被网关以 413 拒绝：' + clip(e1m.text, 160) + ' cors=' + JSON.stringify(e1m.cors));
-    addFinding(ctx, {
-      id: 'f-gateway-body-ceiling',
-      endpoint: 'POST /api/push',
-      严重度: '高（用户数据同步彻底失败，且客户端无法诊断：无 CORS 头的 413 在 WebView 里只会显示「网络不可用」）',
-      request: toCurl(e1m, { builder: 'buildBodyOfExactLength' }) + '\n' + toReproCode(e1m, 'buildBodyOfExactLength'),
-      actual: 'HTTP 413 body=' + clip(e1m.text, 240) + ' cors=' + JSON.stringify(e1m.cors) + '（请求体仅 ' + e1m.bodyChars + ' 字节）',
-      expected: 'HTTP 200 { rev }（服务端 MAX_PAYLOAD_BYTES=8388608 允许 1MB 载荷）',
-      verdict: '真实请求体上限由网关决定且远小于服务端常量：实测网关上限 = 102400 字节（见 --ceiling 独立探测 / f-gateway-body-ceiling-exact），MAX_PAYLOAD_BYTES=8MiB 在真实链路上不可达，1MB 级快照就已经发不上去；且 413 是网关响应，不带 CORS 头、不是协议错误体，客户端只会误报「网络不可用」',
-    });
+    note(ctx, 'g5-16-accepted', '1MB payload（请求体 ' + e1m.bodyChars + ' 字节）被接受，rev=' + e1m.json.rev + '：网关上限疑似已被平台放开，请复核 GATEWAY_LIMIT_BYTES 契约与客户端 PUSH_BODY_LIMIT_BYTES');
+    ok(ctx, 'g5-16 1MB 请求体应被网关 413 拦下（契约：上限 102400 字节），实际到了服务端', false, 'HTTP 200 rev=' + JSON.stringify(e1m.json && e1m.json.rev), 'HTTP 413 + EXCEED_MAX_PAYLOAD_SIZE');
   } else {
-    expectStatus(ctx, e1m, 200, 'push 1MB payload → 200');
+    ok(ctx, 'g5-16 网关行为偏离已记录契约（HTTP ' + e1m.status + '）', false, 'HTTP ' + e1m.status + ' body=' + clip(e1m.text, 160) + ' cors=' + JSON.stringify(e1m.cors), 'HTTP 413 + EXCEED_MAX_PAYLOAD_SIZE + 无 access-control-*');
   }
 }
 
@@ -683,6 +726,9 @@ async function groupPayloadFaults(ctx) {
   for (const f of faults) {
     const e = f.entry;
     if (e.status === 200) {
+      // pf-1-accepted = 服务端「净化 payload 非法码元（NUL / 落单代理项）」（commit a113f1f）修复的正向验证：
+      // 修复前含 U+0000 的 payload 会永久 500（走下面的 >=500 分支），修复生效后它被净化并 200 落库 —— 这条
+      // note 证明修复生效，不是缺陷豁免；若哪天退回 5xx，下面的 f-payload-pf-1 finding 会立刻把它揪出来。
       ctx.rev = e.json && e.json.rev ? e.json.rev : ctx.rev;
       note(ctx, f.id + '-accepted', f.name + '：HTTP 200 rev=' + JSON.stringify(e.json && e.json.rev) + '（被接受）');
     } else if (e.status >= 500) {
@@ -712,8 +758,11 @@ async function groupPayloadFaults(ctx) {
   const over = buildPayloadOverLimit();
   const eOver = await post(ctx, 'pf-4 payload 超限 1 码元', 'push', JSON.stringify({ token, baseRev: ctx.rev, payload: over }), { timeoutMs: 90000 });
   const overChars = JSON.stringify(over).length;
-  if (eOver.status === 400) {
-    expectBodyField(ctx, eOver, 'message', 'payload 过大', 'pf-4 超限 payload 被以「payload 过大」拒绝');
+  if (eOver.status === 413) {
+    // 网关先于云函数拦截：原 f-payload-over-limit finding 期望的 400「payload 过大」在真实链路上不可达（函数
+    // 根本没被调用），已废弃 —— 改写为「契约 note + 断言网关当前行为」；平台若放开上限（这里拿到 400/200/其它）立刻报警。
+    note(ctx, 'pf-4', '超限 payload（JSON 文本 ' + overChars + ' 码元 / ' + byteLen(JSON.stringify(over)) + ' 字节，服务端上限 MAX_PAYLOAD_BYTES=' + MAX_PAYLOAD_BYTES + '）在到达函数前被网关 413 拦下：' + clip(eOver.text, 200) + ' cors=' + JSON.stringify(eOver.cors) + '。' + GATEWAY_CONTRACT_NOTE + '平台放开限制后可用以下命令复验：' + toReproCode(eOver, 'buildPayloadOverLimit') + ' ； ' + toCurl(eOver, { builder: 'buildPayloadOverLimit' }));
+    expectGatewayOverLimit(ctx, eOver, 'pf-4 超限 payload');
   } else if (eOver.status >= 500) {
     addFinding(ctx, {
       id: 'f-payload-over-limit-500',
@@ -725,16 +774,8 @@ async function groupPayloadFaults(ctx) {
       verdict: '超限 payload 没有走校验分支而是 5xx',
     });
   } else {
-    note(ctx, 'pf-4', '超限 payload（JSON 文本 ' + overChars + ' 码元 / ' + byteLen(JSON.stringify(over)) + ' 字节，函数上限 ' + MAX_PAYLOAD_BYTES + '）返回 HTTP ' + eOver.status + ' body=' + clip(eOver.text, 200) + ' cors=' + JSON.stringify(eOver.cors));
-    addFinding(ctx, {
-      id: 'f-payload-over-limit',
-      endpoint: 'POST /api/push',
-      严重度: eOver.status === 200 ? '高（超限载荷被接受、落库，配额与存储失控）' : '低（网关提前拦截，返回体不带 CORS/JSON，客户端只能显示「网络不可用」）',
-      request: toReproCode(eOver, 'buildPayloadOverLimit'),
-      actual: 'HTTP ' + eOver.status + ' body=' + clip(eOver.text, 200) + ' cors=' + JSON.stringify(eOver.cors),
-      expected: '400 bad-request「payload 过大」（服务端 MAX_PAYLOAD_BYTES=' + MAX_PAYLOAD_BYTES + ' 判定）',
-      verdict: eOver.status === 200 ? '服务端上限判定被绕过' : '服务端 400 分支在真实链路上不可达：网关先以非 JSON/无 CORS 的方式拒绝，客户端无法区分「载荷过大」与「网络故障」',
-    });
+    // 400 / 200 / 其它：超限请求抵达了云函数（或行为异常）—— 网关上限疑似已被平台变更，报警，不静默接受。
+    ok(ctx, 'pf-4 超限 payload 应被网关 413 拦下（契约：上限 102400 字节），实际 HTTP ' + eOver.status + ' —— 请复核 GATEWAY_LIMIT_BYTES 契约', false, 'HTTP ' + eOver.status + ' body=' + clip(eOver.text, 200) + ' cors=' + JSON.stringify(eOver.cors), 'HTTP 413 + EXCEED_MAX_PAYLOAD_SIZE + 无 access-control-*');
   }
 
   if (ctx.rev === baseRev && eOver.status !== 200) {
@@ -1038,7 +1079,12 @@ export async function probePayloadCeiling(options) {
     note(ctx, 'ceiling-range', '网关请求体上限落在 (' + lo + ', ' + hi + '] 字节：≤ ' + lo + ' 成功，' + hi + ' 起 413');
   } else {
     const targets = envTargets.length ? envTargets : [MIB, MIB + 1];
-    for (const t of targets) await probe(t);
+    for (const t of targets) {
+      const { entry } = await probe(t);
+      // 探测照发（证明网关边界仍在）；断言的是网关当前行为：≤102400 → 200，>102400 → 413 + EXCEED + 无 CORS。
+      // 平台若调小/放开上限或补 CORS，这里立刻失败报警（契约全文见 GATEWAY_LIMIT_BYTES 注释）。
+      expectGatewayBoundary(ctx, entry);
+    }
     const bad = evidence.filter((e) => e.status === 413).map((e) => e.target);
     const good = evidence.filter((e) => e.status === 200).map((e) => e.target);
     if (bad.length) ceilingDesc = '上限 < ' + Math.min.apply(null, bad) + (good.length ? '，且在 ' + Math.max.apply(null, good) + ' 之上' : '');
@@ -1059,28 +1105,10 @@ export async function probePayloadCeiling(options) {
     }
   }
 
+  // 契约记录：原 f-gateway-body-ceiling-exact / f-gateway-413-no-cors 两条 finding 已按「网关上限是平台行为、
+  // 服务端不可修、客户端已对策」改写为 note；探测与断言仍在（见 expectGatewayBoundary），平台若变更会立刻失败报警。
   if (ceilingDesc) {
-    const f = evidence.filter((e) => e.status === 413)[0];
-    addFinding(ctx, {
-      id: 'f-gateway-body-ceiling-exact',
-      endpoint: 'POST /api/push',
-      严重度: '高（服务端写的 8MiB 快照上限在真实链路上不可达；超限时客户端只会看到「网络不可用」）',
-      request: 'node -e "const{m}=await import(\'./tests/fuzz.api.mjs\');…" 或直接：curl.exe -s -i -X POST "' + ctx.baseUrl + '/push" -H "content-type: application/json" --data-binary @body.bin（body.bin 用 buildBodyOfExactLength(N, $TOKEN, 0) 生成）',
-      actual: evidence.map((e) => '请求体 ' + e.target + ' 字节 → HTTP ' + e.status + (e.status === 413 ? ' ' + clip(e.body, 120) : '') + ' cors=' + JSON.stringify(e.cors)).join(' | '),
-      expected: '扩到 8388608 字节都应当由云函数自己的 400 分支处理（MAX_PAYLOAD_BYTES）',
-      verdict: '网关真实请求体上限 ' + ceilingDesc + '，远小于服务端常量 MAX_PAYLOAD_BYTES=8388608，且 413 响应不带 CORS 头、不是协议错误体 —— 这是用户「快照大了就同步不上」的根因',
-    });
-    if (f && f.cors && !f.cors['access-control-allow-origin']) {
-      addFinding(ctx, {
-        id: 'f-gateway-413-no-cors',
-        endpoint: 'POST /api/push（网关 413）',
-        严重度: '中（客户端错误处理退化为「网络不可用」，用户无法自救）',
-        request: 'curl.exe -s -i -X POST "' + ctx.baseUrl + '/push" -H "content-type: application/json" --data-binary @/<超过网关上限的请求体>',
-        actual: 'HTTP 413 headers=' + JSON.stringify(f.cors),
-        expected: '至少带 access-control-allow-origin（cloud/README.md §13 承诺所有响应带 CORS 头）',
-        verdict: '网关级错误没有 CORS 头：真机 WebView 读不到 413，js/cloud-api.js 会把它归到 network-error',
-      });
-    }
+    note(ctx, 'ceiling-contract', '网关请求体上限契约：' + ceilingDesc + '；' + GATEWAY_CONTRACT_NOTE + '本次实测：' + evidence.filter((e) => e.status !== undefined).map((e) => e.target + ' 字节 → HTTP ' + e.status).join('，') + '；断言的目标行为 = 413 + ' + GATEWAY_LIMIT_CODE + ' + 无 access-control-*。平台放开限制后可用以下命令复验：curl.exe -s -i -X POST "' + ctx.baseUrl + '/push" -H "content-type: application/json" --data-binary @body.bin（body.bin 由 buildBodyOfExactLength(N, $TOKEN, 0) 生成，N 取 102400 / 102401 等边界值）');
   }
   return ceilingSummary(ctx, evidence);
 }

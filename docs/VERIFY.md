@@ -123,3 +123,28 @@ node tests/all.mjs
 ### 待真机确认：CORS 修复后的真实注册（2026-10-22 起）
 云函数已补 CORS（OPTIONS→204 + 所有响应带 `access-control-allow-*`），真环境 curl 实测通过；
 但**真机 WebView 发起的注册尚未被用户确认成功**。失败现象应为 toast「网络不可用，请检查网络后重试」。
+
+### 后端 fuzz 套件的正确跑法（2026-10-23 定）
+
+**主套件单独跑有一个盲区**：如果平台把网关请求体上限从 102400 **调小**，主套件发现不了——
+它那两条超限探针（1MB / 8MiB+1）在任何调小幅度下**照样返回 413**，断言照样通过。
+
+所以例行回归要跑**两条**：
+
+```powershell
+node tests/fuzz.api.mjs                                    # 干跑，0 请求
+$env:HMS_FUZZ_API='1'; node tests/fuzz.api.mjs             # 主套件，约 96 请求
+$env:HMS_FUZZ_API='1'; $env:HMS_FUZZ_CEILING_TARGETS='102400,102401'; node tests/fuzz.api.mjs --ceiling
+                                                           # 边界探针，仅 5~7 请求 ← 唯一的"上限被调小"报警器
+```
+
+**为什么客户端阈值不会自动跟随**：`js/sync.js` 的 `PUSH_BODY_LIMIT_BYTES=100000` 是
+`GATEWAY_MAX_REQUEST_BYTES(102400) − 2400` 算出来的**常量**，与平台真实值无运行时耦合。
+平台调小上限后**必须人工同步**这两个数字，否则客户端会发出越界请求（表现为网关 413、界面只说"网络不可用"）。
+
+**跑完记得清理测试账号**（套件不自清）：
+```sql
+DELETE FROM users WHERE username_lower LIKE 'fuzz_%';
+DELETE FROM users WHERE username_lower IN ('fz3');
+```
+（`tcb db execute` 一次只跑一条语句；跑完核对 `users` 计数回到只有你自己的账号。）
