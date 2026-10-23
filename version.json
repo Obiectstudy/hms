@@ -1,9 +1,9 @@
 {
-    "versionCode":  9,
-    "versionName":  "1.7.0",
-    "apkUrl": "https://hms-d4gnh63iw73f09792-1513758162.tcloudbaseapp.com/HMS-latest.apk",
-    "sha256":  "24c88afed3cb9aef279218ccba3a965dfd2a7506de40dfb0e8a41f403c0872c0",
-    "size":  1786238,
-    "notes":  "新增多账号与云同步：可在设置→账号里注册云账号，换设备登录同一账号即可复原数据（含常吃/整日套餐与设置）；API Key 不上传；同步走腾讯云开发网关，不需要数据库密码。另含 iOS 适配（Safari 添加到主屏幕）。",
-    "publishedAt":  "2026-10-22"
+    "versionCode":  10,
+    "versionName":  "1.8.0",
+    "apkUrl":  null,
+    "sha256":  "8c32db89b8068b9191cdf46633e0f10c3b958ec576aa9c56ee769b859f61cc9d",
+    "size":  1798248,
+    "notes":  "修复了一批同步与数据问题：· 连点「+250」不再少记水量；· 保存成功后的提示现在能看到了（原来被页面刷新吃掉）；· 导入数据不再丢行、重复导入不再翻倍；· 导出的 CSV 在 Excel/WPS 里不会被当公式执行；· 数据变大后仍能同步（改用压缩上传，单次上限提升 6~14 倍）；· 个别脏数据不再让页面整页打不开；· 云同步：注册、拉取、冲突处理的若干问题已修。",
+    "publishedAt":  "2026-10-23"
 }
