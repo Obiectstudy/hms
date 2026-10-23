@@ -6,6 +6,7 @@
  */
 import { createHash, randomBytes, scryptSync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { gzipSync, gunzipSync } from 'node:zlib';
 
 const api = (await import('../cloud/functions/hms-api/index.js')).default;
 const RECOVERY_ALPHABET = api.RECOVERY_ALPHABET;
@@ -1011,6 +1012,143 @@ async function run() {
   check('超限时什么都不写（库里仍是上一份快照 {}），rev 未推进', deepEqual((await sanEnv.req('/pull', { token: sanToken })).body.payload, {}), 'rev 未推进');
   check('上限常量一个字没改（线上不可达的死代码，别动）', api.MAX_PAYLOAD_BYTES === 8 * 1024 * 1024 && /const MAX_BODY_BYTES = 9 \* 1024 \* 1024;/.test(readFileSync(new URL('../cloud/functions/hms-api/index.js', import.meta.url), 'utf8')), String(api.MAX_PAYLOAD_BYTES));
   check('日志字段名是导出常量（文档与测试都按它识别这类情况）', api.TOO_LARGE_LOG_FIELD === 'tooLarge', String(api.TOO_LARGE_LOG_FIELD));
+
+  // ==================== 14. 压缩上传载荷（{ __gz }）在服务端解压 ====================
+  // 客户端为绕开网关约 100KB 的请求体上限，把大快照压成 { __gz: '<base64(gzip(JSON))>' } 再上传。
+  // 服务端必须在写库前解回明文：库里只要存着 { __gz }，旧客户端（网页资源内嵌、不会自动更新）
+  // 会把包装体当成普通数据 loadAll(replace) 写进本机业务表并推进 rev，回推时再当云端快照传上来。
+  const gzEnv = makeEnv();
+  await gzEnv.req('/register', { username: 'gz_user', password: 'gz-pass-12345' });
+  const gzToken = (await gzEnv.req('/login', { username: 'gz_user', password: 'gz-pass-12345' })).body.token;
+  // 抓住真正传给 $4::jsonb 的那根字符串（假库只按语义解析，这里要看原始形态）
+  const gzWrites = [];
+  const gzRawQuery = gzEnv.db.query.bind(gzEnv.db);
+  gzEnv.db.query = async (sql, params) => {
+    const out = await gzRawQuery(sql, params);
+    if (String(sql).indexOf('INSERT INTO snapshots') !== -1) gzWrites.push(Array.isArray(params) ? params.slice() : []);
+    return out;
+  };
+  /** 压缩包装体：与 js/sync.js 的 compressToBase64 + compressedPayloadOf 同一形状。 */
+  const gzEnvelope = (value) => ({
+    [api.COMPRESSED_FIELD]: gzipSync(Buffer.from(typeof value === 'string' ? value : JSON.stringify(value), 'utf8')).toString('base64'),
+  });
+  const gzRev = async () => (await gzEnv.req('/pull', { token: gzToken })).body.rev;
+  const GZ_PAYLOAD = {
+    账号: '小明',
+    weights: [{ date: '2024-05-01', kg: 68.5, note: '早上空腹' }],
+    meals: [{ id: 'm1', name: '番茄炒蛋', kcal: 178, items: [{ name: '米饭', g: 150 }] }],
+    nested: { a: [1, 2, { b: '中文 😀 混排' }], c: null, d: true },
+    标记: 'LOGMARK_GZ_CONTENT',
+  };
+
+  // ----- a) 压缩 push：库里必须是明文 -----
+  const gzPush = await gzEnv.req('/push', { token: gzToken, baseRev: 0, payload: gzEnvelope(GZ_PAYLOAD) });
+  check('14a) 压缩 push → 200 且 rev 推进到 1', gzPush.status === 200 && gzPush.body.rev === 1, gzPush.status + ' ' + gzPush.raw);
+  check('14a) 进 $4::jsonb 的是明文 JSON：里里外外一个 __gz 都没有', gzWrites.length === 1 && typeof gzWrites[0][3] === 'string' && gzWrites[0][3].indexOf('__gz') === -1, String(gzWrites[0] && gzWrites[0][3]).slice(0, 140));
+  check('14a) 写进去的明文与压缩前的原文深度相等', gzWrites.length === 1 && deepEqual(JSON.parse(gzWrites[0][3]), GZ_PAYLOAD), String(gzWrites[0] && gzWrites[0][3]).slice(0, 140));
+  check('14a) 库里（按 $4::jsonb 语义解析后）就是明文对象', deepEqual(gzEnv.db.dump().snapshots[0].payload, GZ_PAYLOAD), JSON.stringify(gzEnv.db.dump().snapshots[0].payload).slice(0, 140));
+
+  // ----- b) pull 回来必须还是原文（旧客户端看到的形态） -----
+  const gzPull = await gzEnv.req('/pull', { token: gzToken });
+  check('14b) 压缩 push 之后 pull 回来的 payload 与压缩前原文深度相等', gzPull.status === 200 && deepEqual(gzPull.body.payload, GZ_PAYLOAD), JSON.stringify(gzPull.body.payload).slice(0, 140));
+  check('14b) pull 响应里根本搜不到 __gz（旧客户端读到的就是普通快照）', gzPull.raw.indexOf('__gz') === -1, gzPull.raw.slice(0, 140));
+  check('14b) 顶层键与原文完全一致（包装体没有残留、也没多出字段）', Object.keys(gzPull.body.payload).join(',') === Object.keys(GZ_PAYLOAD).join(','), Object.keys(gzPull.body.payload).join(','));
+
+  // ----- c) 明文 push 零回归 -----
+  const gzPlain = { 账号: '小明', weights: [{ date: '2024-06-01', kg: 67.9 }], 标记: 'PLAIN_NO_GZ' };
+  const gzPlainPush = await gzEnv.req('/push', { token: gzToken, baseRev: 1, payload: gzPlain });
+  check('14c) 明文 push（没有 __gz）行为不变：200 / rev 推进 / 逐字节原样落库', gzPlainPush.status === 200 && gzPlainPush.body.rev === 2 && deepEqual(gzEnv.db.dump().snapshots[0].payload, gzPlain), gzPlainPush.status + ' ' + gzPlainPush.raw);
+  check('14c) 明文路径的日志里不出现压缩元信息（不画蛇添足）', gzEnv.logs[gzEnv.logs.length - 1].indexOf('compressed') === -1, gzEnv.logs[gzEnv.logs.length - 1]);
+
+  // ----- d) 空串 / 非字符串的 __gz：按明文处理，绝不当成压缩体 -----
+  const gzDValues = [['空串', ''], ['数字', 5], ['null', null], ['对象', { a: 1 }], ['数组', [1, 2]]];
+  for (const pair of gzDValues) {
+    const baseRev = await gzRev();
+    const payload = { __gz: pair[1], keep: 'this-is-data-' + pair[0] };
+    const res = await gzEnv.req('/push', { token: gzToken, baseRev: baseRev, payload: payload });
+    const stored = gzEnv.db.dump().snapshots[0].payload;
+    check('14d) __gz 是' + pair[0] + ' → 按明文处理（200 且逐字节原样落库）', res.status === 200 && res.body.rev === baseRev + 1 && deepEqual(stored, payload), res.status + ' ' + res.raw + ' / ' + JSON.stringify(stored).slice(0, 80));
+  }
+
+  // ----- e) base64 非法 → 400，且日志与库里都不留内容 -----
+  const gzLogsBefore = gzEnv.logs.length;
+  const gzRevBefore = await gzRev();
+  const gzSnapBefore = gzEnv.db.dump().snapshots;
+  const gzBadB64 = await gzEnv.req('/push', { token: gzToken, baseRev: gzRevBefore, payload: { __gz: 'LOGMARK_BAD_B64!!!这不是 base64!!!' } });
+  check('14e) base64 非法 → 400 bad-request + 中文说明', gzBadB64.status === 400 && gzBadB64.body.error === 'bad-request' && gzBadB64.body.message.indexOf('base64') !== -1, gzBadB64.status + ' ' + gzBadB64.raw);
+  check('14e) 拒绝时日志里不含失败载荷的原文（标记串一个字符都不出现）', gzEnv.logs.slice(gzLogsBefore).join('\n').indexOf('LOGMARK_BAD_B64') === -1, gzEnv.logs.slice(gzLogsBefore).join('\n'));
+  check('14e) 非法 base64 时不写库：快照与 rev 都停在原地', deepEqual(gzEnv.db.dump().snapshots, gzSnapBefore) && (await gzRev()) === gzRevBefore, 'rev=' + (await gzRev()));
+  const gzNonCanonical = await gzEnv.req('/push', { token: gzToken, baseRev: gzRevBefore, payload: { __gz: 'AB==' } });
+  check('14e) 非规范尾比特（AB==）也按非法 base64 拒绝，而不是静默解出 0x00', gzNonCanonical.status === 400 && gzNonCanonical.body.error === 'bad-request', gzNonCanonical.status + ' ' + gzNonCanonical.raw);
+
+  // ----- f) base64 合法但不是 gzip → 400 -----
+  const gzNotGzip = await gzEnv.req('/push', { token: gzToken, baseRev: gzRevBefore, payload: { __gz: Buffer.from('这压根不是 gzip 数据', 'utf8').toString('base64') } });
+  check('14f) base64 合法但不是 gzip → 400 bad-request + 中文说明 gzip', gzNotGzip.status === 400 && gzNotGzip.body.error === 'bad-request' && gzNotGzip.body.message.indexOf('gzip') !== -1, gzNotGzip.status + ' ' + gzNotGzip.raw);
+  const gzTruncated = await gzEnv.req('/push', { token: gzToken, baseRev: gzRevBefore, payload: { __gz: gzipSync(Buffer.from('{}', 'utf8')).subarray(0, 12).toString('base64') } });
+  check('14f) 被截断的 gzip 数据 → 同样 400（不是 500）', gzTruncated.status === 400 && gzTruncated.body.error === 'bad-request', gzTruncated.status + ' ' + gzTruncated.raw);
+
+  // ----- g) 解压出来不是 JSON / 不是对象 → 400 -----
+  const gzNonObjects = [['不是 JSON', '{不是 JSON'], ['数组', '[1,2,3]'], ['数字', '42'], ['null', 'null'], ['字符串', '"text"']];
+  for (const pair of gzNonObjects) {
+    const res = await gzEnv.req('/push', { token: gzToken, baseRev: gzRevBefore, payload: gzEnvelope(pair[1]) });
+    check('14g) 解压后是' + pair[0] + ' → 400 bad-request + 中文', res.status === 400 && res.body.error === 'bad-request' && /(JSON|对象)/.test(res.body.message), res.status + ' ' + res.raw);
+  }
+  check('14g) 五连拒之后库与 rev 仍停在原地（一次都没写进去）', deepEqual(gzEnv.db.dump().snapshots, gzSnapBefore) && (await gzRev()) === gzRevBefore, 'rev=' + (await gzRev()));
+
+  // ----- h) gzip 炸弹：maxOutputLength 必须生效（400，不是 OOM、更不是 500） -----
+  const GZ_BOMB_MIB = 64;
+  const gzBombGzip = gzipSync(Buffer.alloc(GZ_BOMB_MIB * 1024 * 1024)); // 全 0：压缩比最高的真实炸弹
+  const gzBombBody = JSON.stringify({ token: gzToken, baseRev: gzRevBefore, payload: { __gz: gzBombGzip.toString('base64') } });
+  check('14h) 炸弹请求体 ' + gzBombBody.length + ' 字节，远在网关 102400 上限之内（真能打到函数）', gzBombBody.length < 100000, '请求体 ' + gzBombBody.length + ' 字节');
+  check('14h) 同一份数据不加限制真的能解出 ' + GZ_BOMB_MIB + 'MiB（证明不是空包弹）', gunzipSync(gzBombGzip).length === GZ_BOMB_MIB * 1024 * 1024, '解出 ' + gunzipSync(gzBombGzip).length + ' 字节');
+  const gzBombStarted = Date.now();
+  const gzBombRes = await gzEnv.req('/push', { token: gzToken, baseRev: gzRevBefore, payload: { __gz: gzBombGzip.toString('base64') } });
+  const gzBombMs = Date.now() - gzBombStarted;
+  const gzBombLog = gzEnv.logs[gzEnv.logs.length - 1];
+  check('14h) 超过 maxOutputLength → 400 bad-request（不是 500），' + gzBombMs + 'ms 内返回', gzBombRes.status === 400 && gzBombRes.body.error === 'bad-request' && gzBombRes.body.message.indexOf('过大') !== -1 && gzBombMs < 5000, gzBombRes.status + ' ' + gzBombRes.raw + ' (' + gzBombMs + 'ms)');
+  check('14h) 炸弹被认出来并进日志：tooLarge + limit=8388608', gzBombLog.indexOf('"tooLarge":true') !== -1 && gzBombLog.indexOf('"limit":8388608') !== -1, gzBombLog);
+  check('14h) 炸弹被拦下后库与 rev 未变，函数照常服务（下一发正常 push 仍然 200）', deepEqual(gzEnv.db.dump().snapshots, gzSnapBefore) && (await gzRev()) === gzRevBefore, 'rev=' + (await gzRev()));
+  const gzAfterBomb = await gzEnv.req('/push', { token: gzToken, baseRev: gzRevBefore, payload: gzEnvelope({ 账号: '小明', after: 'bomb' }) });
+  check('14h) 炸弹之后同一个实例仍能正常解压并落库明文', gzAfterBomb.status === 200 && deepEqual(gzEnv.db.dump().snapshots[0].payload, { 账号: '小明', after: 'bomb' }), gzAfterBomb.status + ' ' + gzAfterBomb.raw);
+
+  // ----- i) 解压 → 净化 两步协同（NUL 与落单代理项照样被清掉） -----
+  const gzDirtyLogsFrom = gzEnv.logs.length;
+  const gzDirtyPush = await gzEnv.req('/push', {
+    token: gzToken,
+    baseRev: await gzRev(),
+    payload: gzEnvelope(JSON.stringify({ a: 'x\u0000y', b: 'z\ud800', ok: '保留' })),
+  });
+  const gzDirtyLog = gzEnv.logs.slice(gzDirtyLogsFrom).find((line) => line.indexOf('"route":"push"') !== -1) || '';
+  const gzDirtyBack = (await gzEnv.req('/pull', { token: gzToken })).body.payload;
+  check('14i) 压缩载荷解出来的 NUL / 落单代理项仍被净化（解压 → 净化两步协同）', gzDirtyPush.status === 200 && deepEqual(gzDirtyBack, { a: 'xy', b: 'z', ok: '保留' }), JSON.stringify(gzDirtyBack));
+  check('14i) 净化计数照旧进日志（本例删了 2 处）', gzDirtyLog.indexOf('"sanitized":2') !== -1, gzDirtyLog);
+
+  // ----- j) 新增分支不掉 CORS 头 -----
+  const gzCorsOk = gzAfterBomb.headers;
+  const gzCorsBad = gzBadB64.headers;
+  const gzCorsFull = (h) => h['access-control-allow-origin'] === '*' && h['access-control-allow-methods'] === 'POST, OPTIONS' && typeof h['access-control-allow-headers'] === 'string' && h['access-control-max-age'] === '86400' && h.vary === 'origin';
+  check('14j) 压缩 push 的成功响应带全套 CORS 头', gzCorsFull(gzCorsOk), JSON.stringify(gzCorsOk));
+  check('14j) 压缩载荷被 400 拒绝时也带全套 CORS 头（新分支不丢头）', gzCorsFull(gzCorsBad), JSON.stringify(gzCorsBad));
+
+  // ----- k) 409 冲突语义不受影响（解压通过后才谈 rev） -----
+  const gzCurrentRev = await gzRev();
+  const gzConflict = await gzEnv.req('/push', { token: gzToken, baseRev: gzCurrentRev - 1, payload: gzEnvelope({ x: 1 }) });
+  check('14k) 压缩载荷照样走 409 rev-conflict（响应体仍是 { error, rev }）', gzConflict.status === 409 && gzConflict.body.error === 'rev-conflict' && gzConflict.body.rev === gzCurrentRev && Object.keys(gzConflict.body).sort().join(',') === 'error,rev', gzConflict.status + ' ' + gzConflict.raw);
+
+  // ----- l) 日志只记元信息（是否解压 + 解压后字节数），绝不记内容 -----
+  const gzMetaLogs = gzEnv.logs.filter((line) => line.indexOf('"compressed":true') !== -1);
+  check('14l) 解压日志记 compressed + decompressedBytes（元信息）', gzMetaLogs.length > 0 && /"decompressedBytes":\d+/.test(gzMetaLogs[0]), gzMetaLogs[0] || '(无)');
+  check('14l) 全部日志里搜不到解压内容（标记串 / 中文正文 / __gz 都不出现）', gzEnv.logs.join('\n').indexOf('__gz') === -1 && gzEnv.logs.join('\n').indexOf('LOGMARK_GZ_CONTENT') === -1 && gzEnv.logs.join('\n').indexOf('番茄炒蛋') === -1, '日志条数 ' + gzEnv.logs.length);
+  check('14l) 每条日志都很短（漏进一条 base64 就会让某行爆成几万字符）', gzEnv.logs.every((line) => line.length < 400), '最长 ' + Math.max.apply(null, gzEnv.logs.map((l) => l.length)));
+
+  // ----- m) 边界：解压后接近但不超过 8MiB → 照常收下并存明文 -----
+  const gzNearLimit = { v: 'x'.repeat(8 * 1024 * 1024 - 128) };
+  const gzNearPush = await gzEnv.req('/push', { token: gzToken, baseRev: await gzRev(), payload: gzEnvelope(gzNearLimit) });
+  check('14m) 解压后接近 8MiB（未超）→ 200，且落库是明文（解压路径不比明文路径更严）', gzNearPush.status === 200 && gzEnv.db.dump().snapshots[0].payload.v.length === gzNearLimit.v.length, gzNearPush.status + ' ' + gzNearPush.raw);
+
+  // ----- n) 导出契约（解压器本身可单测） -----
+  check('14n) 导出 COMPRESSED_FIELD = __gz，与前端 GZIP_MARKER_KEY 对齐', api.COMPRESSED_FIELD === '__gz', String(api.COMPRESSED_FIELD));
+  check('14n) decompressPayload 对明文 / 空串 / 非字符串返回 null（调用方按明文处理）', api.decompressPayload({ a: 1 }) === null && api.decompressPayload({ __gz: '' }) === null && api.decompressPayload({ __gz: 7 }) === null, 'ok');
 
   return { passed: passed, failed: failures.length, failures: failures };
 }

@@ -2885,6 +2885,149 @@ export async function run() {
       });
     });
 
+    // ---- 7b. 上传体积与压缩：卡片要如实说明「这次上传会发出去多少字节」 ----
+
+    /** 确定性伪随机串：造「压不动的大载荷」用（xorshift32，gzip 压不下去）。 */
+    const randomText = (size, alphabet) => {
+      const chars = alphabet || 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      let state = 0x2f6e2b1;
+      const out = [];
+      for (let i = 0; i < size; i += 1) {
+        state ^= (state << 13) >>> 0;
+        state >>>= 0;
+        state ^= state >>> 17;
+        state ^= (state << 5) >>> 0;
+        state >>>= 0;
+        out.push(chars[state % chars.length]);
+      }
+      return out.join('');
+    };
+
+    await checkAsync('云同步：卡片显示「上传体积 / 上限」，小数据不报超限', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await store.logWeight({ date: '2001-11-01', weightKg: 69 });
+        const fake = fakeTransport({
+          login: () => ({ ok: true, token: 'tok-size', userId: 'u_size' }),
+          pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+          push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+        });
+        const shown = await renderCloud(fake);
+
+        const row = byClass(shown, 'cloud-status__row').find((r) => r.textOf().includes('上传体积'));
+        assert.ok(row, '卡片缺少「上传体积」一行：' + nodeText(shown).slice(0, 300));
+        assert.ok(/[\d.]+ (B|KB|MB) \/ 上限 [\d.]+ (B|KB|MB)/.test(row.textOf()), '上传体积格式不对：' + row.textOf());
+        assert.equal(row.textOf().includes('已压缩'), false, '这点数据还够不着压缩阈值');
+        assert.equal(byClass(shown, 'cloud-warn').filter((n) => n.textOf().includes('上限')).length, 0, '小数据不该报超限');
+        assertNoLeak(nodeText(shown), 'account(上传体积)');
+      });
+    });
+
+    await checkAsync('云同步：大而可压的数据走压缩上传（卡片标注「已压缩」，上传体是 { __gz }）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        // 大且高度可压缩：真实场景里是「攒了两个月的记录」，这里用重复串代替
+        await db.setMeta('bulk', { blob: '米饭-午餐-2026-03-01;'.repeat(6000) });
+        try {
+          const fake = fakeTransport({
+            login: () => ({ ok: true, token: 'tok-gz', userId: 'u_gz' }),
+            pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+            push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+          });
+          const shown = await loginWith(fake); // 登录后立刻同步一次：这次应该压缩上传
+
+          const row = byClass(shown, 'cloud-status__row').find((r) => r.textOf().includes('上传体积'));
+          assert.ok(row && row.textOf().includes('已压缩'), '卡片应该标注已压缩：' + (row ? row.textOf() : '没有这一行'));
+          assert.equal(byClass(shown, 'cloud-warn').filter((n) => n.textOf().includes('上限')).length, 0, '压得下的数据不该报超限');
+
+          const pushes = fake.calls.filter((c) => c.name === 'push');
+          assert.equal(pushes.length, 1, '压缩后的数据应该照常上传：' + JSON.stringify(fake.calls.map((c) => c.name)));
+          const payload = pushes[0].args.payload;
+          assert.deepEqual(Object.keys(payload), ['__gz'], '上传体应该是 { __gz } 包装：' + JSON.stringify(payload).slice(0, 60));
+          assert.equal(typeof payload.__gz, 'string');
+          const decoded = await syncMod.decodePayloadFromCloud(payload);
+          assert.equal(decoded.ok, true, '上传的压缩体必须能被解回来：' + decoded.message);
+          assert.ok(decoded.payload.meta.bulk.blob.startsWith('米饭-午餐-2026-03-01'), '解回来的数据必须完好');
+          assert.ok(toasts().some((t) => t.includes('已上传本机数据')), '缺少上传成功提示：' + toasts().join(' | '));
+        } finally {
+          await db.del('meta', 'bulk');
+        }
+      });
+    });
+
+    await checkAsync('云同步：没有 CompressionStream 的环境要说明「不支持压缩上传」，同步仍然可用', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        await store.logWeight({ date: '2001-11-11', weightKg: 68 });
+        const savedCompress = Object.getOwnPropertyDescriptor(globalThis, 'CompressionStream');
+        const savedDecompress = Object.getOwnPropertyDescriptor(globalThis, 'DecompressionStream');
+        delete globalThis.CompressionStream;
+        delete globalThis.DecompressionStream;
+        try {
+          const fake = fakeTransport({
+            login: () => ({ ok: true, token: 'tok-nogz', userId: 'u_nogz' }),
+            pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+            push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+          });
+          const shown = await loginWith(fake);
+
+          assert.ok(nodeText(shown).includes('不支持压缩上传'), '卡片没有说明压缩不可用：' + nodeText(shown).slice(0, 300));
+          const row = byClass(shown, 'cloud-status__row').find((r) => r.textOf().includes('上传体积'));
+          assert.ok(row && row.textOf().includes('上限'), '老环境也要显示上传体积');
+          assert.equal(row.textOf().includes('已压缩'), false, '老环境压不了');
+
+          const pushes = fake.calls.filter((c) => c.name === 'push');
+          assert.equal(pushes.length, 1, '老环境也必须能同步（回退成不压缩）');
+          assert.ok(Array.isArray(pushes[0].args.payload.weights), '回退时上传的是原样 JSON：' + JSON.stringify(pushes[0].args.payload).slice(0, 80));
+          assert.ok(pushes[0].args.payload.weights.some((w) => w.date === '2001-11-11'), '上传的载荷不含刚写的记录');
+          assert.ok(toasts().some((t) => t.includes('已上传本机数据')), '缺少上传成功提示：' + toasts().join(' | '));
+        } finally {
+          if (savedCompress) Object.defineProperty(globalThis, 'CompressionStream', savedCompress);
+          if (savedDecompress) Object.defineProperty(globalThis, 'DecompressionStream', savedDecompress);
+        }
+      });
+    });
+
+    await checkAsync('云同步：本机数据超限 → 不发请求、给中文原因、本机数据与锚点都不动', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await store.clearSyncState();
+        const bulk = randomText(260 * 1024);
+        await db.setMeta('bulk', { blob: bulk });
+        try {
+          const fake = fakeTransport({
+            login: () => ({ ok: true, token: 'tok-big', userId: 'u_big' }),
+            pull: () => ({ ok: true, rev: 0, savedAt: 0, payload: {} }),
+            push: ({ baseRev }) => ({ ok: true, rev: baseRev + 1 }),
+          });
+          const shown = await loginWith(fake); // 登录后立刻同步一次：这次必须被前置拦下
+
+          assert.equal(fake.calls.filter((c) => c.name === 'push').length, 0, '超限时不该发出上传请求');
+          const toastText = toasts().join(' | ');
+          assert.ok(toastText.includes('上限'), '超限提示没给中文原因：' + toastText);
+          assert.equal(toastText.includes('网络不可用'), false, '不能退化成「网络不可用」：' + toastText);
+          assert.equal((await store.getSyncState()).rev, 0, '超限时锚点不该被改写');
+          const kept = await db.getMeta('bulk', null);
+          assert.ok(kept && kept.blob === bulk, '本机数据必须原样保留');
+
+          const warn = byClass(shown, 'cloud-warn').find((n) => n.textOf().includes('上限'));
+          assert.ok(warn, '卡片没有给出超限警告：' + nodeText(shown).slice(0, 300));
+          assert.ok(warn.textOf().includes('导出备份'), '超限警告要给出下一步：' + warn.textOf());
+          assertNoLeak(nodeText(shown), 'account(超限)');
+        } finally {
+          await db.del('meta', 'bulk');
+        }
+      });
+    });
+
+
     await checkAsync('云同步：「立即同步」推成功 → rev 递增、锚点更新、标记回到已同步', async () => {
       await withStorage(async () => {
         clearOverlays();

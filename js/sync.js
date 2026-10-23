@@ -373,6 +373,250 @@ export function snapshotSummary(snapshot) {
   };
 }
 
+// ---------- 载荷压缩（网关 POST /push 的请求体上限） ----------
+//
+// 网关对 /push 请求体的硬上限是 102400 字节（实测 102401 → 413 EXCEED_MAX_PAYLOAD_SIZE），
+// 而这个 413 是网关自产的、不带 CORS 头：真机 WebView 读不到响应体，界面只会说「网络不可用」，
+// 用户既看不懂也没法自救。所以「压缩 + 量字节 + 拦下超限」全部放在客户端、发请求之前；
+// 服务端一行不改（它只把 payload 当不透明 JSON 对象存，不需要认识压缩包装）。
+
+/** 压缩包装体的标记键：{ "__gz": "<base64>" }。老快照没有这个键，照旧按普通 JSON 处理。 */
+export const GZIP_MARKER_KEY = '__gz';
+
+/**
+ * 单次上传的请求体安全阈值：网关硬上限 102400（GATEWAY_MAX_REQUEST_BYTES，见 js/cloud-api.js），
+ * 留 2400 字节余量给 token 与包装开销。超过就明确拒绝上传 —— 绝不把注定 413 的请求发出去。
+ */
+export const PUSH_BODY_LIMIT_BYTES = 100000;
+
+/** 低于这个大小就不压缩：base64 的 33% 膨胀加上包装开销会吃掉压缩收益，小数据原样上传更省也更兼容。 */
+export const PUSH_COMPRESS_MIN_BYTES = 8192;
+
+/**
+ * UTF-8 字节数（不是字符数：一个汉字 3 字节、emoji 4 字节）。
+ * 判断超限必须用它 —— String.length 会把中文载荷算小三分之二，正好是最危险的方向。
+ */
+export function utf8Bytes(text) {
+  const src = typeof text === 'string' ? text : String(text ?? '');
+  if (typeof TextEncoder === 'function') return new TextEncoder().encode(src).length;
+  // 兜底（实际上到不了：能跑 ES module 的环境都有 TextEncoder）：没有它就按 UTF-8 规则手算
+  let bytes = 0;
+  for (let i = 0; i < src.length; i += 1) {
+    const code = src.charCodeAt(i);
+    const next = i + 1 < src.length ? src.charCodeAt(i + 1) : 0;
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/**
+ * POST /push 请求体的确切文本：键与顺序跟 js/cloud-api.js 发出去的 body 完全一致（用例钉死）。
+ * 这样「量出来的大小」就是「发出去的大小」，量字节与发请求不存在第二份算法。
+ */
+export function pushBodyText({ token, baseRev, payload } = {}) {
+  return JSON.stringify({ token, baseRev, payload });
+}
+
+/** 压缩包装体：服务端照旧当不透明 JSON 存，客户端靠这个键认出压缩体。 */
+export function compressedPayloadOf(base64) {
+  return { [GZIP_MARKER_KEY]: base64 };
+}
+
+/** 是不是压缩包装体：只认「有 __gz 且为字符串」。普通 JSON 的老快照永远不会命中这条。 */
+export function isCompressedPayload(value) {
+  return isDataObject(value) && typeof value[GZIP_MARKER_KEY] === 'string';
+}
+
+/** 把一段字节灌进 TransformStream 再收回来：浏览器与 Node 通用，不依赖 Blob / Response。 */
+async function pumpThrough(transform, bytes) {
+  const writer = transform.writable.getWriter();
+  const reader = transform.readable.getReader();
+  const chunks = [];
+  const reading = (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  })();
+  const writing = (async () => {
+    await writer.write(bytes);
+    await writer.close();
+  })();
+  await Promise.all([reading, writing]); // 数据坏了 / 流出错在任一侧都会在这里抛
+  let total = 0;
+  for (const chunk of chunks) total += chunk.length;
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return joined;
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(base64) {
+  const binary = atob(base64); // 非法 base64 在这里抛，由调用方翻成中文
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * 环境默认的 gzip 编解码器（CompressionStream / DecompressionStream）。
+ * 拿不到这两个能力（老 WebView）就返回 null —— 调用方必须回退成不压缩上传，绝不能因此同步不了。
+ */
+export function createStreamCompressor(scope) {
+  const source = isDataObject(scope) ? scope : globalThis;
+  const compress = source.CompressionStream;
+  const decompress = source.DecompressionStream;
+  if (typeof compress !== 'function' || typeof decompress !== 'function') return null;
+  if (typeof TextEncoder !== 'function' || typeof TextDecoder !== 'function') return null;
+  return {
+    /** 文本 → gzip 字节 → base64。 */
+    async compressToBase64(text) {
+      const bytes = await pumpThrough(new compress('gzip'), new TextEncoder().encode(String(text ?? '')));
+      return bytesToBase64(bytes);
+    },
+    /** base64 → gzip 字节 → 文本；base64 坏了、或压根不是 gzip 数据都会抛，由调用方翻成中文。 */
+    async decompressFromBase64(base64) {
+      const bytes = await pumpThrough(new decompress('gzip'), base64ToBytes(String(base64 ?? '')));
+      return new TextDecoder().decode(bytes);
+    },
+  };
+}
+
+/** 压缩能力解析：没注入就用环境能力；显式传 null 表示「不要压缩」（老环境模拟与单测用）。 */
+function resolveCompressor(compressor) {
+  if (compressor === null) return null;
+  if (compressor && typeof compressor === 'object') return compressor;
+  return createStreamCompressor();
+}
+
+function positiveBytes(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function kbText(bytes) {
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+function tooLargeMessage(bytes, limit, compressed) {
+  return `本机数据太大：${compressed ? '压缩后' : ''}请求体 ${kbText(bytes)}，超过单次上传上限 ${kbText(limit)}，`
+    + '本次没有上传，本机数据一个字节都没动。请先在设置页导出备份，再清理部分历史数据后重试。';
+}
+
+/**
+ * 上传前的编码 + 前置拦截（纯逻辑，不发任何请求）：
+ *   1) 先量出「原样上传」的请求体字节数；
+ *   2) 载荷够大时 gzip → base64 → { __gz }，只有确实更小才采用；
+ *   3) 环境没有压缩能力 / 压缩反而更大 / 载荷太小 → 原样上传（绝不因为「压不动」就同步不了）；
+ *   4) 最终请求体超过阈值 → ok:false + 中文原因，且不交出 payload / body（免得调用方顺手用上）。
+ * 返回 { ok, mode, compressed, payload, body, bytes, rawBytes, gzipBytes, limitBytes, overLimit, error, message }。
+ */
+export async function encodePayloadForUpload({ payload, token, baseRev, compressor, limitBytes, compressMinBytes } = {}) {
+  const limit = positiveBytes(limitBytes, PUSH_BODY_LIMIT_BYTES);
+  const minBytes = positiveBytes(compressMinBytes, PUSH_COMPRESS_MIN_BYTES);
+  const rejected = (error, message) => ({
+    ok: false, error, message, mode: 'raw', compressed: false, payload: null, body: '',
+    bytes: 0, rawBytes: 0, gzipBytes: 0, limitBytes: limit, overLimit: false,
+  });
+  if (!isDataObject(payload)) return rejected('bad-payload', '本机没有可上传的数据：载荷不是对象');
+  let rawText;
+  try {
+    rawText = pushBodyText({ token, baseRev, payload });
+  } catch (error) {
+    return rejected('bad-payload', `本机数据无法序列化（${reasonOf(error)}），本次没有上传`);
+  }
+  const rawBytes = utf8Bytes(rawText);
+  let gzipPayload = null;
+  let gzipText = '';
+  let gzipBytes = 0;
+  if (rawBytes >= minBytes) {
+    const codec = resolveCompressor(compressor);
+    if (codec && typeof codec.compressToBase64 === 'function') {
+      try {
+        gzipPayload = compressedPayloadOf(await codec.compressToBase64(JSON.stringify(payload)));
+        gzipText = pushBodyText({ token, baseRev, payload: gzipPayload });
+        gzipBytes = utf8Bytes(gzipText);
+      } catch {
+        gzipPayload = null; // 压缩失败不该让同步失败：退回原样上传
+      }
+    }
+  }
+  const compressed = Boolean(gzipPayload) && gzipBytes < rawBytes;
+  const body = compressed ? gzipText : rawText;
+  const bytes = compressed ? gzipBytes : rawBytes;
+  const overLimit = bytes > limit;
+  return {
+    ok: !overLimit,
+    mode: compressed ? 'gzip' : 'raw',
+    compressed,
+    // 超限时一个字节都不交出去：调用方只能拿到「为什么不行」，拿不到能发的载荷
+    payload: overLimit ? null : (compressed ? gzipPayload : payload),
+    body: overLimit ? '' : body,
+    bytes,
+    rawBytes,
+    gzipBytes,
+    limitBytes: limit,
+    overLimit,
+    error: overLimit ? 'payload-too-large' : undefined,
+    message: overLimit ? tooLargeMessage(bytes, limit, compressed) : undefined,
+  };
+}
+
+/**
+ * 云端载荷解码：有 __gz 标记才解压；没有就原样返回（向后兼容 —— 老快照是普通 JSON）。
+ * 解压失败一律 ok:false + 中文原因：绝不把认不出的东西当数据写进本机。
+ */
+export async function decodePayloadFromCloud(payload, options) {
+  const { compressor } = options && typeof options === 'object' ? options : {};
+  if (!isCompressedPayload(payload)) return { ok: true, compressed: false, payload };
+  const codec = resolveCompressor(compressor);
+  if (!codec || typeof codec.decompressFromBase64 !== 'function') {
+    return {
+      ok: false,
+      compressed: true,
+      error: 'no-decompressor',
+      message: '云端数据是压缩格式，但当前环境不支持解压：请升级浏览器或 App 之后再同步',
+    };
+  }
+  let text = '';
+  try {
+    text = await codec.decompressFromBase64(payload[GZIP_MARKER_KEY]);
+  } catch (error) {
+    return {
+      ok: false,
+      compressed: true,
+      error: 'bad-payload',
+      message: `云端数据解压失败（${reasonOf(error)}），可能不是本 App 写上去的压缩快照`,
+    };
+  }
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return { ok: false, compressed: true, error: 'bad-payload', message: '云端数据解压后不是合法 JSON，无法读取' };
+  }
+  if (!isDataObject(data)) {
+    return { ok: false, compressed: true, error: 'bad-payload', message: '云端数据解压后不是快照对象，无法读取' };
+  }
+  return { ok: true, compressed: true, payload: data };
+}
+
 // ---------- 云同步编排（阶段 3：网络与存储都由外面注入） ----------
 // transport 由界面注入（js/cloud-transport.js），存储接口由调用方注入（js/store.js + js/db.js）。
 // 本文件因此依旧零网络、零 DOM、零本地存储：全部依赖都可换成假实现，决策路径能确定性重放。
@@ -430,8 +674,13 @@ function safeRev(value) {
  * @param {string} options.token      本机保存的登录令牌
  * @param {Function} [options.now]    时钟注入，默认 Date.now
  * @param {object} options.storage    { dumpAll, getSyncState, setSyncState, loadAll, getMeta, setMeta }
+ * @param {object} [options.compressor] 压缩器注入（默认用环境的 CompressionStream；传 null = 不压缩）
+ * @param {number} [options.limitBytes] 请求体安全阈值，默认 PUSH_BODY_LIMIT_BYTES
+ * @param {number} [options.compressMinBytes] 触发压缩的最小载荷，默认 PUSH_COMPRESS_MIN_BYTES
  */
-export async function runSyncOnce({ accountId, transport, token, now, storage } = {}) {
+export async function runSyncOnce({
+  accountId, transport, token, now, storage, compressor, limitBytes, compressMinBytes,
+} = {}) {
   const clock = typeof now === 'function' ? now : () => Date.now();
   const missing = missingMethods(storage, SYNC_STORAGE_METHODS);
   if (missing.length) {
@@ -470,12 +719,18 @@ export async function runSyncOnce({ accountId, transport, token, now, storage } 
   if (!remote || remote.ok !== true) {
     return failed('failed', remote?.error ?? 'network', remote?.message || '拉取云端数据失败', localRev);
   }
+  // 2b) 压缩快照（{ __gz }）先解出来再参与决策；解不出来就明确报错并原样保留本机数据，
+  //     绝不把认不出的东西当数据写进本机（老快照没有标记，原样通过）。
+  const decoded = await decodePayloadFromCloud(remote.payload, { compressor });
+  if (!decoded.ok) {
+    return failed('pull', decoded.error, `云端数据读取失败：${decoded.message}；本机数据没有被改动`, localRev);
+  }
   const remoteSnap = parseSnapshot({
     v: SNAPSHOT_VERSION,
     accountId: typeof accountId === 'string' && accountId.trim() ? accountId.trim() : 'remote',
     rev: safeRev(remote.rev),
     savedAt: Number(remote.savedAt) || clock(),
-    payload: remote.payload,
+    payload: decoded.payload,
   });
   const usableRemote = remoteSnap && remoteSnap.rev > 0 ? remoteSnap : null;
 
@@ -491,10 +746,23 @@ export async function runSyncOnce({ accountId, transport, token, now, storage } 
 
   // 4a) 上传
   if (plan.action === 'push') {
+    // 4a-0) 上传前编码：里面能压就压成 { __gz }、压不动就原样；最终请求体超限则在这里直接拦下。
+    // 网关自产的 413 不带 CORS 头，真机上只会显示「网络不可用」——所以宁可不上传，也要给一句能看懂的中文。
+    const upload = await encodePayloadForUpload({
+      // 上传前再剥一次：任何要走云端的 payload 都不许带上 settings 里的密钥
+      payload: stripSyncSecrets(digest.payload),
+      token: auth,
+      baseRev: localRev,
+      compressor,
+      limitBytes,
+      compressMinBytes,
+    });
+    if (!upload.ok) {
+      return failed('push', upload.error ?? 'payload-too-large', upload.message || '本机数据太大，无法上传', localRev);
+    }
     let pushed = null;
     try {
-      // 上传前再剥一次：任何要走云端的 payload 都不许带上 settings 里的密钥
-      pushed = await transport.push({ token: auth, baseRev: localRev, payload: stripSyncSecrets(digest.payload) });
+      pushed = await transport.push({ token: auth, baseRev: localRev, payload: upload.payload });
     } catch (error) {
       return failed('push', 'network', `上传失败：${reasonOf(error)}`, localRev);
     }

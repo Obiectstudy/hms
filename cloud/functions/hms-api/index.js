@@ -17,6 +17,8 @@
  */
 
 const nodeCrypto = require('node:crypto');
+// gunzipSync 是同步的：一次解压最多 8MiB（maxOutputLength 兜底），几十毫秒量级，不需要异步化。
+const nodeZlib = require('node:zlib');
 
 // ---------- 常量 ----------
 
@@ -39,6 +41,10 @@ const RECOVERY_GROUP = 4;
 const MAX_BODY_BYTES = 9 * 1024 * 1024;
 /** 单个快照上限。 */
 const MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
+/** 压缩上传（{ __gz: '<base64(gzip(JSON))>' }）的标记键，与前端 js/sync.js 的 GZIP_MARKER_KEY 对齐。 */
+const COMPRESSED_FIELD = '__gz';
+/** 严格 base64 字符集：标准字母表 + 可选尾部 padding。 */
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 const SCRYPT_KEYLEN = 32;
 const SALT_BYTES = 16;
@@ -460,6 +466,74 @@ function sanitizePayload(root) {
   return { value: removed > 0 ? rootClone : root, removed: removed };
 }
 
+// ---------- 压缩上传载荷的解压（{ __gz } → 明文 JSON） ----------
+//
+// 现场：网关对请求体的上限约 100KB（实测 102400 字节，它自产的 413 不带 CORS 头，真机上只会显示
+// 「网络不可用」）。客户端于是把大快照压成 { "__gz": "<base64(gzip(utf8(JSON)))>" } 再上传。
+//
+// 风险（实测，不是推测）：库里只要存着 { __gz }，**读得懂压缩体的就只有新客户端**。旧版 App
+// （网页资源内嵌、不会自动更新）读到它不报错，反而把 { __gz } 当成普通数据 loadAll(replace)
+// 写进本机业务表并推进 rev，之后回推就把这份垃圾当成云端快照传上来 —— 旧客户端没有任何自我保护。
+//
+// 修法：服务端在写库之前解压，库里永远只存**明文 JSON**。所有客户端（含旧版）pull 到的仍是普通
+// 快照，行为与改动前完全一致：压缩只是「上传通道」的一种编码，不是存储格式。
+//
+// 安全（gzip 炸弹是真实威胁）：100KB 的请求体可以解出几十 GB。所以 gunzipSync **必须**给
+// maxOutputLength（与快照上限同值 MAX_PAYLOAD_BYTES）—— 没有它，一次请求就能把函数内存打爆。
+// 任何失败一律 400 bad-request + 中文（500 会让客户端无限重试），且绝不把内容写进日志。
+
+/**
+ * 严格 base64 解码：Buffer.from(s, 'base64') 对非法输入是**静默**的（'!!!' → 空 buffer，
+ * 非法字符被直接丢掉），所以必须自己挡两道：
+ *   - 正则挡非法字符，以及长度 % 4 == 1（1 个字符连一个字节都不够）；
+ *   - 往返比对挡「非规范尾比特」（如 'AB==' 会被解成 0x00，但按标准它不该被接受）。
+ * 非法一律 400：绝不把坏数据带进后续流程。
+ */
+function decodeBase64Strict(text) {
+  const compact = text.replace(/[\r\n\t ]/g, '');
+  if (!BASE64_RE.test(compact) || compact.length % 4 === 1) throw badRequest('payload.__gz 不是合法的 base64');
+  const bytes = Buffer.from(compact, 'base64');
+  if (bytes.toString('base64').replace(/=+$/, '') !== compact.replace(/=+$/, '')) {
+    throw badRequest('payload.__gz 不是合法的 base64');
+  }
+  return bytes;
+}
+
+/**
+ * 解压压缩载荷；不是压缩体就返回 null（调用方按明文处理，零回归）。
+ * 返回 { value, bytes }：value 是解出来的**对象**，bytes 是解压后的字节数（只进日志的元信息）。
+ * 抛出的都是 HttpError(400)：base64 非法 / 不是 gzip / 超 maxOutputLength / 解出来不是合法 JSON 对象。
+ */
+function decompressPayload(payload) {
+  const wrapped = payload[COMPRESSED_FIELD];
+  // 只有「非空字符串」才算压缩体：空串 / 数字 / null / 对象一律按普通数据走 ——
+  // 用户数据里恰好有个叫 __gz 的普通字段，不该把这次 push 打成 400。
+  if (typeof wrapped !== 'string' || wrapped.length === 0) return null;
+
+  const gzipped = decodeBase64Strict(wrapped);
+  let inflated;
+  try {
+    // maxOutputLength 是这里唯一的内存防线：超了直接抛 ERR_BUFFER_TOO_LARGE，不会先把几十 GB 解出来
+    inflated = nodeZlib.gunzipSync(gzipped, { maxOutputLength: MAX_PAYLOAD_BYTES });
+  } catch (err) {
+    if (err && err.code === 'ERR_BUFFER_TOO_LARGE') throw payloadTooLarge('payload.__gz 解压后过大', MAX_PAYLOAD_BYTES);
+    // Z_DATA_ERROR（incorrect header check）/ Z_BUF_ERROR（数据被截断）等：都不是 gzip
+    throw badRequest('payload.__gz 不是合法的 gzip 数据');
+  }
+
+  const bytes = inflated.length;
+  let value;
+  try {
+    value = JSON.parse(inflated.toString('utf8'));
+  } catch (err) {
+    throw badRequest('payload.__gz 解压后不是合法 JSON');
+  }
+  if (!isRecord(value)) throw badRequest('payload.__gz 解压后必须是 JSON 对象');
+  // 解压路径不许比明文路径宽松：同样要过「是对象 + 序列化后不超过 8MiB」
+  requirePayload(value);
+  return { value: value, bytes: bytes };
+}
+
 // ---------- 会话 ----------
 
 async function requireSession(db, now, token) {
@@ -579,7 +653,11 @@ async function handlePull(body, ctx) {
 async function handlePush(body, ctx) {
   const userId = await requireSession(ctx.db, ctx.now, body.token);
   const baseRev = requireRev(body.baseRev);
-  const payload = requirePayload(body.payload);
+  const outer = requirePayload(body.payload);
+  // 压缩上传（{ __gz }）在写库前解回明文：库里永远只存普通 JSON，旧客户端 pull 到的仍是老样子。
+  // 不是压缩体时 inflated === null，payload 就是原对象，一个字节都不动（零回归）。
+  const inflated = decompressPayload(outer);
+  const payload = inflated ? inflated.value : outer;
   // 写库前净化：jsonb 不收 NUL 与落单代理项，直接写会让合法 JSON 变成永久 500（见 sanitizePayload）
   const cleaned = sanitizePayload(payload);
 
@@ -601,8 +679,13 @@ async function handlePush(body, ctx) {
     const again = firstRow(await ctx.db.query(SQL.snapshotRev, [userId]));
     throw revConflict(again ? toInt(again.rev) : 0);
   }
-  // sanitized 只用于日志计数（删了几处），绝不带内容
-  return { status: 200, body: { rev: toInt(row.rev) }, sanitized: cleaned.removed };
+  // sanitized 只用于日志计数（删了几处），decompressed 只用于日志记「解压后字节数」，两者都绝不带内容
+  return {
+    status: 200,
+    body: { rev: toInt(row.rev) },
+    sanitized: cleaned.removed,
+    decompressed: inflated ? inflated.bytes : null,
+  };
 }
 
 // ---------- 路由 ----------
@@ -697,11 +780,15 @@ function createHandler(options) {
     let body;
     let sanitized = 0;
     let tooLargeLimit = null;
+    let decompressedBytes = null;
     try {
       const result = await dispatch(event, { db, now, randomBytes });
       status = result.status;
       body = result.body;
       sanitized = toInt(result.sanitized);
+      decompressedBytes = result.decompressed === null || result.decompressed === undefined
+        ? null
+        : toInt(result.decompressed);
     } catch (err) {
       if (err instanceof HttpError) {
         status = err.status;
@@ -717,6 +804,11 @@ function createHandler(options) {
     const record = { route: route, status: status, ms: Math.max(0, now() - startedAt) };
     // 净化只记「删了几处」，绝不记被删掉的内容（payload 是用户数据）
     if (sanitized > 0) record.sanitized = sanitized;
+    // 压缩上传只记元信息：这次是不是压缩体、解压后多少字节 —— 绝不记 base64 原文或解压结果
+    if (decompressedBytes !== null) {
+      record.compressed = true;
+      record.decompressedBytes = decompressedBytes;
+    }
     // 超限类别也进日志：网关拦下的 413 不会有任何服务端日志，这一条就是区分的锚点
     if (tooLargeLimit !== null) {
       record[TOO_LARGE_LOG_FIELD] = true;
@@ -1051,7 +1143,9 @@ module.exports = {
   LOCK_MS: LOCK_MS,
   MAX_PAYLOAD_BYTES: MAX_PAYLOAD_BYTES,
   TOO_LARGE_LOG_FIELD: TOO_LARGE_LOG_FIELD,
+  COMPRESSED_FIELD: COMPRESSED_FIELD,
   sanitizePayload: sanitizePayload,
+  decompressPayload: decompressPayload,
   sanitizeText: sanitizeText,
   generateRecoveryCode: generateRecoveryCode,
   normalizeRecoveryCode: normalizeRecoveryCode,

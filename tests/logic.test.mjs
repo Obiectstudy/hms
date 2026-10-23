@@ -16,6 +16,7 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import zlib from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 
 import * as nutrition from '../js/nutrition.js';
@@ -24,6 +25,8 @@ import * as db from '../js/db.js';
 import * as store from '../js/store.js';
 import * as accounts from '../js/accounts.js';
 import * as sync from '../js/sync.js';
+import * as cloudApi from '../js/cloud-api.js';
+import * as cloudTransport from '../js/cloud-transport.js';
 
 const IDB_MSG = '当前浏览器禁用了本地存储，数据无法保存';
 
@@ -3521,6 +3524,528 @@ async function testMutationHooks() {
 
 // ---------- 入口 ----------
 
+// ---------- 云同步的载荷压缩（网关请求体上限 102400 字节） ----------
+//
+// 网关对 /push 请求体的硬上限是 102400 字节，超一个字节就是 413 EXCEED_MAX_PAYLOAD_SIZE，
+// 而那个 413 不带 CORS 头 —— 真机上只会显示「网络不可用」。所以判断必须发生在发请求之前。
+// 这一节盯四件事：UTF-8 字节数算对、压缩往返不丢数据、超限一次请求都不发、老快照照旧能读。
+
+/** 确定性伪随机串：给「压不动的大载荷」用（xorshift32 高低位都均匀，gzip 压不下去）。 */
+function randomText(size, alphabet) {
+  const chars = alphabet || 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let state = 0x2f6e2b1;
+  const out = [];
+  for (let i = 0; i < size; i += 1) {
+    state ^= (state << 13) >>> 0;
+    state >>>= 0;
+    state ^= state >>> 17;
+    state ^= (state << 5) >>> 0;
+    state >>>= 0;
+    out.push(chars[state % chars.length]);
+  }
+  return out.join('');
+}
+
+/** 读起来像真实用户数据的快照载荷：中文 / emoji / 嵌套，每条略有不同（不像 fixture 那样压到 2%）。 */
+function userShapedPayload(records) {
+  const foods = ['米饭', '鸡蛋', '牛奶', '鸡胸肉', '西兰花', '苹果', '全麦面包', '酸奶', '牛肉', '豆腐', '菠菜', '香蕉'];
+  const slots = ['早餐', '午餐', '晚餐', '加餐'];
+  const total = Number.isFinite(records) && records > 0 ? Math.floor(records) : 20;
+  const meals = [];
+  for (let i = 0; i < total; i += 1) {
+    meals.push({
+      id: i + 1,
+      date: '2026-03-' + String(1 + (i % 28)).padStart(2, '0'),
+      slot: slots[i % 4],
+      items: [{
+        name: foods[i % foods.length] + (i % 7 === 0 ? ' 🍚' : ''),
+        grams: 100 + (i % 7) * 25,
+        kcal: 120 + (i % 13) * 17,
+        carbs: Number((12.5 + (i % 11) * 1.7).toFixed(1)),
+        protein: Number((5.5 + (i % 9) * 2.1).toFixed(1)),
+        fat: Number((3.2 + (i % 5) * 1.3).toFixed(1)),
+      }],
+      note: i % 5 === 0 ? '外食，少油' : '',
+      createdAt: 1772000000000 + i * 3600000,
+    });
+  }
+  const weights = [];
+  for (let i = 0; i < Math.max(1, Math.round(total / 10)); i += 1) {
+    weights.push({ date: '2026-02-' + String(1 + (i % 28)).padStart(2, '0'), weightKg: Number((70 - i * 0.15).toFixed(1)) });
+  }
+  return {
+    app: 'hms',
+    schemaVersion: 1,
+    meta: { settings: { model: 'qwen3-vl-plus', weightUnit: 'kg' }, profile: { nickname: '小林 🌱', sex: 'male', birthday: '1990-01-01', heightCm: 175 } },
+    weights,
+    meals,
+    exercises: [],
+    waters: [{ date: '2026-03-01', ml: 1500 }],
+    photoCount: 0,
+  };
+}
+
+/** 与浏览器等价、但走 node:zlib 的压缩器：这组用例不依赖全局 CompressionStream。 */
+function zlibCompressor() {
+  return {
+    async compressToBase64(text) {
+      return zlib.gzipSync(Buffer.from(String(text), 'utf8')).toString('base64');
+    },
+    async decompressFromBase64(base64) {
+      return zlib.gunzipSync(Buffer.from(String(base64), 'base64')).toString('utf8');
+    },
+  };
+}
+
+/** 临时摘掉一个全局（TextEncoder / CompressionStream 之类），无论如何都装回去。 */
+async function withoutGlobal(name, fn) {
+  const had = Object.getOwnPropertyDescriptor(globalThis, name);
+  delete globalThis[name];
+  try {
+    return await fn();
+  } finally {
+    if (had) Object.defineProperty(globalThis, name, had);
+  }
+}
+
+function bodyBytesOf(payload, token, baseRev) {
+  return sync.utf8Bytes(sync.pushBodyText({ token, baseRev, payload }));
+}
+
+function fakePullTransport(pull) {
+  const pushes = [];
+  return {
+    pushes,
+    async pull() {
+      return pull;
+    },
+    async push(args) {
+      pushes.push(args);
+      return { ok: true, rev: 1 };
+    },
+  };
+}
+
+async function testSyncCompression() {
+  // ----- 契约与字节数 -----
+
+  check('sync/压缩: 导出契约完整，安全阈值 = 网关硬上限 − 2400 字节余量', () => {
+    for (const name of ['GZIP_MARKER_KEY', 'PUSH_BODY_LIMIT_BYTES', 'PUSH_COMPRESS_MIN_BYTES', 'utf8Bytes',
+      'pushBodyText', 'compressedPayloadOf', 'isCompressedPayload', 'createStreamCompressor',
+      'encodePayloadForUpload', 'decodePayloadFromCloud']) {
+      ok(name in sync, 'sync.' + name + ' 缺失');
+    }
+    eq(sync.GZIP_MARKER_KEY, '__gz');
+    eq(sync.PUSH_BODY_LIMIT_BYTES, 100000, '安全阈值取 100000 字节');
+    eq(sync.PUSH_BODY_LIMIT_BYTES, cloudApi.GATEWAY_MAX_REQUEST_BYTES - 2400, '阈值必须给 token 与包装留出 2400 字节余量');
+    ok(sync.PUSH_COMPRESS_MIN_BYTES > 0 && sync.PUSH_COMPRESS_MIN_BYTES < sync.PUSH_BODY_LIMIT_BYTES);
+    deep(sync.compressedPayloadOf('AAA'), { __gz: 'AAA' });
+  });
+
+  check('sync/压缩: utf8Bytes 按 UTF-8 算（中文 3 / emoji 4 / 英文 1），与 Buffer.byteLength 一致', () => {
+    const samples = ['', 'abc', '中文', '中'.repeat(50), '小林 🌱', 'a中文b', '😀😀', 'é€', JSON.stringify(userShapedPayload(5))];
+    for (const text of samples) {
+      eq(sync.utf8Bytes(text), Buffer.byteLength(text, 'utf8'), 'UTF-8 字节数不一致: ' + text.slice(0, 16));
+    }
+    eq('中文'.length, 2, '前置: 这两个字的字符数只有 2');
+    eq(sync.utf8Bytes('中文'), 6);
+    eq(sync.utf8Bytes('中'.repeat(5)), 15);
+    eq(sync.utf8Bytes('a'.repeat(5)), 5);
+    eq(sync.utf8Bytes('😀'), 4);
+    eq(sync.utf8Bytes('中'.repeat(10)) === sync.utf8Bytes('a'.repeat(10)), false, '同样字符数的中文与英文字节数必须不同');
+    ok(sync.utf8Bytes('中文') > '中文'.length, '按字符数算会小三分之二: 正好是最危险的方向');
+  });
+
+  await checkAsync('sync/压缩: 没有 TextEncoder 时兜底算法结果不变（与 TextEncoder 逐项一致）', async () => {
+    const samples = ['abc', '中文测试', '小林 🌱 emoji 😀', JSON.stringify(userShapedPayload(3))];
+    const expected = samples.map((text) => sync.utf8Bytes(text));
+    await withoutGlobal('TextEncoder', async () => {
+      eq(typeof globalThis.TextEncoder, 'undefined', '前置: 全局确实被摘掉了');
+      samples.forEach((text, index) => eq(sync.utf8Bytes(text), expected[index], '兜底算法与 TextEncoder 不一致: ' + text.slice(0, 12)));
+      eq(sync.utf8Bytes('中文'), 6);
+      eq(sync.utf8Bytes('😀'), 4);
+    });
+    eq(typeof globalThis.TextEncoder, 'function', '跑完必须把全局装回去');
+  });
+
+  check('sync/压缩: 只认 { __gz } 包装，普通 JSON 老快照不被误判', () => {
+    ok(sync.isCompressedPayload({ __gz: 'H4sIAAAA' }));
+    eq(sync.isCompressedPayload({ __gz: '' }), true, '有键就是压缩体: 空串要在解压时报错，而不是当数据读');
+    eq(sync.compressedPayloadOf('x')[sync.GZIP_MARKER_KEY], 'x');
+    for (const legacy of [SNAP_PAYLOAD, { app: 'hms' }, {}, { gz: 'x' }, { gzipped: true }, { __gz: 5 }, { __gz: null }, null, undefined, 'x', 7, [], [{ __gz: 'z' }]]) {
+      eq(sync.isCompressedPayload(legacy), false, '被误判成压缩体: ' + JSON.stringify(legacy));
+    }
+  });
+
+  check('sync/压缩: 量的是完整请求体（token / baseRev 都算进去）', () => {
+    const payload = { a: 1 };
+    const withToken = bodyBytesOf(payload, 'x'.repeat(500), 9);
+    const withoutToken = bodyBytesOf(payload, '', 9);
+    ok(withToken - withoutToken >= 500, 'token 的长度必须计入: ' + (withToken - withoutToken));
+    eq(sync.pushBodyText({ token: 't', baseRev: 1, payload }).includes('"baseRev":1'), true, 'baseRev 在同一个请求体里');
+    const text = sync.pushBodyText({ token: '中文令牌', baseRev: 1, payload });
+    eq(sync.utf8Bytes(text), Buffer.byteLength(text, 'utf8'), '中文 token 也要按字节算');
+  });
+
+  // ----- 往返 -----
+
+  await checkAsync('sync/压缩: 中文 / emoji / 嵌套载荷编码 → { __gz } → 解码往返深度相等', async () => {
+    const payload = userShapedPayload(60);
+    const codec = zlibCompressor();
+    const encoded = await sync.encodePayloadForUpload({ payload, token: 'tok', baseRev: 3, compressor: codec });
+    eq(encoded.ok, true);
+    eq(encoded.mode, 'gzip');
+    eq(encoded.compressed, true);
+    ok(sync.isCompressedPayload(encoded.payload), '上传的载荷应该是 { __gz } 包装');
+    eq(Object.keys(encoded.payload).join(','), '__gz', '包装体只该有 __gz 一个键');
+    eq(typeof encoded.payload.__gz, 'string');
+    eq(encoded.body.includes('西兰花'), false, '压缩后的请求体里不该还能看到明文');
+    eq(encoded.body.includes('__gz'), true, '请求体里应该出现标记键');
+    const decoded = await sync.decodePayloadFromCloud(encoded.payload, { compressor: codec });
+    eq(decoded.ok, true);
+    eq(decoded.compressed, true);
+    deep(decoded.payload, payload, '往返必须深度相等');
+    deep(JSON.parse(encoded.body).payload, encoded.payload, '服务端视角: 它拿到的就是一个普通 JSON 对象');
+  });
+
+  await checkAsync('sync/压缩: 环境默认压缩器（CompressionStream）同样能往返，且与 zlib 互相认得', async () => {
+    const codec = sync.createStreamCompressor();
+    ok(codec, '这个运行环境应该有 CompressionStream / DecompressionStream');
+    eq(sync.createStreamCompressor({}), null, '没有这两个能力的 scope 必须返回 null');
+    const payload = userShapedPayload(75); // 13KB 量级：超过默认压缩阈值，走真实默认策略
+    const encoded = await sync.encodePayloadForUpload({ payload, token: 't', baseRev: 0, compressor: codec });
+    eq(encoded.mode, 'gzip');
+    ok(encoded.rawBytes > sync.PUSH_COMPRESS_MIN_BYTES, '前置: 这份载荷在默认阈值之上');
+    const decoded = await sync.decodePayloadFromCloud(encoded.payload, { compressor: codec });
+    eq(decoded.ok, true);
+    deep(decoded.payload, payload);
+    const viaZlib = await sync.decodePayloadFromCloud(encoded.payload, { compressor: zlibCompressor() });
+    eq(viaZlib.ok, true);
+    deep(viaZlib.payload, payload, '默认实现产出的 gzip 流必须能被 zlib 解开');
+  });
+
+  // ----- 压缩比 / 回退 -----
+
+  await checkAsync('sync/压缩: ≥20KB 样例压后不到原始的 60%（用户 13KB 规模同样生效）', async () => {
+    const payload = userShapedPayload(120);
+    const rawBytes = bodyBytesOf(payload, 'tok', 1);
+    ok(rawBytes >= 20000, '前置: 样例要 ≥20KB，实际 ' + rawBytes);
+    const encoded = await sync.encodePayloadForUpload({ payload, token: 'tok', baseRev: 1, compressor: zlibCompressor() });
+    eq(encoded.mode, 'gzip');
+    eq(encoded.rawBytes, rawBytes);
+    ok(encoded.bytes < rawBytes * 0.6, '压缩后 ' + encoded.bytes + ' 应不到原始的 60%（原始 ' + rawBytes + '）');
+    ok(encoded.bytes < encoded.rawBytes);
+
+    const userPayload = userShapedPayload(75);
+    const userRaw = bodyBytesOf(userPayload, 'tok', 1);
+    ok(userRaw >= 12000, '前置: 用户规模样例要 ≥12KB，实际 ' + userRaw);
+    const userEncoded = await sync.encodePayloadForUpload({ payload: userPayload, token: 'tok', baseRev: 1, compressor: zlibCompressor() });
+    eq(userEncoded.mode, 'gzip');
+    ok(userEncoded.bytes < userRaw * 0.4, '13KB 规模压缩后 ' + userEncoded.bytes + ' 应不到原始的 40%（原始 ' + userRaw + '）');
+  });
+
+  await checkAsync('sync/压缩: 压缩后反而更大时选择不压缩（小数据不吃 base64 膨胀）', async () => {
+    const payload = { app: 'hms', weights: [{ date: '2026-03-01', weightKg: 70 }], meals: [], exercises: [], waters: [] };
+    const codec = zlibCompressor();
+    const rawBytes = bodyBytesOf(payload, '', 0);
+    const envelope = sync.compressedPayloadOf(await codec.compressToBase64(JSON.stringify(payload)));
+    const gzipBytes = bodyBytesOf(envelope, '', 0);
+    ok(gzipBytes > rawBytes, '前置: 这份小载荷的压缩包装确实更大（' + gzipBytes + ' > ' + rawBytes + '）');
+    const encoded = await sync.encodePayloadForUpload({ payload, token: '', baseRev: 0, compressor: codec, compressMinBytes: 1 });
+    eq(encoded.mode, 'raw', '压缩更大时必须原样上传');
+    eq(encoded.compressed, false);
+    ok(encoded.gzipBytes > encoded.rawBytes, '诊断字段也要说清压缩不划算');
+    deep(encoded.payload, payload, '不压缩时必须原样交出载荷');
+    eq(encoded.bytes, rawBytes);
+    eq(encoded.overLimit, false);
+  });
+
+  await checkAsync('sync/压缩: 默认阈值以下的小载荷原样上传（老客户端也读得懂）', async () => {
+    const encoded = await sync.encodePayloadForUpload({ payload: SNAP_PAYLOAD, token: 'tok', baseRev: 0, compressor: zlibCompressor() });
+    eq(encoded.mode, 'raw');
+    eq(encoded.compressed, false);
+    ok(encoded.rawBytes < sync.PUSH_COMPRESS_MIN_BYTES, '前置: 小载荷要在压缩阈值以下');
+    deep(encoded.payload, SNAP_PAYLOAD);
+    eq(encoded.bytes, bodyBytesOf(SNAP_PAYLOAD, 'tok', 0));
+    eq(encoded.body, sync.pushBodyText({ token: 'tok', baseRev: 0, payload: SNAP_PAYLOAD }));
+  });
+
+  // ----- 超限拦截（编码层） -----
+
+  await checkAsync('sync/压缩: 压缩后仍超限 → ok:false + 中文原因，且不交出载荷', async () => {
+    const huge = { app: 'hms', meta: { bulk: randomText(260 * 1024) }, weights: [], meals: [], exercises: [], waters: [] };
+    const encoded = await sync.encodePayloadForUpload({ payload: huge, token: 'tok', baseRev: 2, compressor: zlibCompressor() });
+    eq(encoded.ok, false);
+    eq(encoded.error, 'payload-too-large');
+    eq(encoded.overLimit, true);
+    ok(encoded.bytes > encoded.limitBytes, '压完还是超限: ' + encoded.bytes);
+    ok(encoded.gzipBytes > encoded.limitBytes, '前置: 这份数据压不动（压缩后 ' + encoded.gzipBytes + ' 仍超限）');
+    eq(encoded.payload, null, '超限时不该交出任何载荷');
+    eq(encoded.body, '', '超限时不该交出请求体');
+    ok(encoded.message.includes('上限'), '必须有明确中文原因: ' + encoded.message);
+    ok(/[\u4e00-\u9fa5]/.test(encoded.message), '提示必须是中文: ' + encoded.message);
+    eq(encoded.message.includes('本机数据一个字节都没动'), true, '要让用户知道数据没丢');
+  });
+
+  await checkAsync('sync/压缩: 非对象 / 无法序列化的载荷 → ok:false + 中文（不静默丢数据）', async () => {
+    for (const payload of [null, undefined, 'x', 7, [], [{ a: 1 }]]) {
+      const encoded = await sync.encodePayloadForUpload({ payload, token: 't', baseRev: 0, compressor: zlibCompressor() });
+      eq(encoded.ok, false, '非对象载荷必须拒绝: ' + JSON.stringify(payload));
+      eq(encoded.error, 'bad-payload');
+      eq(encoded.overLimit, false, '这不是超限，是载荷本身不合法');
+      ok(/[\u4e00-\u9fa5]/.test(encoded.message), '中文原因: ' + encoded.message);
+    }
+    const circular = { app: 'hms', meta: {} };
+    circular.meta.self = circular;
+    const encoded = await sync.encodePayloadForUpload({ payload: circular, token: 't', baseRev: 0, compressor: zlibCompressor() });
+    eq(encoded.ok, false);
+    eq(encoded.error, 'bad-payload');
+    ok(encoded.message.includes('无法序列化'), '要说清是序列化不了: ' + encoded.message);
+  });
+
+  await checkAsync('sync/压缩: 压缩不可用（注入 null / 全局缺失）时回退原样上传，同步照常成功', async () => {
+    const payload = userShapedPayload(30);
+    const injected = await sync.encodePayloadForUpload({ payload, token: 't', baseRev: 0, compressor: null });
+    eq(injected.ok, true);
+    eq(injected.mode, 'raw');
+    deep(injected.payload, payload);
+    eq(injected.gzipBytes, 0, '压不动时不该有压缩大小');
+
+    const localDump = { app: 'hms', meta: {}, weights: [{ date: '2026-03-01', weightKg: 70 }], meals: [], exercises: [], waters: [] };
+    await withoutGlobal('CompressionStream', async () => {
+      eq(sync.createStreamCompressor(), null, '没有 CompressionStream 必须返回 null');
+      const encoded = await sync.encodePayloadForUpload({ payload, token: 't', baseRev: 0 });
+      eq(encoded.mode, 'raw', '老 WebView 必须回退成不压缩');
+      eq(encoded.ok, true);
+      const storage = fakeSyncStorage(localDump, null);
+      const transport = fakePullTransport({ ok: true, rev: 0, savedAt: 0, payload: null });
+      const result = await sync.runSyncOnce({ accountId: 'acc', token: 'tok', storage, transport });
+      eq(result.ok, true, '没有压缩能力也必须能同步: ' + result.message);
+      eq(transport.pushes.length, 1);
+      eq(Array.isArray(transport.pushes[0].payload.weights), true, '回退时上传的是原样 JSON');
+    });
+    eq(typeof globalThis.CompressionStream, 'function', '跑完必须把全局装回去');
+  });
+
+  await checkAsync('sync/压缩: 环境不支持解压时给出明确中文，而不是写坏本机数据', async () => {
+    await withoutGlobal('DecompressionStream', async () => {
+      const decoded = await sync.decodePayloadFromCloud({ __gz: 'AAAA' });
+      eq(decoded.ok, false);
+      eq(decoded.error, 'no-decompressor');
+      eq(decoded.payload, undefined, '解不出来就绝不交出载荷');
+      ok(decoded.message.includes('不支持解压'), '要说清是环境不支持: ' + decoded.message);
+      const localDump = { app: 'hms', meta: {}, weights: [{ date: '2026-03-01', weightKg: 70 }], meals: [], exercises: [], waters: [] };
+      const storage = fakeSyncStorage(localDump, { rev: 1, checksum: sync.syncDigestOf(localDump).checksum });
+      const transport = fakePullTransport({ ok: true, rev: 5, savedAt: 1, payload: { __gz: 'AAAA' } });
+      const result = await sync.runSyncOnce({ accountId: 'acc', token: 'tok', storage, transport });
+      eq(result.ok, false);
+      eq(storage.log.loadAll.length, 0, '本机数据必须原样保留');
+      eq(storage.log.setSyncState.length, 0, '也不该写锚点');
+      ok(result.message.includes('本机数据没有被改动'), '要让用户放心: ' + result.message);
+    });
+  });
+
+  // ----- 解码失败 / 向后兼容 -----
+
+  await checkAsync('sync/压缩: 老格式（无 __gz）解码原样返回，runSyncOnce 照旧拉取', async () => {
+    const decoded = await sync.decodePayloadFromCloud(SNAP_PAYLOAD, { compressor: zlibCompressor() });
+    eq(decoded.ok, true);
+    eq(decoded.compressed, false);
+    ok(decoded.payload === SNAP_PAYLOAD, '没标记就该原样返回同一个对象，不拷贝也不改造');
+    const localDump = { app: 'hms', meta: {}, weights: [{ date: '2026-01-01', weightKg: 71 }], meals: [], exercises: [], waters: [] };
+    const storage = fakeSyncStorage(localDump, { rev: 1, checksum: sync.syncDigestOf(localDump).checksum });
+    const transport = fakePullTransport({ ok: true, rev: 2, savedAt: 1700000000000, payload: SNAP_PAYLOAD });
+    const result = await sync.runSyncOnce({ accountId: 'acc', token: 'tok', storage, transport, compressor: zlibCompressor() });
+    eq(result.ok, true, result.message);
+    eq(result.action, 'pull');
+    deep(storage.log.loadAll[0].payload.weights, SNAP_PAYLOAD.weights, '老快照的数据必须完整落到本机');
+    eq(transport.pushes.length, 0, '拉取不该顺带再上传');
+  });
+
+  await checkAsync('sync/压缩: 坏 base64 / 非 gzip 数据 / 解出来不是对象 → 全部 ok:false + 中文', async () => {
+    const codec = zlibCompressor();
+    for (const payload of [{ __gz: '!!!这不是 base64!!!' }, { __gz: Buffer.from('这压根不是 gzip 数据').toString('base64') }]) {
+      const decoded = await sync.decodePayloadFromCloud(payload, { compressor: codec });
+      eq(decoded.ok, false, '必须报错而不是当数据读: ' + JSON.stringify(payload).slice(0, 40));
+      eq(decoded.compressed, true);
+      eq(decoded.payload, undefined, '失败时绝不交出载荷');
+      ok(decoded.message.includes('解压失败'), '要明确说解压失败: ' + decoded.message);
+    }
+    const notObject = sync.compressedPayloadOf(await codec.compressToBase64('[1,2,3]'));
+    const arrayDecoded = await sync.decodePayloadFromCloud(notObject, { compressor: codec });
+    eq(arrayDecoded.ok, false);
+    ok(arrayDecoded.message.includes('快照对象'), '要说清不是快照对象: ' + arrayDecoded.message);
+    const badJson = sync.compressedPayloadOf(await codec.compressToBase64('{不是 JSON'));
+    const badJsonDecoded = await sync.decodePayloadFromCloud(badJson, { compressor: codec });
+    eq(badJsonDecoded.ok, false);
+    ok(badJsonDecoded.message.includes('合法 JSON'), '要说清 JSON 坏了: ' + badJsonDecoded.message);
+  });
+
+  // ----- 量出来的大小 = 发出去的大小 -----
+
+  await checkAsync('sync/压缩: 量出来的请求体与 cloud-api 真正发出的 body 逐字节一致', async () => {
+    const payload = userShapedPayload(75); // 13KB 量级：默认策略下会走压缩分支
+    const sent = [];
+    const client = cloudApi.createCloudApi({
+      baseUrl: 'https://cloud.test/api',
+      fetchImpl: async (url, options) => {
+        sent.push({ url, options });
+        return { ok: true, status: 200, json: async () => ({ rev: 7 }) };
+      },
+    });
+    await client.push('tok-中文', 3, payload);
+    eq(sent.length, 1);
+    eq(sent[0].url, 'https://cloud.test/api/push');
+    eq(sent[0].options.body, sync.pushBodyText({ token: 'tok-中文', baseRev: 3, payload }), '两边序列化必须一模一样');
+    eq(sync.utf8Bytes(sent[0].options.body), bodyBytesOf(payload, 'tok-中文', 3));
+
+    const encoded = await sync.encodePayloadForUpload({ payload, token: 'tok-中文', baseRev: 3, compressor: zlibCompressor() });
+    eq(encoded.mode, 'gzip');
+    await client.push('tok-中文', 3, encoded.payload);
+    eq(sent[1].options.body, encoded.body, '压缩包的请求体也要逐字节一致');
+    eq(sync.utf8Bytes(sent[1].options.body), encoded.bytes, '真正发出去的字节数必须等于量出来的 bytes');
+  });
+
+  // ----- runSyncOnce / 传输层：一次请求都不许发 -----
+
+  await checkAsync('runSyncOnce: 超限载荷 → 一次 push 都没发、锚点没写、中文原因（本机数据未变）', async () => {
+    const dump = {
+      app: 'hms',
+      meta: { bulk: randomText(260 * 1024) },
+      weights: [{ date: '2026-03-01', weightKg: 70 }],
+      meals: [],
+      exercises: [],
+      waters: [],
+    };
+    const storage = fakeSyncStorage(dump, null);
+    const transport = fakePullTransport({ ok: true, rev: 0, savedAt: 0, payload: null });
+    const result = await sync.runSyncOnce({ accountId: 'acc', transport, token: 'tok', storage, compressor: zlibCompressor() });
+    eq(result.ok, false);
+    eq(result.action, 'push');
+    eq(result.error, 'payload-too-large');
+    eq(transport.pushes.length, 0, '超限时绝不许发出上传请求');
+    eq(storage.log.setSyncState.length, 0, '超限时不该写同步锚点');
+    eq(storage.log.loadAll.length, 0);
+    eq(storage.log.setMeta.length, 0);
+    ok(result.message.includes('上限'), '必须有可读中文原因: ' + result.message);
+    ok(/[\u4e00-\u9fa5]/.test(result.message), '提示必须是中文: ' + result.message);
+    deep(dump.weights, [{ date: '2026-03-01', weightKg: 70 }], '本机数据必须原封不动');
+  });
+
+  await checkAsync('runSyncOnce: 接真实传输层时超限同样发不出请求（只发了 pull）', async () => {
+    const calls = [];
+    const transport = cloudTransport.createCloudTransport({
+      baseUrl: 'https://cloud.test/api',
+      fetchImpl: async (url, options) => {
+        calls.push({ url, body: options.body });
+        return { ok: true, status: 200, json: async () => ({ rev: 0, savedAt: 0, payload: null }) };
+      },
+    });
+    const storage = fakeSyncStorage({ app: 'hms', meta: { bulk: randomText(260 * 1024) }, weights: [], meals: [], exercises: [], waters: [] }, null);
+    const result = await sync.runSyncOnce({ accountId: 'acc', transport, token: 'tok', storage });
+    eq(calls.length, 1, '只该有一次请求（pull），超限的 push 必须被拦下: ' + JSON.stringify(calls.map((c) => c.url)));
+    eq(calls[0].url, 'https://cloud.test/api/pull');
+    eq(result.ok, false);
+    eq(result.error, 'payload-too-large');
+    ok(result.message.includes('上限'), '中文原因: ' + result.message);
+  });
+
+  await checkAsync('传输层: push 收到超限载荷 → 中文失败且零请求；小载荷不受影响', async () => {
+    const calls = [];
+    const transport = cloudTransport.createCloudTransport({
+      baseUrl: 'https://cloud.test/api',
+      fetchImpl: async (url, options) => {
+        calls.push({ url, body: options.body });
+        return { ok: true, status: 200, json: async () => ({ rev: 4 }) };
+      },
+    });
+    const huge = { app: 'hms', meta: { bulk: randomText(200 * 1024) }, weights: [] };
+    const blocked = await transport.push({ token: 'tok', baseRev: 1, payload: huge });
+    eq(blocked.ok, false);
+    eq(blocked.error, 'payload-too-large');
+    eq(calls.length, 0, '超限时一个请求都不许发');
+    ok(blocked.message.includes('上限'), '网络边界的说明也要是可读中文: ' + blocked.message);
+    const small = await transport.push({ token: 'tok', baseRev: 1, payload: SNAP_PAYLOAD });
+    eq(small.ok, true);
+    eq(calls.length, 1);
+    eq(calls[0].url, 'https://cloud.test/api/push');
+    deep(JSON.parse(calls[0].body).payload, SNAP_PAYLOAD, '小载荷必须原样发出，不许误伤');
+  });
+
+  await checkAsync('runSyncOnce: 云端 { __gz } 压缩快照 → 解压后按普通快照落库', async () => {
+    const remotePayload = userShapedPayload(20);
+    const codec = zlibCompressor();
+    const envelope = sync.compressedPayloadOf(await codec.compressToBase64(JSON.stringify(remotePayload)));
+    const localDump = { app: 'hms', meta: {}, weights: [], meals: [], exercises: [], waters: [] };
+    const storage = fakeSyncStorage(localDump, null);
+    const transport = fakePullTransport({ ok: true, rev: 4, savedAt: 1700000000000, payload: envelope });
+    const result = await sync.runSyncOnce({ accountId: 'acc', token: 'tok', storage, transport, compressor: codec });
+    eq(result.ok, true, result.message);
+    eq(result.action, 'pull');
+    eq(result.rev, 4);
+    eq(storage.log.loadAll.length, 1);
+    eq(storage.log.loadAll[0].mode, 'replace');
+    deep(storage.log.loadAll[0].payload.weights, remotePayload.weights, '落库的必须是解压后的数据');
+    eq(storage.log.loadAll[0].payload.meals.length, remotePayload.meals.length);
+    eq(storage.log.loadAll[0].payload.meals[0].items[0].name.includes('米饭'), true, '中文内容必须完好');
+    eq(storage.log.setSyncState[0].rev, 4);
+  });
+
+  await checkAsync('runSyncOnce: 云端压缩快照解不开 → 明确中文、不落库、不写锚点（本机数据保留）', async () => {
+    const localDump = { app: 'hms', meta: {}, weights: [{ date: '2026-03-01', weightKg: 70 }], meals: [], exercises: [], waters: [] };
+    const storage = fakeSyncStorage(localDump, { rev: 1, checksum: sync.syncDigestOf(localDump).checksum });
+    const transport = fakePullTransport({ ok: true, rev: 5, savedAt: 1, payload: { __gz: '!!!坏掉的压缩快照!!!' } });
+    const result = await sync.runSyncOnce({ accountId: 'acc', token: 'tok', storage, transport, compressor: zlibCompressor() });
+    eq(result.ok, false);
+    eq(result.action, 'pull');
+    eq(storage.log.loadAll.length, 0, '解不开就不许覆盖本机数据');
+    eq(storage.log.setSyncState.length, 0, '不许写锚点（写了下次就以为同步过了）');
+    eq(storage.log.setMeta.length, 0, '什么都没发生，也不该留冲突副本');
+    ok(result.message.includes('本机数据没有被改动'), '要让用户知道数据没丢: ' + result.message);
+    eq(result.rev, 1, 'rev 必须停在本机原值');
+  });
+
+  await checkAsync('sync/压缩: 两台设备经真实传输层往返（A 压缩上传 → B 拉取还原，载荷等价）', async () => {
+    // 假网关：按协议原样存 / 取 payload，不做任何加工（真网关也一样 —— payload 对它是不透明 JSON）
+    let stored = null;
+    let storedRev = 0;
+    let pushBytes = 0;
+    const gateway = async (url, options) => {
+      const body = JSON.parse(options.body);
+      if (url.endsWith('/push')) {
+        if (body.baseRev !== storedRev) {
+          return { ok: false, status: 409, text: async () => JSON.stringify({ error: 'rev-conflict', rev: storedRev }) };
+        }
+        pushBytes = sync.utf8Bytes(options.body);
+        storedRev += 1;
+        stored = body.payload;
+        return { ok: true, status: 200, text: async () => JSON.stringify({ rev: storedRev }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ rev: storedRev, savedAt: 1772000000000, payload: stored }) };
+    };
+    const makeTransport = () => cloudTransport.createCloudTransport({ baseUrl: 'https://cloud.test/api', fetchImpl: gateway });
+
+    const dumpA = userShapedPayload(75); // 用户当前规模：13KB 量级
+    const storageA = fakeSyncStorage(dumpA, null);
+    const deviceA = await sync.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: 'tok', storage: storageA });
+    eq(deviceA.ok, true, 'A 上传必须成功: ' + deviceA.message);
+    eq(deviceA.action, 'push');
+    eq(sync.isCompressedPayload(stored), true, '云端的载荷应该是 { __gz } 压缩体');
+    ok(pushBytes > 0 && pushBytes < sync.PUSH_BODY_LIMIT_BYTES, '上传请求体 ' + pushBytes + ' 字节必须在阈值内');
+    const rawBytes = bodyBytesOf(dumpA, 'tok', 0);
+    ok(pushBytes < rawBytes * 0.4, '压缩后 ' + pushBytes + ' 字节应远小于原样 ' + rawBytes + ' 字节');
+
+    // B 设备：空库 + 从没同步过 → 直接拉，落库的数据必须等于 A 想备份的那份
+    const storageB = fakeSyncStorage({ app: 'hms', meta: {}, weights: [], meals: [], exercises: [], waters: [] }, null);
+    const deviceB = await sync.runSyncOnce({ accountId: 'acc', transport: makeTransport(), token: 'tok', storage: storageB });
+    eq(deviceB.ok, true, 'B 拉取必须成功: ' + deviceB.message);
+    eq(deviceB.action, 'pull');
+    eq(storageB.log.loadAll.length, 1);
+    deep(storageB.log.loadAll[0].payload, sync.syncDigestOf(dumpA).payload, 'B 上落库的数据必须与 A 要备份的数据等价');
+    deep(storageB.log.loadAll[0].payload.meals, dumpA.meals, '中文饮食记录必须逐条一致');
+  });
+}
+
 export async function run() {
   testDates();
   testMetabolism();
@@ -3540,6 +4065,7 @@ export async function run() {
   testPurity();
   testSyncPure();
   testSyncSecrets();
+  await testSyncCompression();
   await testModules();
   // 放最后：它会临时注入假 indexedDB 并清理，不干扰上面的「IDB 不可用」断言
   await testStoreSettings();

@@ -14,7 +14,11 @@ import {
   clearCloudToken, bindAccountServerId,
 } from '../js/cloud-config.js';
 import { createCloudTransport } from '../js/cloud-transport.js';
-import { runSyncOnce, createSyncScheduler, readConflictBackup, syncDigestOf } from '../js/sync.js';
+// encodePayloadForUpload / createStreamCompressor / utf8Bytes / PUSH_BODY_LIMIT_BYTES 用于「上传体积」那一行
+import {
+  runSyncOnce, createSyncScheduler, readConflictBackup, syncDigestOf,
+  encodePayloadForUpload, createStreamCompressor, utf8Bytes, PUSH_BODY_LIMIT_BYTES,
+} from '../js/sync.js';
 
 const go = (hash) => window.HMS.navigate(hash);
 const refresh = () => window.HMS.refresh();
@@ -66,6 +70,7 @@ function fmtBytes(bytes) {
  * 本机数据规模与内容指纹：dumpAll 是数据层唯一只读统计入口。
  * 指纹走 syncDigestOf（纯函数），不碰 meta —— 用 store.getSyncPayload 做只读判断会顺手
  * 记一笔导出时间，把设置页的备份提醒静默关掉。
+ * bytes 按 UTF-8 字节算（中文 3 字节），与云同步判定超限的口径一致；用字符数会把中文载荷算小。
  */
 async function readLocalSummary() {
   try {
@@ -79,7 +84,7 @@ async function readLocalSummary() {
     const digest = syncDigestOf(dump);
     let bytes = 0;
     try {
-      bytes = String(JSON.stringify(digest.payload) ?? '').length;
+      bytes = utf8Bytes(JSON.stringify(digest.payload) ?? '');
     } catch {
       bytes = 0; // 循环引用之类根本发不出去，规模显示 0 就行，别连累整页
     }
@@ -88,6 +93,7 @@ async function readLocalSummary() {
       total: counts.weights + counts.meals + counts.exercises + counts.waters,
       bytes,
       checksum: digest.checksum,
+      payload: digest.payload, // 上传体积预估要用同一份内容（已经剥过密钥）
     };
   } catch {
     return null; // 统计失败只让数字变成「—」
@@ -113,6 +119,26 @@ async function readSyncStatus(summary) {
     dirty,
     backupAt: backup ? backup.savedAt : null,
   };
+}
+
+/**
+ * 上传体积预估：拿当前内容真跑一次编码（含压缩），卡片据此说清「离单次上传上限还有多远」。
+ * 只读、不发请求；算不出来（载荷序列化不了之类）就返回 null，卡片少一行而不是整页报错。
+ */
+async function readUploadPlan(summary, token, baseRev) {
+  if (!summary || !summary.payload) return null;
+  try {
+    const encoded = await encodePayloadForUpload({ payload: summary.payload, token, baseRev });
+    return {
+      bytes: encoded.bytes,
+      rawBytes: encoded.rawBytes,
+      limitBytes: Number.isFinite(encoded.limitBytes) ? encoded.limitBytes : PUSH_BODY_LIMIT_BYTES,
+      compressed: encoded.compressed === true,
+      overLimit: encoded.overLimit === true,
+    };
+  } catch {
+    return null;
+  }
 }
 
 const SCALE_ROWS = [
@@ -258,6 +284,10 @@ export async function render(root, deps = {}) {
   const cloudAuth = cloudReady ? readCloudAuth(current.id) : null;
   const loggedIn = Boolean(cloudAuth?.token);
   const status = await readSyncStatus(summary);
+  // 压缩能力 + 上传体积：卡片要如实说明「这次上传会发出去多少字节、离上限还有多远」。
+  // 预估真跑一次编码（含压缩），所以显示的是实际会发出去的大小，不是一个拍脑袋的估算。
+  const compressionReady = createStreamCompressor() !== null;
+  const upload = cloudReady ? await readUploadPlan(summary, cloudAuth?.token ?? '', status.rev) : null;
 
   root.appendChild(el('div', { className: 'row row--between' },
     el('div', { className: 'col' },
@@ -375,6 +405,13 @@ export async function render(root, deps = {}) {
         ? el('span', { className: 'cloud-status__value', text: '—' })
         : el('span', { className: status.dirty ? 'pill pill--warn' : 'pill pill--ok', text: status.dirty ? '有未同步改动' : '已全部同步' })],
     ];
+    // 上传体积：云端单次上传的上限是硬性的，说清「还剩多少余量」比事后报错有用
+    if (upload) {
+      rows.push(['上传体积', el('span', {
+        className: 'cloud-status__value',
+        text: `${fmtBytes(upload.bytes)} / 上限 ${fmtBytes(upload.limitBytes)}${upload.compressed ? '（已压缩）' : ''}`,
+      })]);
+    }
     card.appendChild(el('div', { className: 'cloud-status' },
       rows.map(([label, value]) => el('div', { className: 'cloud-status__row' },
         el('span', { className: 'cloud-status__label', text: label }),
@@ -384,6 +421,16 @@ export async function render(root, deps = {}) {
 
     if (status.backupAt) {
       card.appendChild(el('div', { className: 'cloud-warn', text: `存在冲突副本：${fmtWhen(status.backupAt)} 的本机数据已在本机备份（冲突时不会静默覆盖），需要时可在设置页导出查看。` }));
+    }
+
+    // 上传体积接近 / 超出上限：都在这里说清楚，别等网关回 413（那个响应还没有 CORS 头）
+    if (upload?.overLimit) {
+      card.appendChild(el('div', { className: 'cloud-warn', text: `本机数据已超出单次上传上限（${fmtBytes(upload.limitBytes)}）：同步会失败。请先在设置页导出备份，再清理部分历史数据。` }));
+    } else if (upload && upload.bytes > upload.limitBytes * 0.8) {
+      card.appendChild(el('div', { className: 'cloud-warn', text: `本机数据已用到单次上传上限的 ${Math.round((upload.bytes / upload.limitBytes) * 100)}%：继续增长会同步失败，建议先在设置页导出备份。` }));
+    }
+    if (!compressionReady) {
+      card.appendChild(el('div', { className: 'cloud-note', text: '当前环境不支持压缩上传（老浏览器）：数据超过单次上传上限时无法同步，建议先导出备份或换一台设备。' }));
     }
 
     // 注册时拿到了恢复码但用户还没点「我已保存」（比如中途切了页面）：在本机留着，随时能再看一次

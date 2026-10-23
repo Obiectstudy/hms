@@ -20,6 +20,14 @@ export const CLOUD_API_PATHS = Object.freeze({
 /** 服务端会话有效期 30 天，与后端 SESSION_TTL_MS 对齐。 */
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * 网关对 POST /push 请求体的硬上限（实测：102400 字节 → 200，102401 → 413 EXCEED_MAX_PAYLOAD_SIZE）。
+ * 这个 413 由网关自己产生、不带 CORS 头，真机 WebView 读不到响应体，只会被归一成 network-error；
+ * 服务端函数里那两个更大的上限（MAX_PAYLOAD_BYTES / MAX_BODY_BYTES）在真实链路上不可达。
+ * 客户端因此必须在发请求之前就拦下超限载荷：安全阈值见 js/sync.js 的 PUSH_BODY_LIMIT_BYTES。
+ */
+export const GATEWAY_MAX_REQUEST_BYTES = 102400;
+
 const DEFAULT_MESSAGES = {
   'bad-request': '请求参数不合法',
   unauthorized: '用户名或密码不正确',

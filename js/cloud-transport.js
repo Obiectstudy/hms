@@ -8,10 +8,13 @@
  *   成功 { ok: true, ...服务端字段 }；失败 { ok: false, error, message }（message 是给人看的中文）。
  * 错误体统一 { error, message }：后端给了中文就直接透传，没给就按 code 兜底一句。
  * 网络异常 / 超时 / 非 JSON 响应一律归一成 error:'network'。
+ * push 的请求体超过 PUSH_BODY_LIMIT_BYTES 时直接返回 { ok:false, error:'payload-too-large' } 且不发请求
+ * （网关的 413 不带 CORS 头，发出去只会变成一句看不懂的「网络不可用」）。
  * push 遇到 409 返回 { ok: false, error: 'rev-conflict', rev }，rev 是服务器当前版本。
  */
 
 import { createCloudApi } from './cloud-api.js';
+import { PUSH_BODY_LIMIT_BYTES, pushBodyText, utf8Bytes } from './sync.js';
 
 // 上传/下载整库快照在弱网下可能要十几秒；15 秒是「用户还愿意等」的上限。
 export const CLOUD_TIMEOUT_MS = 15000;
@@ -45,6 +48,12 @@ function messageFor(error, message, status) {
 
 function failure(error, message, extra) {
   return { ok: false, error, message: messageFor(error, message, extra?.status), ...(extra ?? {}) };
+}
+
+/** 超限的中文说明：阈值（PUSH_BODY_LIMIT_BYTES）与量法（pushBodyText + utf8Bytes）都来自 js/sync.js。 */
+function oversizedMessage(bytes) {
+  const kb = (value) => `${(value / 1024).toFixed(1)} KB`;
+  return `本机数据太大：请求体 ${kb(bytes)}，超过单次上传上限 ${kb(PUSH_BODY_LIMIT_BYTES)}，本次没有发出请求`;
 }
 
 /** CloudApiError → 界面要的失败结果；错误码与中文文案的取舍只在这一层。 */
@@ -116,12 +125,22 @@ export function createCloudTransport({ baseUrl = '', fetchImpl, timeoutMs = CLOU
       return delegate((client) => client.pull(token));
     },
     async push({ token, baseRev, payload } = {}) {
-      if (!trimmed(token)) return failure('unauthorized', '还没登录：请先登录再同步');
+      const auth = trimmed(token);
+      if (!auth) return failure('unauthorized', '还没登录：请先登录再同步');
       if (!payload || typeof payload !== 'object') {
         return failure('bad-request', '本机没有可上传的数据');
       }
       const rev = Number.isInteger(baseRev) && baseRev >= 0 ? baseRev : 0;
-      return delegate((client) => client.push(token, rev, payload));
+      // 网络边界的最后一道闸：sync.js（决策层）已经拦过一次，这里再按真实请求体量一遍。
+      // 量不出来（载荷压根序列化不了）就不拦——交给 cloud-api 按原有语义报错。
+      let bytes = 0;
+      try {
+        bytes = utf8Bytes(pushBodyText({ token: auth, baseRev: rev, payload }));
+      } catch {
+        bytes = 0;
+      }
+      if (bytes > PUSH_BODY_LIMIT_BYTES) return failure('payload-too-large', oversizedMessage(bytes));
+      return delegate((client) => client.push(auth, rev, payload));
     },
   };
 }

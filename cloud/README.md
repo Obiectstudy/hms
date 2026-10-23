@@ -37,6 +37,9 @@
 - `push` 是原子的：只有服务器当前 `rev` 仍等于 `baseRev` 时才写成 `rev + 1`，否则返回
   `409 { "error": "rev-conflict", "rev": <服务器当前 rev> }` —— 这是协议里唯一不走统一错误体的响应。
 - 未注册用户名与密码错误返回**完全相同**的 401，避免用户名枚举。
+- `push` 的 `payload` 既可以是普通 JSON 对象，也可以是**压缩包装体** `{ "__gz": "<base64(gzip(utf8(JSON)))>" }`
+  （客户端为绕开网关约 100KB 的请求体上限而做的**上传通道编码**，见第 16 节）。服务端在写库前把它解成
+  明文，**库里与 `pull` 的响应里永远只有明文 JSON**：压缩不是存储格式，旧客户端不受影响。
 - 非 `POST` 方法一律 404 `not-found`；唯一例外是预检 `OPTIONS`（见第 14 节）。
 - 所有响应（含 4xx / 5xx）都带 CORS 头：`access-control-allow-origin`（反射请求 `Origin`，没有该头时回落 `*`）、
   `access-control-allow-methods`、`access-control-allow-headers`、`access-control-max-age` 与 `vary: origin`。
@@ -303,4 +306,49 @@ E. 推送，再故意冲突一次
 客户端拿到**不带任何 `access-control-*` 头**的 `413`、而服务端日志里找不到同一次请求的记录 ——
 那就是网关提前拦的。响应体字段与两个上限常量都**没动**：函数自己的 400 分支在真实链路上不可达
 （网关先拦），改它只会改协议，没有意义。相关断言见 `tests/cloud.test.mjs` 第 13 节。
+
+## 16. 压缩上传（`{ __gz }`）：客户端压、服务端解，库里只存明文
+
+### 16.1 上传为什么要压缩
+
+网关对 `/push` 请求体的硬上限约 100KB（实测 102400 字节），而它自产的 413 **不带 CORS 头**：真机
+WebView 读不到响应体，界面只会显示「网络不可用」，用户既看不懂也没法自救。客户端于是把大快照压成
+`{ "__gz": "<base64(gzip(utf8(JSON)))>" }` 再上传（`js/sync.js` 的 `encodePayloadForUpload` /
+`compressedPayloadOf`，标记键 `GZIP_MARKER_KEY = '__gz'`）。
+
+### 16.2 为什么**服务端必须解压**（本节的要点）
+
+如果服务端把 `{ __gz }` 原样写进库里，那就只有**新客户端**读得懂它。旧版 App（网页资源内嵌、
+不会自动更新）读到 `{ __gz }` 时**不报错**：它把包装体当成数据 `loadAll(replace)` 写进本机业务表、
+推进 rev，之后回推时再把这份垃圾当成云端快照传上来 —— **旧客户端没有任何自我保护**（实测，不是推测）。
+
+所以 `push` 在 `requirePayload` 之后、`sanitizePayload` 之前多了一步解压，**库里永远只存明文 JSON**：
+
+1. `payload` 是对象且 `payload.__gz` 是**非空字符串** → 严格 base64 解码 → `zlib.gunzipSync` → `JSON.parse`；
+2. 解出来的必须是**对象**（非数组、非 `null`），再照旧过一遍 `requirePayload`（解压路径不比明文路径宽松）；
+3. 用解压结果**替换** `payload`，后续 `sanitizePayload` → `JSON.stringify` → `$4::jsonb` 一行不改；
+4. 于是一份压缩上传的快照 `pull` 回来就是普通 JSON：**旧客户端读到的与改动前完全一致**；
+5. `__gz` 是空串 / 数字 / `null` / 对象时按**普通数据**处理（用户数据里恰好有这个名字的字段不会被误判），
+   明文 `push`（没有 `__gz`）行为零回归。
+
+### 16.3 gzip 炸弹：`maxOutputLength` 是唯一的内存防线
+
+100KB 的请求体可以解出几十 GB —— 实测一份 **64MiB 全零**快照 gzip 后 base64 只有 87000 字节，
+**在网关 102400 的上限之内**，也就是说这种请求真的能打进来。没有上限就是一次把函数内存打爆的 DoS。
+
+因此 `gunzipSync` **必须**带 `maxOutputLength`，取值与服务端快照上限同值（`MAX_PAYLOAD_BYTES`，8MiB）：
+超限时 Node 抛 `ERR_BUFFER_TOO_LARGE`，**不会先把几十 GB 解出来**。所有失败分支一律 400 `bad-request`
+（500 会让客户端无限重试，绝不能用），文案都是可读中文：
+
+| 情况 | 响应 |
+| --- | --- |
+| base64 非法（含非法字符、非规范尾比特如 `AB==`） | `400 bad-request`「payload.__gz 不是合法的 base64」 |
+| base64 合法但不是 gzip（含被截断的 gzip） | `400 bad-request`「payload.__gz 不是合法的 gzip 数据」 |
+| 解出来不是合法 JSON | `400 bad-request`「payload.__gz 解压后不是合法 JSON」 |
+| 解出来不是对象（数组 / 数字 / `null` / 字符串） | `400 bad-request`「payload.__gz 解压后必须是 JSON 对象」 |
+| 解压后超过 8MiB（gzip 炸弹） | `400 bad-request`「payload.__gz 解压后过大」+ 日志 `"tooLarge":true`、`"limit":8388608` |
+
+日志只记**元信息**：`{"route":"push","status":200,...,"compressed":true,"decompressedBytes":<解压后字节数>}`；
+base64 原文、解压结果、被净化的内容统统不进日志（payload 是用户数据）。相关断言见
+`tests/cloud.test.mjs` 第 14 节（含真实炸弹、CORS 不掉头、与 `sanitizePayload` 的两步协同）。
 
