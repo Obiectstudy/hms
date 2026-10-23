@@ -3,3 +3,6 @@ ehthumbs.db
 desktop.ini
 .DS_Store
 *.log
+
+# 脚本里 $env:TEMP 为空时 Join-Path 会落到仓库根的 undefined/ 目录，别提交它
+undefined/

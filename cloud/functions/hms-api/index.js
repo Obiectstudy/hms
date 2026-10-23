@@ -117,6 +117,23 @@ function notFound(message) {
 function locked(message) {
   return new HttpError(423, 'locked', message);
 }
+/**
+ * 「超限」是一类必须能被认出来的情况：网关对自己拦下的超限请求会自产 413，而那条响应**不带 CORS 头**
+ * （网关改不了），真机 WebView 读不到它，只能显示「网络不可用」，用户没法自救。
+ * 网关那一条我们碰不到，所以这里只做能做的两件事：
+ *   - 响应体保持冻结协议不变（400 + bad-request +「payload 过大」/「请求体过大」），一个字段都不加；
+ *   - 把「这是服务端判定的超限」挂到错误对象上，由 createHandler 记进日志（tooLarge + limit）。
+ * 于是生产日志里能认出这一类：有 tooLarge 日志 = 服务端判定超限；客户端拿到不带 CORS 的 413
+ * 而同一次请求在服务端没有任何日志 = 网关提前拦的（请求根本没到函数）。这是真实链路上唯一可做的区分。
+ * 两个上限常量一个字都不改（线上不可达的死代码，见 README 第 15 节）。
+ */
+const TOO_LARGE_LOG_FIELD = 'tooLarge';
+function payloadTooLarge(message, limit) {
+  const err = badRequest(message);
+  err.tooLarge = true;
+  err.limit = toInt(limit);
+  return err;
+}
 /** push 的 409 是协议里唯一不走统一错误体的响应：{ error: 'rev-conflict', rev }。 */
 function revConflict(rev) {
   return new HttpError(409, 'conflict', '服务器版本已更新', { error: 'rev-conflict', rev: toInt(rev) });
@@ -297,8 +314,150 @@ function requirePayload(value) {
     throw badRequest('payload 无法序列化');
   }
   if (typeof text !== 'string') throw badRequest('payload 无法序列化');
-  if (text.length > MAX_PAYLOAD_BYTES) throw badRequest('payload 过大');
+  if (text.length > MAX_PAYLOAD_BYTES) throw payloadTooLarge('payload 过大', MAX_PAYLOAD_BYTES);
   return value;
+}
+
+// ---------- payload 净化（jsonb 不接受 NUL 与落单代理项） ----------
+//
+// 现场：合法 JSON 里可以有 `\u0000`（NUL）与**落单代理项**（lone surrogate，如 `\ud800`），
+// 但 PostgreSQL 的 jsonb 两者都不收：写库时报 22P05 unsupported Unicode escape sequence。
+// 服务端过去只做结构与长度校验，随后就 `$4::jsonb` 直接写进去 —— 于是已登录用户只要本机
+// 数据里混进一个这样的字符，push 就永远 500、rev 永不推进、客户端无限重试、快照永远传不上去。
+//
+// 修法：写库之前把这些字符从字符串里**删掉**（删成空串）。
+//   - 不替换成「·」之类可见字符：那会污染用户数据，用户会看到自己从没输入过的内容。
+//   - 合法字符一个都不动：emoji 是合法代理对（`\ud83d\ude00`）、中文、组合字符、换行与制表符全部原样保留。
+//   - 对象 / 数组 / 字符串逐层处理，**键名也处理**。
+//   - 遍历用显式栈而不是递归：4000 层嵌套也压不爆调用栈；循环引用与共享引用由 memo 表兜住。
+//   - 没有深度上限：多深都要净化到，否则「深处的非法字符」照样能把 push 打回 500。
+//   - 整份 payload 净化后变成空对象 {} 照常接受：用户数据就是这样，不是错误。
+
+const HIGH_SURROGATE_MIN = 0xd800;
+const HIGH_SURROGATE_MAX = 0xdbff;
+const LOW_SURROGATE_MIN = 0xdc00;
+const LOW_SURROGATE_MAX = 0xdfff;
+
+function isHighSurrogateCode(code) {
+  return code >= HIGH_SURROGATE_MIN && code <= HIGH_SURROGATE_MAX;
+}
+function isLowSurrogateCode(code) {
+  return code >= LOW_SURROGATE_MIN && code <= LOW_SURROGATE_MAX;
+}
+
+/**
+ * 删除字符串里的 U+0000 与落单代理项（每删掉一个码元算一处）。
+ * 返回 { text, removed }：没有可删内容时 text 就是原字符串本身（引用相等，零改动）。
+ */
+function sanitizeText(text) {
+  let removed = 0;
+  let out = '';
+  let copying = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    let keep = '';
+    let width = 1;
+    if (code === 0 || isLowSurrogateCode(code)) {
+      removed += 1;
+    } else if (isHighSurrogateCode(code)) {
+      const next = i + 1 < text.length ? text.charCodeAt(i + 1) : -1;
+      if (isLowSurrogateCode(next)) {
+        keep = text.slice(i, i + 2); // 合法代理对（emoji 等）：原样保留
+        width = 2;
+      } else {
+        removed += 1; // 落单的高代理项
+      }
+    } else {
+      keep = text.charAt(i);
+    }
+    if (!copying && removed > 0) {
+      out = text.slice(0, i); // 第一次遇到非法字符：先把前面的合法部分搬过来
+      copying = true;
+    }
+    if (copying && keep) out += keep;
+    i += width - 1;
+  }
+  return { text: copying ? out : text, removed: removed };
+}
+
+/** 只走数组与自己造出来的普通对象；Date、Buffer 之类非普通对象原样保留，不拆不丢。 */
+function isWalkablePayloadNode(node) {
+  if (Array.isArray(node)) return true;
+  const proto = Object.getPrototypeOf(node);
+  return proto === Object.prototype || proto === null;
+}
+
+/** 键名 __proto__ 走 defineProperty：JSON.parse 出来的对象带这个自有关键字是合法的，直接赋值会改掉原型。 */
+function setOwnKey(target, key, value) {
+  if (key === '__proto__') {
+    Object.defineProperty(target, key, { value: value, writable: true, enumerable: true, configurable: true });
+    return;
+  }
+  target[key] = value;
+}
+
+/**
+ * 递归净化一个 JSON 值：字符串里的 NUL / 落单代理项删掉，对象与数组逐层复制，键名同样净化。
+ * 返回 { value, removed }：removed 为 0 时 value 就是入参本身（一个字节都没动）。
+ * 不抛异常：循环引用 / 共享引用都指向同一个副本，超深嵌套走显式栈（没有深度上限）。
+ * 键名被删成空串的整条丢弃（原本就是空键名 "" 的合法情况保留）；两个键名净化后撞名时后写的胜出。
+ */
+function sanitizePayload(root) {
+  if (typeof root === 'string') {
+    const text = sanitizeText(root);
+    return { value: text.text, removed: text.removed };
+  }
+  if (root === null || typeof root !== 'object' || !isWalkablePayloadNode(root)) {
+    return { value: root, removed: 0 };
+  }
+
+  let removed = 0;
+  const clones = new Map();
+  const stack = [];
+  const rootClone = Array.isArray(root) ? new Array(root.length) : {};
+  clones.set(root, rootClone);
+  stack.push({ src: root, dst: rootClone });
+
+  const assign = (value, target, key) => {
+    if (typeof value === 'string') {
+      const text = sanitizeText(value);
+      removed += text.removed;
+      setOwnKey(target, key, text.text);
+      return;
+    }
+    if (value !== null && typeof value === 'object' && isWalkablePayloadNode(value)) {
+      let clone = clones.get(value);
+      if (!clone) {
+        clone = Array.isArray(value) ? new Array(value.length) : {};
+        clones.set(value, clone);
+        stack.push({ src: value, dst: clone });
+      }
+      setOwnKey(target, key, clone);
+      return;
+    }
+    setOwnKey(target, key, value); // 数字 / 布尔 / null / 非普通对象（如 Date）原样带过去
+  };
+
+  while (stack.length > 0) {
+    const frame = stack.pop();
+    const src = frame.src;
+    const dst = frame.dst;
+    if (Array.isArray(src)) {
+      for (let i = 0; i < src.length; i += 1) assign(src[i], dst, i);
+      continue;
+    }
+    const keys = Object.keys(src);
+    for (let k = 0; k < keys.length; k += 1) {
+      const key = keys[k];
+      const keyText = sanitizeText(key);
+      removed += keyText.removed;
+      // 键名里的非法字符被删光就没法表示了：整条丢弃（原本就是合法空键名 "" 的保留）
+      if (keyText.text === '' && key !== '') continue;
+      assign(src[key], dst, keyText.text);
+    }
+  }
+
+  return { value: removed > 0 ? rootClone : root, removed: removed };
 }
 
 // ---------- 会话 ----------
@@ -421,6 +580,8 @@ async function handlePush(body, ctx) {
   const userId = await requireSession(ctx.db, ctx.now, body.token);
   const baseRev = requireRev(body.baseRev);
   const payload = requirePayload(body.payload);
+  // 写库前净化：jsonb 不收 NUL 与落单代理项，直接写会让合法 JSON 变成永久 500（见 sanitizePayload）
+  const cleaned = sanitizePayload(payload);
 
   const current = firstRow(await ctx.db.query(SQL.snapshotRev, [userId]));
   const currentRev = current ? toInt(current.rev) : 0;
@@ -432,7 +593,7 @@ async function handlePush(body, ctx) {
     userId,
     baseRev + 1,
     new Date(savedAt),
-    JSON.stringify(payload),
+    JSON.stringify(cleaned.value),
     baseRev,
   ]);
   const row = firstRow(result);
@@ -440,7 +601,8 @@ async function handlePush(body, ctx) {
     const again = firstRow(await ctx.db.query(SQL.snapshotRev, [userId]));
     throw revConflict(again ? toInt(again.rev) : 0);
   }
-  return { status: 200, body: { rev: toInt(row.rev) } };
+  // sanitized 只用于日志计数（删了几处），绝不带内容
+  return { status: 200, body: { rev: toInt(row.rev) }, sanitized: cleaned.removed };
 }
 
 // ---------- 路由 ----------
@@ -462,7 +624,7 @@ function readJsonBody(event) {
   if (Buffer.isBuffer(raw)) raw = raw.toString('utf8');
   if (typeof raw === 'object' && !Buffer.isBuffer(raw)) return requireBodyObject(raw); // 网关已解析
   if (typeof raw !== 'string') throw badRequest('请求体必须是 JSON');
-  if (raw.length > MAX_BODY_BYTES) throw badRequest('请求体过大');
+  if (raw.length > MAX_BODY_BYTES) throw payloadTooLarge('请求体过大', MAX_BODY_BYTES);
   if (!raw.trim()) throw badRequest('请求体不能为空');
   let parsed;
   try {
@@ -533,14 +695,18 @@ function createHandler(options) {
     }
     let status;
     let body;
+    let sanitized = 0;
+    let tooLargeLimit = null;
     try {
       const result = await dispatch(event, { db, now, randomBytes });
       status = result.status;
       body = result.body;
+      sanitized = toInt(result.sanitized);
     } catch (err) {
       if (err instanceof HttpError) {
         status = err.status;
         body = err.body || { error: err.code, message: err.message };
+        if (err.tooLarge === true) tooLargeLimit = toInt(err.limit);
       } else {
         // 未预期异常：只记错误类别与 SQLSTATE，绝不回显 message（可能夹带参数值）
         log({ route, status: 500, error: 'server-error', name: errorName(err), sqlstate: errorCode(err) });
@@ -548,7 +714,15 @@ function createHandler(options) {
         body = { error: 'server-error', message: '服务器内部错误，请稍后再试' };
       }
     }
-    log({ route, status: status, ms: Math.max(0, now() - startedAt) });
+    const record = { route: route, status: status, ms: Math.max(0, now() - startedAt) };
+    // 净化只记「删了几处」，绝不记被删掉的内容（payload 是用户数据）
+    if (sanitized > 0) record.sanitized = sanitized;
+    // 超限类别也进日志：网关拦下的 413 不会有任何服务端日志，这一条就是区分的锚点
+    if (tooLargeLimit !== null) {
+      record[TOO_LARGE_LOG_FIELD] = true;
+      record.limit = tooLargeLimit;
+    }
+    log(record);
     // 成功与失败一视同仁地带 CORS 头（JSON 主体与状态码不变）
     const headers = Object.assign({}, JSON_HEADERS, cors);
     return { statusCode: status, headers: headers, body: JSON.stringify(body), json: body };
@@ -876,6 +1050,9 @@ module.exports = {
   LOCK_AFTER_FAILS: LOCK_AFTER_FAILS,
   LOCK_MS: LOCK_MS,
   MAX_PAYLOAD_BYTES: MAX_PAYLOAD_BYTES,
+  TOO_LARGE_LOG_FIELD: TOO_LARGE_LOG_FIELD,
+  sanitizePayload: sanitizePayload,
+  sanitizeText: sanitizeText,
   generateRecoveryCode: generateRecoveryCode,
   normalizeRecoveryCode: normalizeRecoveryCode,
   scryptHash: scryptHash,

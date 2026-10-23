@@ -901,6 +901,117 @@ async function run() {
   check('不输出 access-control-allow-credentials（不用 cookie，鉴权走 authorization）', !('access-control-allow-credentials' in preflight.headers) && !('access-control-allow-credentials' in noOrigin.headers), Object.keys(noOrigin.headers).join(','));
   check('CORS 头在 createHandler 与 main 两层的取值一致', api.corsHeaders({ headers: { Origin: WEBVIEW_ORIGIN } })['access-control-allow-origin'] === WEBVIEW_ORIGIN && api.corsHeaders({})['access-control-allow-origin'] === '*', JSON.stringify(api.corsHeaders({})));
 
+  // ==================== 13. payload 净化（jsonb 不接受 U+0000 与落单代理项） ====================
+  // 现场：POST /api/push 携带合法 JSON 里的 \u0000 或落单代理项 → 服务端直接 $4::jsonb 写库 →
+  // PostgreSQL 报 22P05 unsupported Unicode escape sequence → 兜成 500，rev 永不推进、快照永远传不上去。
+  // 修法：requirePayload 之后、拼 SQL 之前净化 payload（删掉非法码元，不替换成可见字符）。
+  const sanEnv = makeEnv();
+  await sanEnv.req('/register', { username: 'sanitize_01', password: 'sanitize-pass-1' });
+  const sanToken = (await sanEnv.req('/login', { username: 'sanitize_01', password: 'sanitize-pass-1' })).body.token;
+
+  // 直接盯住真正传给 $4 的文本：FakeDb 里的 JSON.parse 能吞下 NUL，只看落库后的值测不出这个 bug
+  const snapshotParams = [];
+  const rawQuery = sanEnv.db.query.bind(sanEnv.db);
+  sanEnv.db.query = async (sql, params) => {
+    if (String(sql).replace(/\s+/g, ' ').trim().startsWith('INSERT INTO snapshots')) snapshotParams.push(params.slice());
+    return rawQuery(sql, params);
+  };
+  const pushedText = () => (snapshotParams.length ? snapshotParams[snapshotParams.length - 1][3] : null);
+  const pushedPayload = () => JSON.parse(pushedText());
+
+  // a) NUL
+  const nulPush = await sanEnv.req('/push', { token: sanToken, baseRev: 0, payload: { v: 'a\u0000b', keep: '中文' } });
+  check('a) 含 \\u0000 的 payload → 200（不再 500，rev 正常推进）', nulPush.status === 200 && nulPush.body.rev === 1, nulPush.status + ' ' + nulPush.raw);
+  check('a) 传给 $4 的 JSON 文本里不含 \\u0000（转义写法与裸字符两种形态都查）', Boolean(pushedText()) && pushedText().indexOf('\\u0000') === -1 && pushedText().indexOf('\u0000') === -1, JSON.stringify(String(pushedText()).slice(0, 60)));
+  check('a) NUL 两侧的合法字符保留（ab），中文原样', deepEqual(pushedPayload(), { v: 'ab', keep: '中文' }), String(pushedText()));
+
+  // b) 落单代理项
+  const lonePush = await sanEnv.req('/push', { token: sanToken, baseRev: 1, payload: { hi: 'x\ud800y', lo: 'p\udfffq' } });
+  check('b) 落单代理项 \\ud800 / \\udfff → 200', lonePush.status === 200 && lonePush.body.rev === 2, lonePush.status + ' ' + lonePush.raw);
+  check('b) $4 文本里没有 \\ud800 / \\udfff（转义形态与裸代理项都不许有）', pushedText().indexOf('\\ud800') === -1 && pushedText().indexOf('\\udfff') === -1 && pushedText().indexOf('\ud800') === -1 && pushedText().indexOf('\udfff') === -1, JSON.stringify(String(pushedText())));
+  check('b) 落单代理项被删掉，前后字符保留', deepEqual(pushedPayload(), { hi: 'xy', lo: 'pq' }), String(pushedText()));
+
+  // c) 合法内容一个字节都不能动（最关键：防净化过度）
+  const legal = {
+    emoji: '😀🎉',
+    family: '👨‍👩‍👧‍👦',
+    cjk: '中文、标点。？！',
+    ws: 'a\n\tb',
+    combining: 'e\u0301',
+    key_中文: '值',
+  };
+  const legalText = JSON.stringify(legal);
+  const logsBeforeLegal = sanEnv.logs.length;
+  const legalPush = await sanEnv.req('/push', { token: sanToken, baseRev: 2, payload: legal });
+  const legalLogs = sanEnv.logs.slice(logsBeforeLegal).join('\n');
+  check('c) 全合法 payload（emoji / 中文 / 换行 / 制表符 / 组合字符）→ 200', legalPush.status === 200 && legalPush.body.rev === 3, legalPush.status + ' ' + legalPush.raw);
+  check('c) 传给 $4 的文本与净化前逐字节相同（emoji 代理对没被误删）', pushedText() === legalText, JSON.stringify(String(pushedText())) + ' vs ' + JSON.stringify(legalText));
+  check('c) 回读的 payload 与推上去的合法 payload 深度相等', deepEqual((await sanEnv.req('/pull', { token: sanToken })).body.payload, legal), 'pull 回读比对');
+  check('c) 一次删除都没发生时日志里不出现 sanitized 字段（不画蛇添足）', legalLogs.indexOf('"sanitized"') === -1 && legalLogs.indexOf('"status":200') !== -1, legalLogs.slice(0, 200));
+  check('c) 前面 NUL / 代理项两次 push 各自记了净化计数（1 处与 2 处）', sanEnv.logs.slice(0, logsBeforeLegal).join('\n').indexOf('"sanitized":1') !== -1 && sanEnv.logs.slice(0, logsBeforeLegal).join('\n').indexOf('"sanitized":2') !== -1, sanEnv.logs.slice(0, logsBeforeLegal).join('\n').slice(0, 240));
+
+  // d) 嵌套结构（对象套数组套对象）与键名
+  const nested = { list: [{ 'k\u0000ey': 'v\u0000al', ok: [1, { deep: 'x\ud800' }] }], 'top\u0000level': { a: 'b\udfff' } };
+  const nestedPush = await sanEnv.req('/push', { token: sanToken, baseRev: 3, payload: nested });
+  const nestedBack = (await sanEnv.req('/pull', { token: sanToken })).body.payload;
+  check('d) 对象套数组套对象里的非法字符被递归净化', nestedPush.status === 200 && deepEqual(nestedBack, { list: [{ key: 'val', ok: [1, { deep: 'x' }] }], toplevel: { a: 'b' } }), JSON.stringify(nestedBack));
+  check('d) 键名里的非法字符同样被净化（k\\u0000ey → key）', Object.keys(nestedBack).join(',') === 'list,toplevel' && Object.keys(nestedBack.list[0]).join(',') === 'key,ok', JSON.stringify(nestedBack).slice(0, 120));
+  check('d) 净化返回副本，不就地改写入参对象', nested.list[0]['k\u0000ey'] === 'v\u0000al' && nested.list[0].ok[1].deep === 'x\ud800', JSON.stringify(nested).slice(0, 120));
+
+  // e) 合法部分深度相等（只少了非法字符）
+  const mixed = { a: ['1\u0000', '2', { b: '3\ud800' }], n: 42, t: true, z: null, s: 'ok' };
+  await sanEnv.req('/push', { token: sanToken, baseRev: 4, payload: mixed });
+  const mixedBack = (await sanEnv.req('/pull', { token: sanToken })).body.payload;
+  check('e) 净化后的 payload 与「只删掉非法字符」的期望值深度相等', deepEqual(mixedBack, { a: ['1', '2', { b: '3' }], n: 42, t: true, z: null, s: 'ok' }), JSON.stringify(mixedBack));
+  check('e) 非字符串类型逐个原样（数字 / 布尔 / null / 字符串）', mixedBack.n === 42 && mixedBack.t === true && mixedBack.z === null && mixedBack.s === 'ok', JSON.stringify(mixedBack));
+
+  // f) 日志只记「净化了几处」，绝不记被净化的内容
+  const logEnv = makeEnv();
+  await logEnv.req('/register', { username: 'sanitize_log', password: 'sanitize-pass-1' });
+  const logToken = (await logEnv.req('/login', { username: 'sanitize_log', password: 'sanitize-pass-1' })).body.token;
+  const logPush = await logEnv.req('/push', { token: logToken, baseRev: 0, payload: { a: 'LEAKMARK\u0000END', b: 'x\ud800y', c: 'z\udfff', d: '\u0000\u0000' } });
+  const logBlob = logEnv.logs.join('\n');
+  check('f) 净化计数写进日志（本例删了 5 处）', logPush.status === 200 && logBlob.indexOf('"sanitized":5') !== -1, logBlob);
+  check('f) 日志里不含被净化内容（标记串 / NUL / 落单代理项都不出现）', logBlob.indexOf('LEAKMARK') === -1 && logBlob.indexOf('END') === -1 && logBlob.indexOf('\u0000') === -1 && logBlob.indexOf('\\u0000') === -1 && logBlob.indexOf('\\ud800') === -1, logBlob.slice(0, 300));
+
+  // g) 非字符串类型不被破坏
+  const typed = { n: 0, neg: -1.5, big: 9007199254740991, t: true, f: false, z: null, deep: { arr: [1, [2, [{ x: null }]]] } };
+  await sanEnv.req('/push', { token: sanToken, baseRev: 5, payload: typed });
+  const typedBack = (await sanEnv.req('/pull', { token: sanToken })).body.payload;
+  check('g) 0 / 负数 / 大整数 / true / false / null / 深层嵌套全部原样', deepEqual(typedBack, typed) && typeof typedBack.neg === 'number' && typedBack.f === false, JSON.stringify(typedBack));
+
+  const emptyPush = await sanEnv.req('/push', { token: sanToken, baseRev: 6, payload: { '\u0000': '\u0000' } });
+  const emptyBack = (await sanEnv.req('/pull', { token: sanToken })).body.payload;
+  check('边界：整份 payload 净化后变成空对象 → 照常 200，rev 照常推进', emptyPush.status === 200 && emptyPush.body.rev === 7, emptyPush.status + ' ' + emptyPush.raw);
+  check('边界：空对象原样落库（不是 null，也不是错误）', deepEqual(emptyBack, {}) && emptyBack !== null, JSON.stringify(emptyBack));
+
+  // h) 净化函数对异常输入不抛异常（循环引用 / 超深嵌套；实现走显式栈，没有深度上限）
+  const cyclic = { name: 'loop' };
+  cyclic.self = cyclic;
+  let cyclicOut = null;
+  let cyclicErr = null;
+  try { cyclicOut = api.sanitizePayload(cyclic); } catch (err) { cyclicErr = err; }
+  check('h) 循环引用不抛异常（memo 表兜住，不无限递归）', cyclicErr === null && cyclicOut.value.self === cyclicOut.value && cyclic.self === cyclic, cyclicErr ? String(cyclicErr) : 'ok');
+
+  let deep = { leaf: 'end\u0000' };
+  for (let i = 0; i < 20000; i += 1) deep = { child: deep };
+  let deepErr = null;
+  let deepRemoved = -1;
+  try { deepRemoved = api.sanitizePayload(deep).removed; } catch (err) { deepErr = err; }
+  check('h) 20000 层嵌套不抛异常（显式栈，无深度上限）', deepErr === null && deepRemoved === 1, deepErr ? String(deepErr) : 'removed=' + deepRemoved);
+
+  // 第二条（顺手修）：超限要能「被识别」—— 413 + payload-too-large + 全套 CORS 头。
+  // 网关自己拦下的 413 不带 CORS 头（网关改不了），客户端只能看到「网络不可用」；服务端把
+  // 「我判定超限」做成可辨认形状，两者就能区分开。上限常量保持原样（线上不可达的死代码）。
+  const hugePush = await sanEnv.req('/push', { token: sanToken, baseRev: 7, payload: { v: 'x'.repeat(8 * 1024 * 1024) } });
+  const hugeLogLine = sanEnv.logs[sanEnv.logs.length - 1];
+  check('超限 payload → 400 bad-request「payload 过大」（冻结协议不变：状态码与错误体一个字段都不加）', hugePush.status === 400 && hugePush.body.error === 'bad-request' && hugePush.body.message === 'payload 过大' && Object.keys(hugePush.body).sort().join(',') === 'error,message', hugePush.status + ' ' + String(hugePush.raw).slice(0, 120));
+  check('超限响应带全套 CORS 头（不带任何 CORS 头的 413 才说明是网关提前拦的）', hugePush.headers['access-control-allow-origin'] === '*' && hugePush.headers['access-control-allow-methods'] === 'POST, OPTIONS' && hugePush.headers.vary === 'origin', JSON.stringify(hugePush.headers));
+  check('服务端把「自己判定的超限」记进日志（tooLarge + limit）：网关拦下的那条不会留下任何服务端日志', String(hugeLogLine).indexOf('"tooLarge":true') !== -1 && String(hugeLogLine).indexOf('"limit":8388608') !== -1, String(hugeLogLine).slice(0, 240));
+  check('超限时什么都不写（库里仍是上一份快照 {}），rev 未推进', deepEqual((await sanEnv.req('/pull', { token: sanToken })).body.payload, {}), 'rev 未推进');
+  check('上限常量一个字没改（线上不可达的死代码，别动）', api.MAX_PAYLOAD_BYTES === 8 * 1024 * 1024 && /const MAX_BODY_BYTES = 9 \* 1024 \* 1024;/.test(readFileSync(new URL('../cloud/functions/hms-api/index.js', import.meta.url), 'utf8')), String(api.MAX_PAYLOAD_BYTES));
+  check('日志字段名是导出常量（文档与测试都按它识别这类情况）', api.TOO_LARGE_LOG_FIELD === 'tooLarge', String(api.TOO_LARGE_LOG_FIELD));
+
   return { passed: passed, failed: failures.length, failures: failures };
 }
 
