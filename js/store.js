@@ -287,7 +287,9 @@ export async function targetsForGoalKind(goalKind, overrides = {}) {
     goalKind: GOAL_KINDS.includes(goalKind) ? goalKind : saved.goalKind,
     ...o,
   };
-  return dailyTargetsFrom(profile, merged, merged.weightKg);
+  // 这是「切档预览」：必须按新档位重新推算热量，否则会把存下来的热量目标冻住、
+  // 三种档位显示同一个热量。故显式清掉 calorieTarget 覆盖。
+  return dailyTargetsFrom(profile, { ...merged, calorieTarget: 0 }, merged.weightKg);
 }
 
 export async function getGoals() {

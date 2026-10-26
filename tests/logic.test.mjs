@@ -315,7 +315,7 @@ async function testDailyTargets() {
     ok(t('maintain').protein.g < t('cut').protein.g, '维持的 g/kg 必须小于减脂');
     ok(t('cut').protein.g < t('bulk').protein.g, '减脂的 g/kg 必须小于增肌');
     ok(t('maintain').protein.g < t('bulk').protein.g, '维持的 g/kg 必须小于增肌');
-    deep(Object.keys(t('cut').basis).sort(), ['bmr', 'calorieAdjustPct', 'gPerKg', 'goalKind', 'tdee']);
+    deep(Object.keys(t('cut').basis).sort(), ['autoCalorieTarget', 'bmr', 'calorieAdjustPct', 'calorieFromGoal', 'gPerKg', 'goalKind', 'tdee']);
   });
 
   check('蛋白质克数按体重线性变化（g/kg 口径，不是固定百分比）', () => {
