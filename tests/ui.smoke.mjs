@@ -2004,6 +2004,519 @@ export async function run() {
       }
     });
 
+    // ---- 3.8.6 膳食纤维：只显示摄取量（用户决策：不加每日目标），缺数据不撒谎 ----
+    await checkAsync('food 纤维口径：缺数据不累加、全缺时说「暂无数据」、脏值不当已知', async () => {
+      const foodView = await import('../views/food.js');
+      const t = foodView.fiberTotals([{ fiber: 6.2 }, { name: '无数据' }, null, 42, { fiber: 'abc' }, { fiber: 0 }]);
+      assert.equal(t.total, 4, 'total 只应数对象条目：' + t.total);
+      assert.equal(t.known, 2, 'known 只应数有限数值：' + t.known);
+      assert.equal(t.value, 6.2, '只应累加已知值：' + t.value);
+      assert.equal(t.missing, 2, 'missing 口径不对：' + t.missing);
+      assert.equal(foodView.fiberSummaryText(t), '6.2 g（部分食物无数据）', '汇总文案不对：' + foodView.fiberSummaryText(t));
+      assert.equal(foodView.fiberSummaryText(foodView.fiberTotals([{ name: '只有无数据' }])), '暂无数据', '一条纤维数据都没有时应说「暂无数据」');
+      assert.equal(foodView.fiberSummaryText(foodView.fiberTotals([])), '', '一条条目都没有时整行不该渲染');
+      assert.equal(foodView.fiberMetaSuffix({ fiber: null }), '', 'fiber 为 null 时条目行不该有纤维片段');
+      assert.equal(foodView.fiberMetaSuffix({ name: 'x' }), '', '缺 fiber 键时条目行不该有纤维片段');
+      assert.equal(foodView.fiberMetaSuffix({ fiber: 3 }), ' / 纤 3.0', '条目行片段不对');
+      assert.equal(foodView.fiberPreviewSuffix({ fiber: 3 }), ' · 膳食纤维 3.0g', '预览片段不对');
+      assert.equal(foodView.fiberPreviewSuffix({ fiber: null }), '', '缺数据时预览不该出现纤维');
+      assert.equal(foodView.fiberSubtotalSuffix([{ fiber: 1 }]), ' · 纤 1.0', '每餐小计片段不对');
+      assert.equal(foodView.fiberSubtotalSuffix([{ name: '无数据' }]), '', '每餐小计全缺数据时什么都不加');
+    });
+
+// ---- 3.8.7 作息偏移：默认餐次整体后移（新疆作息：14:00 午饭 / 21:30 晚饭） ----
+await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不再被记成午餐', async () => {
+  const foodView = await import('../views/food.js');
+  const at = (h, m) => h * 60 + m;
+  assert.equal(foodView.defaultSlot(0, at(9, 59)), 'breakfast', '09:59 应为早餐');
+  assert.equal(foodView.defaultSlot(0, at(10, 0)), 'lunch', '10:00 应为午餐');
+  assert.equal(foodView.defaultSlot(0, at(15, 0)), 'dinner', '15:00 应为晚餐');
+  assert.equal(foodView.defaultSlot(0, at(21, 0)), 'snack', '21:00 应为加餐');
+  assert.equal(foodView.defaultSlot(120, at(10, 30)), 'breakfast', '新疆 10:30 的早饭被记成了午餐');
+  assert.equal(foodView.defaultSlot(120, at(14, 0)), 'lunch', '14:00 应为午餐');
+  assert.equal(foodView.defaultSlot(120, at(21, 30)), 'dinner', '21:30 应为晚餐');
+  assert.equal(foodView.defaultSlot(120, at(14, 0)), foodView.defaultSlot(0, at(12, 0)), '偏移语义应与整体平移等价');
+  assert.equal(foodView.defaultSlot(NaN, at(10, 30)), 'lunch', 'NaN 偏移应回落 0');
+  assert.equal(foodView.defaultSlot('abc', at(10, 30)), 'lunch', '非法字符串偏移应回落 0');
+  assert.equal(foodView.defaultSlot(null, at(10, 30)), 'lunch', 'null 偏移应回落 0');
+});
+
+
+    await checkAsync('food 条目行显示纤维，缺 fiber 的条目不出「纤 0」', async () => {
+      clearCaseOverlays();
+      // 名字里不能带「纤」字：下面要按「整行文本里有没有纤」断言，名字自带这个字会把断言变成假信号。
+      const withFiber = { name: '条目有数据', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3, fiber: 6.2 };
+      const without = { name: '条目无数据', grams: 80, kcal: 88, carb: 9, protein: 4, fat: 2 };
+      const mealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: [withFiber, without] });
+      try {
+        const root = await renderView('food');
+        const rowA = foodRow(root, withFiber.name);
+        const rowB = foodRow(root, without.name);
+        assert.ok(rowA && rowB, '餐次列表里找不到测试条目');
+        assert.ok(rowA.textOf().includes('碳 10.0 / 蛋 5.0 / 脂 3.0 / 纤 6.2'), '有条目的行没有追加纤维：' + rowA.textOf());
+        assert.ok(!rowB.textOf().includes('纤'), '没有 fiber 数据的条目不该出现纤维：' + rowB.textOf());
+        // 只抓「正好是 0」：纤 0.3 这种真有数据的不算（0.3% 的纤维不是 0）。
+        assert.ok(!/纤 0(\.0)?(?![.\d])/.test(nodeText(root)), '缺数据的条目被写成了「纤 0」');
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('food 修改面板预览含纤维，缺数据时预览不出现纤维', async () => {
+      clearCaseOverlays();
+      const withFiber = { name: '预览纤维A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3, fiber: 6.2 };
+      const without = { name: '预览纤维B', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const mealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: [withFiber, without] });
+      try {
+        let root = await renderView('food');
+        let sheet = await openModifyPanel(root, withFiber.name);
+        assert.ok(sheet, '点「修改」没有打开面板');
+        let preview = byClass(sheet, 'portion-preview')[0];
+        assert.ok(preview.textOf().includes('膳食纤维 6.2g'), '面板预览没有追加纤维：' + preview.textOf());
+        fireClick(findButton(sheet, '取消'));
+        await tick(80);
+
+        root = await renderView('food');
+        sheet = await openModifyPanel(root, without.name);
+        assert.ok(sheet, '点「修改」没有打开面板');
+        preview = byClass(sheet, 'portion-preview')[0];
+        assert.ok(!preview.textOf().includes('纤维'), '缺数据的面板预览不该出现纤维：' + preview.textOf());
+        assertNoLeak(preview.textOf(), 'portion-preview(无纤维)');
+        fireClick(findButton(sheet, '取消'));
+        await tick(80);
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('food 每餐小计追加纤维，部分食物缺数据时明确标注', async () => {
+      clearCaseOverlays();
+      const withFiber = { name: '小计纤维A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3, fiber: 4.4 };
+      const without = { name: '小计纤维B', grams: 100, kcal: 120, carb: 12, protein: 6, fat: 4 };
+      const mealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: [withFiber, without] });
+      try {
+        const root = await renderView('food');
+        const summary = await store.daySummary(today);
+        const snacks = [];
+        for (const meal of summary.meals) {
+          if (meal.slot !== 'snack') continue;
+          for (const item of (Array.isArray(meal.items) ? meal.items : [])) snacks.push(item);
+        }
+        const expect = nutrition.round1(snacks.reduce((sum, item) => sum + (item && item.fiber != null && Number.isFinite(Number(item.fiber)) ? Number(item.fiber) : 0), 0));
+        const heading = byClass(root, 'h2').find((n) => n.textOf().startsWith('加餐'));
+        assert.ok(heading, '找不到「加餐」的小计行');
+        assert.ok(heading.textOf().includes('纤 ' + expect.toFixed(1)), '每餐小计没有追加纤维：' + heading.textOf());
+        assert.ok(heading.textOf().includes('（部分食物无数据）'), '每餐小计没有标注缺数据：' + heading.textOf());
+        assert.equal(byClass(root, 'h2').filter((n) => n.textOf().startsWith('加餐')).length, 1, '加餐小计行应恰好一条');
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('food 当日合计追加纤维：只累加已知值，缺数据的条目明确标注', async () => {
+      clearCaseOverlays();
+      const extra = { name: '当日纤维项', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3, fiber: 7.3 };
+      const mealId = await store.logMeal({ date: today, slot: 'dinner', source: 'manual', items: [extra] });
+      try {
+        const root = await renderView('food');
+        const summary = await store.daySummary(today);
+        const all = [];
+        for (const meal of summary.meals) for (const item of (Array.isArray(meal.items) ? meal.items : [])) all.push(item);
+        const expect = nutrition.round1(all.reduce((sum, item) => sum + (item && item.fiber != null && Number.isFinite(Number(item.fiber)) ? Number(item.fiber) : 0), 0));
+        const text = nodeText(root);
+        assert.ok(text.includes('膳食纤维'), '当日合计缺少「膳食纤维」');
+        assert.ok(text.includes(expect.toFixed(1) + ' g（部分食物无数据）'), '当日合计的纤维文案不对，期望 ' + expect.toFixed(1) + ' g（部分食物无数据）');
+        assertNoLeak(text, 'food(含纤维)');
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('food 当日合计：一条纤维数据都没有时说「暂无数据」，不报 0', async () => {
+      clearCaseOverlays();
+      const yesterday = nutrition.daysAgo(1);
+      const mealId = await store.logMeal({ date: yesterday, slot: 'snack', source: 'manual', items: [{ name: '昨天无数据项', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 }] });
+      try {
+        const root = await renderView('food');
+        fireClick(findButton(root, '‹ 前一天'));
+        await tick(300);
+        const text = nodeText(root);
+        assert.ok(text.includes('昨天无数据项'), '没有翻到前一天：' + text.slice(0, 160));
+        assert.ok(text.includes('膳食纤维'), '当日合计缺少「膳食纤维」');
+        assert.ok(text.includes('暂无数据'), '一条纤维数据都没有时应说「暂无数据」：' + text.slice(0, 200));
+        assert.ok(!/纤 0(\.0)?(?![.\d])/.test(text), '缺数据被写成了「纤 0」：' + text.slice(0, 200));
+        assert.equal(foodRow(root, '昨天无数据项').textOf().includes('纤'), false, '缺数据的条目行不该出现纤维');
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('dashboard 宏量营养素显示膳食纤维：只报摄取量、不设每日目标', async () => {
+      clearCaseOverlays();
+      const extra = { name: '今日页纤维项', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3, fiber: 7.3 };
+      const mealId = await store.logMeal({ date: today, slot: 'dinner', source: 'manual', items: [extra] });
+      try {
+        const summary = await store.daySummary(today);
+        const all = [];
+        for (const meal of summary.meals) for (const item of (Array.isArray(meal.items) ? meal.items : [])) all.push(item);
+        const expect = nutrition.round1(all.reduce((sum, item) => sum + (item && item.fiber != null && Number.isFinite(Number(item.fiber)) ? Number(item.fiber) : 0), 0));
+        const dash = await renderView('dashboard');
+        const row = byClass(dash, 'macro').find((n) => n.textOf().includes('膳食纤维'));
+        assert.ok(row, '今日页宏量营养素里没有膳食纤维');
+        assert.ok(row.textOf().includes(expect.toFixed(1) + ' g'), '今日页纤维值不对：' + row.textOf());
+        assert.ok(row.textOf().includes('部分食物无数据'), '缺数据的条数没有标注：' + row.textOf());
+        assert.equal(byClass(row, 'bar').length, 0, '纤维不该有进度条（用户决策：不设每日目标）');
+        assert.ok(!row.textOf().includes('/'), '纤维不该出现「/ 目标」：' + row.textOf());
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    // ---- 3.8.7 餐内「已添加」列表直删：不用先进「修改」面板，二次确认与面板内删除同源 ----
+    await checkAsync('food 列表直删：条目上有紧凑删除入口，取消后一项都不动', async () => {
+      clearCaseOverlays();
+      const A = { name: '直删测试A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '直删测试B', grams: 80, kcal: 88, carb: 9, protein: 4, fat: 2 };
+      const mealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: [A, B] });
+      try {
+        const root = await renderView('food');
+        const row = foodRow(root, A.name);
+        assert.ok(row, '餐次列表里找不到测试条目');
+        const delBtn = findButton(row, '删');
+        assert.ok(delBtn, '条目行上没有紧凑的删除入口');
+        assert.ok(delBtn.className.includes('btn--sm'), '删除入口不是紧凑按钮：' + delBtn.className);
+        assert.ok(delBtn.className.includes('btn--danger'), '删除入口不是危险操作样式：' + delBtn.className);
+        assert.ok(findButton(row, '修改'), '「修改」入口被删入口挤掉了');
+
+        fireClick(delBtn);
+        await tick(80);
+        const dialog = topDialog();
+        assert.ok(dialog, '列表直删没有二次确认');
+        assert.ok(dialog.textOf().includes('删除这一项？'), '确认框标题不对：' + dialog.textOf());
+        assert.ok(dialog.textOf().includes(A.name), '确认框没有说明删的是哪一项：' + dialog.textOf());
+        fireClick(findButton(dialog, '取消'));
+        await tick(80);
+        const after = await mealById(mealId);
+        assert.ok(after && after.items.length === 2, '取消后条目被删掉了');
+        assert.deepEqual(after.items, [A, B], '取消后条目内容变了');
+        assert.ok(!caseToasts().some((t) => t.includes('已删除')), '取消也弹了删除提示：' + caseToasts().join(' | '));
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('food 列表直删：确认后删中间项，其余项顺序与内容不变', async () => {
+      clearCaseOverlays();
+      const A = { name: '直删中间A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '直删中间B', grams: 150, kcal: 200, carb: 20, protein: 10, fat: 6 };
+      const C = { name: '直删中间C', grams: 60, kcal: 33, carb: 3, protein: 2, fat: 1 };
+      const mealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: [A, B, C] });
+      try {
+        const root = await renderView('food');
+        fireClick(findButton(foodRow(root, B.name), '删'));
+        await tick(80);
+        const dialog = topDialog();
+        assert.ok(dialog, '列表直删没有二次确认');
+        fireClick(findButton(dialog, '删除'));
+        const saved = await waitFor(async () => {
+          const row = await mealById(mealId);
+          return row && row.items.length === 2 ? row : null;
+        });
+        assert.ok(saved, '删中间一项把整餐删掉了');
+        assert.deepEqual(saved.items, [A, C], '删除后的条目不是 [A, C]');
+        assert.ok(caseToasts().some((t) => t.includes('已删除这一项')), '没有「已删除这一项」的提示：' + caseToasts().join(' | '));
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('food 列表直删：删最后一项连整餐一起删，提示与「修改」面板逐字一致', async () => {
+      clearCaseOverlays();
+      const name = '直删最后一项';
+      const mealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: [{ name, grams: 120, kcal: 150, carb: 30, protein: 3, fat: 1 }] });
+      const root = await renderView('food');
+      fireClick(findButton(foodRow(root, name), '删'));
+      await tick(80);
+      const dialog = topDialog();
+      assert.ok(dialog, '列表直删没有二次确认');
+      assert.ok(dialog.textOf().includes('最后一项'), '最后一项的确认框没有说明整餐会一起删掉：' + dialog.textOf());
+      fireClick(findButton(dialog, '删除'));
+      const gone = await waitFor(async () => ((await mealById(mealId)) ? null : true));
+      assert.ok(gone, '列表直删最后一项没有把整餐删掉');
+      assert.ok(caseToasts().some((t) => t.includes('已删除最后一项，整餐已移除')), '提示文案与面板不一致：' + caseToasts().join(' | '));
+    });
+
+    await checkAsync('food 列表直删：确认文案与「修改」面板内删除逐字一致', async () => {
+      clearCaseOverlays();
+      const name = '逐字一致测试';
+      const items = [{ name, grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 }, { name: '逐字一致陪衬', grams: 50, kcal: 50, carb: 5, protein: 2, fat: 1 }];
+      const listMealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: items.map((i) => ({ ...i })) });
+      const panelMealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: items.map((i) => ({ ...i })) });
+      try {
+        let root = await renderView('food');
+        fireClick(findButton(foodRow(root, name), '删'));
+        await tick(80);
+        const listText = topDialog().textOf();
+        fireClick(findButton(topDialog(), '取消'));
+        await tick(80);
+
+        root = await renderView('food');
+        const sheet = await openModifyPanel(root, name);
+        assert.ok(sheet, '点「修改」没有打开面板');
+        fireClick(findButton(sheet, '删除这一项'));
+        await tick(80);
+        const panelText = topDialog().textOf();
+        fireClick(findButton(topDialog(), '取消'));
+        await tick(80);
+        assert.ok(listText.includes(name), '确认文案里没有条目名：' + listText);
+        assert.equal(listText, panelText, '列表直删与面板删除的确认文案不一致');
+      } finally {
+        await store.deleteMeal(listMealId);
+        await store.deleteMeal(panelMealId);
+      }
+    });
+
+    await checkAsync('food 列表直删：脏条目（null/42）混进 items 时按原始索引定位', async () => {
+      clearCaseOverlays();
+      const A = { name: '直删脏A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '直删脏B', grams: 90, kcal: 90, carb: 9, protein: 4, fat: 2 };
+      const id = 9102;
+      await db.getAll('meals');
+      const dbName = db.getDbName();
+      const openedDb = fakeIdb.opened.filter((d) => d.name === dbName).pop();
+      assert.ok(openedDb, '假 IDB 里没有当前库');
+      const raw = openedDb.stores.get('meals');
+      raw.seq = Math.max(raw.seq, id);
+      raw.data.set(id, structuredClone({ id, date: today, slot: 'snack', source: 'manual', createdAt: Date.now(), items: [null, A, 42, B] }));
+      try {
+        const root = await renderView('food');
+        const rowB = foodRow(root, B.name);
+        assert.ok(rowB, '脏条目混进 items 后正常条目没有渲染出来');
+        assert.ok(!/\bundefined\b/.test(nodeText(root)), '脏条目把 undefined 漏上了屏');
+        fireClick(findButton(rowB, '删'));
+        await tick(80);
+        const dialog = topDialog();
+        assert.ok(dialog, '列表直删没有二次确认');
+        assert.ok(!/undefined/.test(dialog.textOf()), '确认框漏出 undefined：' + dialog.textOf());
+        fireClick(findButton(dialog, '删除'));
+        const saved = await waitFor(async () => {
+          const row = await mealById(id);
+          return row && row.items.length === 1 ? row : null;
+        });
+        assert.ok(saved, '脏条目那一餐没有按索引删成功');
+        assert.deepEqual(saved.items.map((it) => it.name), [A.name], '删掉的不是原始数组位置上的那一条');
+      } finally {
+        raw.data.delete(id);
+      }
+    });
+
+    // ---- 3.8.8 套餐原地编辑：改的是原套餐（标题/说明/二次确认都要说清，没有退路） ----
+    const mealTemplateByName = async (name) => (await store.getMealTemplates()).filter((t) => t.name === name);
+    const mealTemplateDrop = async (name) => {
+      for (const t of await mealTemplateByName(name)) await store.deleteMealTemplate(t.id);
+    };
+    /** 打开某个套餐的编辑层：chip 上的「编辑」→ 弹层。返回弹层节点。 */
+    const openMealTemplateEditor = async (name) => {
+      const root = await renderView('food');
+      const chip = byClass(root, 'tpl-chip').find((n) => n.textOf().includes(name));
+      assert.ok(chip, '套餐 chip 里找不到「' + name + '」（chip 上限 6 个，或套餐没落库）');
+      const btn = findButton(chip, '编辑');
+      assert.ok(btn, '套餐「' + name + '」没有编辑入口');
+      fireClick(btn);
+      await tick(140);
+      const sheet = topSheet();
+      assert.ok(sheet && sheet.textOf().includes('编辑套餐 · ' + name), '编辑层没打开：' + (sheet ? sheet.textOf().slice(0, 100) : '没有弹层'));
+      return sheet;
+    };
+
+    await checkAsync('food 套餐 chip：单餐套餐有「编辑」入口，编辑层说明会更新原套餐', async () => {
+      clearCaseOverlays();
+      const name = '编辑入口套餐';
+      await mealTemplateDrop(name);
+      await store.saveMealTemplate({ name, slot: 'lunch', items: [{ name: '入口项', grams: 150, kcal: 200, carb: 40, protein: 5, fat: 1 }] });
+      try {
+        const root = await renderView('food');
+        const chip = byClass(root, 'tpl-chip').find((n) => n.textOf().includes(name));
+        assert.ok(chip, '套餐 chip 没有渲染');
+        const editBtn = findButton(chip, '编辑');
+        assert.ok(editBtn, '套餐 chip 上没有「编辑」入口');
+        assert.ok(editBtn.className.includes('btn--sm'), '编辑入口不是紧凑按钮：' + editBtn.className);
+        assert.ok(findButton(chip, '×'), '套餐 chip 上的删除入口被挤掉了');
+
+        fireClick(editBtn);
+        await tick(140);
+        const sheet = topSheet();
+        assert.ok(sheet, '点「编辑」没有打开编辑层');
+        assert.ok(sheet.textOf().includes('编辑套餐 · ' + name), '编辑层标题不对：' + sheet.textOf().slice(0, 90));
+        assert.ok(sheet.textOf().includes('保存后原套餐会被更新'), '编辑层没有说明会更新原套餐：' + sheet.textOf().slice(0, 140));
+        assert.ok(sheet.textOf().includes('入口项'), '编辑层没有列出套餐里的条目');
+        assert.ok(findButton(sheet, '保存到原套餐'), '编辑层没有保存入口');
+        assert.ok(findButton(sheet, '加食物'), '编辑层没有「加食物」入口');
+        fireClick(findButton(sheet, '取消'));
+        await tick(80);
+        assert.ok(!topSheet(), '取消后编辑层没有关闭');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 套餐编辑参数：templateEditPayload 带原套餐 id（原地更新）', async () => {
+      const foodView = await import('../views/food.js');
+      const template = { id: '4242', name: '参数套餐', slot: 'dinner', items: [{ name: '旧项', grams: 100, kcal: 100, carb: 1, protein: 1, fat: 1 }] };
+      const items = [{ name: '新项', grams: 50, kcal: 50, carb: 1, protein: 1, fat: 1 }];
+      const payload = foodView.templateEditPayload(template, items);
+      assert.deepEqual(Object.keys(payload).sort(), ['id', 'items', 'name', 'slot'], '保存参数字段不对：' + Object.keys(payload).join(','));
+      assert.equal(payload.id, '4242', '保存参数没带原套餐 id（编辑结果会变成另一个套餐）');
+      assert.equal(payload.name, '参数套餐', '保存参数把套餐名弄丢了');
+      assert.equal(payload.slot, 'dinner', '保存参数把餐次弄丢了');
+      assert.deepEqual(payload.items.map((i) => i.name), ['新项'], '保存参数的条目不对');
+      assert.notEqual(payload.items, items, '保存参数应复制条目数组');
+      assert.notEqual(payload.items[0], items[0], '保存参数应复制条目对象');
+    });
+
+    await checkAsync('food 套餐编辑：删一项后保存 → 带 id 原地覆盖（套餐数不变、id 不变）', async () => {
+      clearCaseOverlays();
+      const name = '原地编辑套餐';
+      const A = { name: '套餐项A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '套餐项B', grams: 50, kcal: 60, carb: 6, protein: 3, fat: 2 };
+      await mealTemplateDrop(name);
+      const created = await store.saveMealTemplate({ name, slot: 'lunch', items: [A, B] });
+      try {
+        const sheet = await openMealTemplateEditor(name);
+        const rowB = byClass(sheet, 'list__item').find((n) => n.textOf().includes(B.name));
+        assert.ok(rowB, '编辑层里没有条目 B');
+        fireClick(findButton(rowB, '删'));
+        await tick(80);
+        assert.equal(topSheet().textOf().includes(B.name), false, '删掉条目后编辑层列表没刷新');
+
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        const dialog = topDialog();
+        assert.ok(dialog, '保存前没有二次确认');
+        assert.ok(dialog.textOf().includes('更新原套餐'), '确认框没有说清是更新原套餐：' + dialog.textOf());
+        fireClick(findButton(dialog, '更新'));
+        const saved = await waitFor(async () => {
+          const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+          return hit && hit.items.length === 1 ? hit : null;
+        });
+        assert.ok(saved, '保存后原套餐的条目没有更新');
+        assert.equal(saved.id, created.id, '保存后套餐 id 变了（不是原地更新，而是派生了一份）');
+        assert.equal((await mealTemplateByName(name)).length, 1, '保存后同名套餐出现了多份');
+        assert.deepEqual(saved.items.map((i) => i.name), [A.name], '删掉的那一项还在，或顺序不对');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 套餐编辑：加食物后保存 → 条目按顺序追加', async () => {
+      clearCaseOverlays();
+      const foodView = await import('../views/food.js');
+      const foodsMod = await import('../js/foods.js');
+      const target = foodsMod.FOODS.find((f) => f && f.name && f.per100g && foodView.unitsOf(f).length === 1);
+      assert.ok(target, '食物库里找不到单单位食物');
+      const name = '加食物套餐';
+      await mealTemplateDrop(name);
+      await store.saveMealTemplate({ name, slot: 'lunch', items: [{ name: '原有项', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 }] });
+      try {
+        const sheet = await openMealTemplateEditor(name);
+        fireClick(findButton(sheet, '加食物'));
+        await tick(160);
+        const pickSheet = topSheet();
+        assert.ok(pickSheet && pickSheet !== sheet, '点「加食物」没有调起既有的食物搜索弹层');
+        assert.ok(pickSheet.textOf().includes('加进套餐'), '搜索弹层标题不对：' + pickSheet.textOf().slice(0, 80));
+        await pickFoodInSheet(pickSheet, target.name);
+        const editor = topSheet();
+        assert.ok(editor.textOf().includes(target.name), '加完食物后编辑层没有出现新条目：' + editor.textOf().slice(0, 160));
+        fireClick(findButton(editor, '保存到原套餐'));
+        await tick(120);
+        fireClick(findButton(topDialog(), '更新'));
+        const saved = await waitFor(async () => {
+          const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+          return hit && hit.items.length === 2 ? hit : null;
+        });
+        assert.ok(saved, '加食物后没有落库');
+        assert.deepEqual(saved.items.map((i) => i.name), ['原有项', target.name], '加进去的条目顺序不对');
+        const expected = nutrition.scaleFood(target.per100g, foodView.pickDefaultGrams(target));
+        assert.equal(saved.items[1].kcal, expected.kcal, '新条目没有按库值换算：' + saved.items[1].kcal + ' / ' + expected.kcal);
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 套餐编辑：删到 0 项时拒绝保存并给中文原因', async () => {
+      clearCaseOverlays();
+      const name = '空套餐测试';
+      await mealTemplateDrop(name);
+      await store.saveMealTemplate({ name, slot: 'lunch', items: [{ name: '唯一项', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 }] });
+      try {
+        const sheet = await openMealTemplateEditor(name);
+        const row = byClass(sheet, 'list__item').find((n) => n.textOf().includes('唯一项'));
+        assert.ok(row, '编辑层里没有唯一项');
+        fireClick(findButton(row, '删'));
+        await tick(80);
+        assert.equal(topSheet().textOf().includes('唯一项'), false, '删掉唯一一项后列表没刷新');
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        assert.ok(!topDialog(), '空套餐不该走到二次确认');
+        assert.ok(caseToasts().some((t) => t.includes('至少要留一项')), '空套餐没有给中文原因：' + caseToasts().join(' | '));
+        const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+        assert.ok(hit && hit.items.length === 1, '空套餐被写库了');
+        assert.ok(topSheet(), '空套餐被拒后编辑层不该关掉（用户还要能加回来）');
+        fireClick(findButton(topSheet(), '取消'));
+        await tick(80);
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 套餐编辑：保存前二次确认，取消则原套餐一个字节不动', async () => {
+      clearCaseOverlays();
+      const name = '取消保存套餐';
+      const A = { name: '取消项A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '取消项B', grams: 50, kcal: 60, carb: 6, protein: 3, fat: 2 };
+      await mealTemplateDrop(name);
+      const created = await store.saveMealTemplate({ name, slot: 'lunch', items: [A, B] });
+      try {
+        const sheet = await openMealTemplateEditor(name);
+        const rowB = byClass(sheet, 'list__item').find((n) => n.textOf().includes(B.name));
+        assert.ok(rowB, '编辑层里没有条目 B');
+        fireClick(findButton(rowB, '删'));
+        await tick(80);
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        const dialog = topDialog();
+        assert.ok(dialog, '保存前没有二次确认');
+        fireClick(findButton(dialog, '取消'));
+        await tick(140);
+        const after = (await store.getMealTemplates()).find((t) => t.name === name);
+        assert.ok(after, '原套餐不见了');
+        assert.equal(after.id, created.id, '取消后套餐 id 变了');
+        assert.deepEqual(after.items, [A, B], '取消后原套餐被改动了');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 套餐编辑：整日套餐不给「编辑」入口（保存接口不是同一套）', async () => {
+      clearCaseOverlays();
+      const name = '整日套餐不可编辑';
+      await mealTemplateDrop(name);
+      await store.saveDayTemplate({ name, meals: [
+        { slot: 'breakfast', items: [{ name: '整日早', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '整日午', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] });
+      try {
+        const root = await renderView('food');
+        const chip = byClass(root, 'tpl-chip').find((n) => n.textOf().includes(name));
+        assert.ok(chip, '整日套餐 chip 没有渲染');
+        assert.equal(findButton(chip, '编辑'), undefined, '整日套餐出现了「编辑」入口');
+        assert.ok(chip.walk().some((n) => String(n.className).split(/\s+/).includes('tpl-chip__del')), '整日套餐的删除入口不见了');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+
     // ---- 3.9 BMI 可视化：四档小人 / 指针百分比 / 边界提示 ----
     // 前面的用例拖过刻度尺、存过别的体重；这一段依赖种子状态（今天 68.4kg / 172cm），
     // 先把它钉回去（logWeight 按日期覆盖），免得断言跟着跑过的用例漂。

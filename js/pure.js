@@ -257,23 +257,40 @@ export function normalizeDayMeals(meals) {
   return out;
 }
 
+/**
+ * 套餐的 createdAt：只认有限数值与数字串（取整），其余（缺键 / null / 'abc' / 对象）一律 null。
+ * 老记录没有这个键 -> 不补：凭空编一个时间戳会让「原地编辑保留 createdAt」变成假承诺。
+ */
+function templateCreatedAt(rec) {
+  const raw = rec ? rec.createdAt : null;
+  if (raw == null || (typeof raw !== 'number' && typeof raw !== 'string')) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? int(n) : null;
+}
+
 /** 单条套餐：id 与 name 缺一不可；kind='day' 的 meals 归一化后不足 2 餐视为非法。 */
 export function normalizeMealTemplate(rec) {
   if (!rec || typeof rec !== 'object') return null;
   const id = rec.id == null ? '' : String(rec.id).trim();
   const name = text(rec.name);
   if (!id || !name) return null;
+  const createdAt = templateCreatedAt(rec);
   if (rec.kind === 'day') {
     const meals = normalizeDayMeals(rec.meals);
-    return meals.length >= 2 ? { id, name, kind: 'day', meals } : null;
+    if (meals.length < 2) return null;
+    const day = { id, name, kind: 'day', meals };
+    if (createdAt != null) day.createdAt = createdAt;
+    return day;
   }
-  return {
+  const template = {
     id,
     name,
     kind: 'meal',
     slot: SLOTS.includes(rec.slot) ? rec.slot : 'snack',
     items: normalizeItems(rec.items),
   };
+  if (createdAt != null) template.createdAt = createdAt;
+  return template;
 }
 
 /** 数组级整形：非数组 -> []，非法条目忽略，重复 id 只留第一条。 */
@@ -290,8 +307,32 @@ export function normalizeMealTemplates(rows) {
 }
 
 /**
- * 保存单餐套餐的纯逻辑（不碰 IDB）：name 去首尾空格，同名覆盖并保留原 id。
- * now 只在新建时用来生成 id（String(now)），测试可注入固定时间。
+ * 原地替换 list[index] 那一条单餐套餐：位置与 id 保留，原来带 createdAt 的照旧带过去。
+ * 显式重建而不是展开旧对象：被同名整日套餐覆盖时不能把 meals 键留下来。
+ */
+function replaceMealTemplate(list, index, { name, slot, items }) {
+  const prev = list[index];
+  const template = { id: prev.id, name, kind: 'meal', slot, items };
+  if (prev.createdAt != null) template.createdAt = prev.createdAt;
+  list[index] = template;
+  return { templates: list, template: { ...template } };
+}
+
+/** 新建时的时间戳 id：同一毫秒内连存两个新套餐不能互顶，顺延到下一个空位。 */
+function nextTemplateStamp(list, now) {
+  const used = new Set(list.map((t) => t.id));
+  let stamp = Math.trunc(num(now, Date.now()));
+  while (used.has(String(stamp))) stamp += 1;
+  return stamp;
+}
+
+/**
+ * 保存单餐套餐的纯逻辑（不碰 IDB）：name 去首尾空格，空名抛中文错。
+ * 三种走法：
+ *   1) 入参带 id 且命中已有套餐 -> **原地替换那一条**（保留原 id 与 createdAt，位置不变）；
+ *   2) 不带 id（或 id 不存在）但名称撞上已有套餐 -> 同名覆盖，保留原 id 与 createdAt；
+ *   3) 否则新建：id = String(now)，createdAt = 同一个时间戳。
+ * now 只在新建时用来生成 id / createdAt，测试可注入固定时间。
  */
 export function planMealTemplateSave(existing, input, now = Date.now()) {
   const list = normalizeMealTemplates(existing);
@@ -301,19 +342,16 @@ export function planMealTemplateSave(existing, input, now = Date.now()) {
   const slot = SLOTS.includes(src.slot) ? src.slot : 'snack';
   const items = normalizeItems(src.items);
 
-  const index = list.findIndex((t) => t.name === name);
-  if (index >= 0) {
-    // 显式重建而不是展开旧对象：被同名整日套餐覆盖时不能把 meals 键留下来
-    const template = { id: list[index].id, name, kind: 'meal', slot, items };
-    list[index] = template;
-    return { templates: list, template: { ...template } };
-  }
+  // 显式 id 优先：视图层的「编辑这条套餐」走的就是它，不能退化成同名覆盖（改名后就找不到旧记录了）
+  const wantId = src.id == null ? '' : String(src.id).trim();
+  const idIndex = wantId ? list.findIndex((t) => t.id === wantId) : -1;
+  if (idIndex >= 0) return replaceMealTemplate(list, idIndex, { name, slot, items });
 
-  const used = new Set(list.map((t) => t.id));
-  let stamp = Math.trunc(num(now, Date.now()));
-  // 同一毫秒内连存两个新套餐时，硬撞 id 会把前一个顶掉：顺延到下一个空位
-  while (used.has(String(stamp))) stamp += 1;
-  const template = { id: String(stamp), name, kind: 'meal', slot, items };
+  const index = list.findIndex((t) => t.name === name);
+  if (index >= 0) return replaceMealTemplate(list, index, { name, slot, items });
+
+  const stamp = nextTemplateStamp(list, now);
+  const template = { id: String(stamp), name, kind: 'meal', slot, items, createdAt: stamp };
   list.push(template);
   return { templates: list, template: { ...template } };
 }
@@ -332,15 +370,15 @@ export function planDayTemplateSave(existing, input, now = Date.now()) {
 
   const index = list.findIndex((t) => t.name === name);
   if (index >= 0) {
-    const template = { id: list[index].id, name, kind: 'day', meals };
+    const prev = list[index];
+    const template = { id: prev.id, name, kind: 'day', meals };
+    if (prev.createdAt != null) template.createdAt = prev.createdAt;
     list[index] = template;
     return { templates: list, template: { ...template } };
   }
 
-  const used = new Set(list.map((t) => t.id));
-  let stamp = Math.trunc(num(now, Date.now()));
-  while (used.has(String(stamp))) stamp += 1;
-  const template = { id: String(stamp), name, kind: 'day', meals };
+  const stamp = nextTemplateStamp(list, now);
+  const template = { id: String(stamp), name, kind: 'day', meals, createdAt: stamp };
   list.push(template);
   return { templates: list, template: { ...template } };
 }

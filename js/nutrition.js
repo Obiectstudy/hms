@@ -77,6 +77,45 @@ export function daysAgo(n = 0) {
   return shiftDays(localDateStr(new Date()), num(n));
 }
 
+// ---------- 作息偏移 → 餐次槽位 ----------
+// 窗口口径沿用 views/food.js defaultSlot()：<10 点早餐 / <15 点午餐 / <21 点晚餐 / 其余加餐，
+// 换算成「一天中的第几分钟」就是 600 / 900 / 1260 三个边界。
+
+const SLOT_DAY_MINUTES = 1440;
+const SLOT_EDGES = [
+  { until: 600, slot: 'breakfast' },
+  { until: 900, slot: 'lunch' },
+  { until: 1260, slot: 'dinner' },
+];
+
+/** 分钟 / 偏移的脏值归零：非有限、Symbol、连 Number() 都不吃的一律当 0（不抛）。 */
+function slotNumber(value) {
+  if (typeof value === 'symbol') return 0;
+  try {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 一天中的第几分钟（0..1439）→ 餐次槽位。
+ * offsetMinutes 是作息偏移（分钟，可正可负）：判定前先把当前时刻**减去**偏移，
+ * 整条窗口随之平移 —— 偏移为正 = 作息整体后移，+120 分钟时 14:00 按 12:00 判定。
+ * 越界（含跨午夜）按一天 1440 分钟循环折算；非有限入参回落到 0 分（凌晨），绝不抛异常。
+ */
+export function slotFromMinutes(minutes, offsetMinutes = 0) {
+  const shifted = Math.round(slotNumber(minutes)) - Math.round(slotNumber(offsetMinutes));
+  let m = shifted % SLOT_DAY_MINUTES;
+  if (!Number.isFinite(m)) m = 0;
+  if (m < 0) m += SLOT_DAY_MINUTES;
+  for (const edge of SLOT_EDGES) {
+    if (m < edge.until) return edge.slot;
+  }
+  return 'snack';
+}
+
 /** Mifflin-St Jeor，取整。sex 非 'female' 一律按男性公式（宁可略高不低估）。 */
 export function bmrMifflinStJeor({ sex, weightKg, heightCm, age } = {}) {
   const w = num(weightKg);

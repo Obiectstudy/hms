@@ -2,7 +2,7 @@
 import {
   el, clear, toast, openSheet, confirmDialog, emptyState, fmtKcal, fmt1, fmtDateCN, fmtTime, bar,
 } from '../js/ui.js';
-import { localDateStr, parseDateStr, round1, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
+import { localDateStr, parseDateStr, round1, slotFromMinutes, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
 import {
   getSettings, getGoals, daySummary, logMeal, updateMeal, deleteMeal, savePhoto,
   getMealTemplates, saveMealTemplate, saveDayTemplate, deleteMealTemplate, recentFoodItems,
@@ -33,12 +33,26 @@ function slotLabel(slot) {
   return hit ? hit.label : '餐次';
 }
 
-function defaultSlot() {
-  const h = new Date().getHours();
-  if (h < 10) return 'breakfast';
-  if (h < 15) return 'lunch';
-  if (h < 21) return 'dinner';
-  return 'snack';
+/**
+ * 默认餐次：按用户设置的「作息偏移」整体后移判定。
+ * 偏移为正 = 作息整体后移（新疆约 +2 小时）：10:30 的早饭不会被记成午餐。
+ * minutesOfDay 只用于测试注入；不传则取当前时刻。
+ */
+export function defaultSlot(offsetMinutes = 0, minutesOfDay) {
+  const now = new Date();
+  const m = Number.isFinite(Number(minutesOfDay)) ? Number(minutesOfDay) : now.getHours() * 60 + now.getMinutes();
+  return slotFromMinutes(m, Number.isFinite(Number(offsetMinutes)) ? Number(offsetMinutes) : 0);
+}
+
+/** 读作息偏移；设置读不到或字段缺失一律回落 0——不允许因为读设置失败而让"记饮食"中断。 */
+async function slotOffsetOf() {
+  try {
+    const s = await getSettings();
+    const v = s ? Number(s.slotOffsetMinutes) : 0;
+    return Number.isFinite(v) ? v : 0;
+  } catch (err) {
+    return 0;
+  }
 }
 
 function shiftDate(dateStr, delta) {
@@ -226,7 +240,8 @@ export function renderPortionDetail(food, options = {}) {
   const itemAt = (value) => (baseItem ? rescaleItem(baseItem, value) : scaleFood(food, value));
   const updatePreview = () => {
     const item = itemAt(grams.value);
-    preview.textContent = `${fmtKcal(item.kcal)} kcal · 碳水 ${fmt1(item.carb)}g · 蛋白质 ${fmt1(item.protein)}g · 脂肪 ${fmt1(item.fat)}g`;
+    // 纤维只在条目真有数据时追加：缺数据不显示，也不写「膳食纤维 0g」。
+    preview.textContent = `${fmtKcal(item.kcal)} kcal · 碳水 ${fmt1(item.carb)}g · 蛋白质 ${fmt1(item.protein)}g · 脂肪 ${fmt1(item.fat)}g${fiberPreviewSuffix(item)}`;
   };
   const chipRow = renderUnitChips({
     units: unitsOf(food),
@@ -346,6 +361,67 @@ export function replaceMealItem(item, food, grams) {
   if (per100g.fiber == null) delete merged.fiber;
   if (per100g.sodium == null) delete merged.sodium;
   return merged;
+}
+
+/* ---------- 膳食纤维（SPEC §7 饮食：只显示摄取量，不设每日目标） ---------- */
+
+/**
+ * 条目的纤维算不算「有数据」：null / 缺省 = 不知道，0 是「确实为 0」。
+ * 不知道就不显示 —— 把缺数据显示成「纤 0」等于替食物库撒谎；
+ * 非数字（手改过的脏库）同样算不知道，Number('abc') 之类折成 0 也是假数据。
+ */
+export function hasFiber(item) {
+  if (!item || typeof item !== 'object' || item.fiber == null) return false;
+  return Number.isFinite(Number(item.fiber));
+}
+
+/** 条目行 meta 的纤维片段：` / 纤 6.2`；没有数据返回空串（不是 ` / 纤 0`）。 */
+export function fiberMetaSuffix(item) {
+  return hasFiber(item) ? ` / 纤 ${fmt1(item.fiber)}` : '';
+}
+
+/** 营养预览的纤维片段：` · 膳食纤维 6.2g`；没有数据返回空串。 */
+export function fiberPreviewSuffix(item) {
+  return hasFiber(item) ? ` · 膳食纤维 ${fmt1(item.fiber)}g` : '';
+}
+
+/**
+ * 汇总纤维：只累加已知值，并把「有多少条缺数据」一起带出来。
+ * known = 0 时 value 是 null —— 界面据此说「暂无数据」，而不是报一个看起来像
+ * 「一点纤维都没吃」的 0。total 只数对象条目，半截写入的脏记录不算一项。
+ */
+export function fiberTotals(items) {
+  let total = 0;
+  let known = 0;
+  let sum = 0;
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== 'object') continue;
+    total += 1;
+    if (!hasFiber(item)) continue;
+    known += 1;
+    sum += Number(item.fiber);
+  }
+  return { value: known > 0 ? round1(sum) : null, known, total, missing: total - known };
+}
+
+/**
+ * 汇总处的一句话：`6.2 g（部分食物无数据）` / `6.2 g` / `暂无数据`。
+ * 这一天一条条目都没有时返回空串：整行不渲染，比写一个「暂无数据」占位干净。
+ */
+export function fiberSummaryText(totals) {
+  const t = totals || {};
+  const total = Number(t.total) || 0;
+  const known = Number(t.known) || 0;
+  if (!total) return '';
+  if (!known) return '暂无数据';
+  return `${fmt1(t.value)} g${Number(t.missing) > 0 ? '（部分食物无数据）' : ''}`;
+}
+
+/** 每餐小计（「午餐 · 620 kcal」那一行）的纤维片段：一条数据都没有就什么都不加。 */
+export function fiberSubtotalSuffix(items) {
+  const t = fiberTotals(items);
+  if (!t.known) return '';
+  return ` · 纤 ${fmt1(t.value)}${t.missing > 0 ? '（部分食物无数据）' : ''}`;
 }
 
 /* ---------- 常吃套餐（SPEC §7 饮食：一键记入 + 存为套餐） ---------- */
@@ -481,6 +557,116 @@ async function removeTemplate(template, reload) {
   }
 }
 
+/* ---------- 套餐原地编辑（改的是原套餐，不是派生一份新的） ---------- */
+
+/**
+ * 保存参数：带 id 交给数据层「原地更新原套餐」（不带 id 会按新套餐落库，等于派生一份）。
+ * 套餐名与餐次沿用原套餐：编辑界面只改条目 —— 顺手改名会变成「改了名字的另一个套餐」。
+ */
+export function templateEditPayload(template, items) {
+  const t = template && typeof template === 'object' ? template : {};
+  return {
+    id: t.id,
+    name: t.name,
+    slot: t.slot,
+    items: (Array.isArray(items) ? items : []).map((item) => ({ ...item })),
+  };
+}
+
+/** 编辑层里的一行：条目名 + 营养（含纤维）+ 删。 */
+function renderTemplateEditRow(item, onRemove) {
+  return el('div', { className: 'list__item item-row' },
+    el('div', { className: 'col item-row__main' },
+      el('div', { className: 'strong', text: itemLabel(item) }),
+      el('div', { className: 'list__item--meta', text: `${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}${fiberMetaSuffix(item)}` }),
+    ),
+    el('button', {
+      className: 'btn btn--ghost btn--sm btn--danger', text: '删',
+      attr: { 'aria-label': `从套餐里删掉 ${itemLabel(item) || '这一项'}` },
+      onClick: onRemove,
+    }),
+  );
+}
+
+/**
+ * 编辑套餐：删条目 / 加食物，保存时按 id 原地覆盖原套餐。
+ * 原地覆盖没有退路（数据层不留旧版本），所以标题、说明与保存前的二次确认三处都要说清这一点。
+ * 整日套餐（kind === 'day'）不走这里：它没有 items，保存接口也是另一套。
+ */
+async function editTemplateFlow(template, reload) {
+  // 只留能渲染的对象条目：脏记录进不了编辑层，也就不会原样写回去。
+  const items = (Array.isArray(template.items) ? template.items : [])
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => ({ ...item }));
+
+  const action = await openSheet({
+    title: `编辑套餐 · ${template.name}`,
+    actions: [],
+    content: ({ close }) => {
+      const listNode = el('div', { className: 'list' });
+      const totalNode = el('div', { className: 'muted' });
+      const repaint = () => {
+        clear(listNode);
+        items.forEach((item, index) => {
+          listNode.appendChild(renderTemplateEditRow(item, () => { items.splice(index, 1); repaint(); }));
+        });
+        totalNode.textContent = `共 ${items.length} 项 · ${fmtKcal(sumItems(items).kcal)} kcal`;
+      };
+      repaint();
+
+      const addFood = async () => {
+        const pick = await openPickFoodSheet({ title: '加进套餐' });
+        if (!pick || !pick.item) return;
+        items.push(pick.item);
+        repaint();
+      };
+
+      // 保存按钮放在内容里而不是 openSheet 的 actions 上：空套餐时要在弹层内直接拒绝，
+      // 不能一点就把弹层关掉（actions 一旦被点就 resolve 收摊，没有挽回的余地）。
+      const saveBtn = el('button', { className: 'btn btn--primary btn--block', text: '保存到原套餐' });
+      saveBtn.addEventListener('click', async () => {
+        if (!items.length) {
+          toast('套餐里至少要留一项食物，空套餐不能保存', 'error');
+          return;
+        }
+        const ok = await confirmDialog({
+          title: '更新原套餐？',
+          message: `「${template.name}」会被这 ${items.length} 项覆盖，原套餐不会另存一份。`,
+          okText: '更新',
+        });
+        if (!ok) return;
+        saveBtn.disabled = true;
+        saveBtn.textContent = '保存中…';
+        try {
+          await saveMealTemplate(templateEditPayload(template, items));
+          toast(`套餐已更新 · ${template.name}`, 'ok');
+          close('saved');
+          await reload();
+        } catch (err) {
+          toast(`保存套餐失败：${err && err.message ? err.message : err}`, 'error');
+          saveBtn.disabled = false;
+          saveBtn.textContent = '保存到原套餐';
+        }
+      });
+
+      return el('div', { className: 'col' },
+        el('div', { className: 'muted', text: '保存后原套餐会被更新（不会另存一份），先确认条目再保存。' }),
+        el('div', { className: 'divider' }),
+        listNode,
+        totalNode,
+        el('button', {
+          className: 'btn btn--ghost btn--block', text: '加食物',
+          attr: { 'aria-label': `往 ${template.name} 里加一样食物` },
+          onClick: () => { addFood().catch((err) => toast(`添加失败：${err && err.message ? err.message : err}`, 'error')); },
+        }),
+        saveBtn,
+        el('button', { className: 'btn btn--ghost btn--block', text: '取消', onClick: () => close(null) }),
+      );
+    },
+  });
+  return action;
+}
+
 /**
  * 常吃套餐横条：单餐与整日两类共用一行。
  * 一个套餐都没有时不能整块消失：当天已有 ≥2 餐的话，「把今天存为整日套餐」正是新用户
@@ -506,6 +692,14 @@ function renderTemplateCard(templates, date, reload, dayMealCount) {
         el('span', { className: 'tpl-chip__kcal', text: `${fmtKcal(templateKcal(template))} kcal` }),
         sub ? el('span', { className: 'tpl-chip__sub', text: sub }) : null,
       ),
+      // 只有单餐套餐能原地编辑：整日套餐没有 items，保存接口也是另一套。
+      isDay ? null : el('button', {
+        className: 'btn btn--ghost btn--sm',
+        type: 'button',
+        text: '编辑',
+        attr: { 'aria-label': `编辑套餐 ${template.name}` },
+        onClick: () => { editTemplateFlow(template, reload).catch((err) => toast(`编辑套餐失败：${err && err.message ? err.message : err}`, 'error')); },
+      }),
       el('button', {
         className: 'tpl-chip__del',
         type: 'button',
@@ -614,6 +808,8 @@ function totalsBlock(items) {
 // 可编辑清单：改克数、删单项、整份合并成一道菜、实时合计、选餐次、保存。
 // 返回 'saved' | 'add' | null。AI 识别与手动添加共用同一张表（只有标题/来源不同）。
 export async function openDraftSheet(initialItems, meta) {
+  // 在异步作用域先取偏移：内部的 content 回调不是 async，不能在里面 await。
+  const slotOffset = await slotOffsetOf();
   const items = initialItems.map((i) => ({ ...i }));
   // 存套餐后让调用方重画饮食页（弹层挂在 body 上，重画不会把它冲掉）。
   const notifyTemplatesChanged = async () => {
@@ -628,7 +824,7 @@ export async function openDraftSheet(initialItems, meta) {
       const slotSelect = el('select', { className: 'select' },
         SLOTS.map((s) => el('option', { value: s.value, text: s.label })),
       );
-      slotSelect.value = meta.slot || defaultSlot();
+      slotSelect.value = meta.slot || defaultSlot(slotOffset);
 
       const repaint = () => {
         clear(listNode);
@@ -654,7 +850,7 @@ export async function openDraftSheet(initialItems, meta) {
                 el('span', { className: 'strong', text: item.name }),
                 item.confidence ? confidencePill(item.confidence) : null,
               ),
-              el('div', { className: 'list__item--meta', text: `${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} · 蛋 ${fmt1(item.protein)} · 脂 ${fmt1(item.fat)}` }),
+              el('div', { className: 'list__item--meta', text: `${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} · 蛋 ${fmt1(item.protein)} · 脂 ${fmt1(item.fat)}${fiberMetaSuffix(item)}` }),
             ),
             el('div', { className: 'row item-row__edit' }, grams, el('span', { className: 'muted', text: 'g' }), del),
           ));
@@ -984,7 +1180,7 @@ async function startPhoto(file, date, reload) {
       date,
       source: 'ai',
       raw: run.value.raw,
-      slot: defaultSlot(),
+      slot: defaultSlot(await slotOffsetOf()),
       onTemplateSaved: reload,
       photo: compressed && compressed.dataUrl
         ? { blob: dataUrlToBlob(compressed.dataUrl, compressed.mime || 'image/jpeg'), mime: compressed.mime || 'image/jpeg' }
@@ -1003,12 +1199,54 @@ async function manualFlow(date, reload) {
     if (!pick || !pick.item) break;
     picked.push(pick.item);
     const action = await openDraftSheet(picked, {
-      date, source: 'manual', slot: defaultSlot(), onTemplateSaved: reload,
+      date, source: 'manual', slot: defaultSlot(await slotOffsetOf()), onTemplateSaved: reload,
     });
     if (action === 'saved') { await reload(); return; }
     if (action === 'add') continue;
     return;
   }
+}
+
+/** 条目在界面上的名字：脏记录（缺 name / 非字符串）不给 undefined，退化成空串。 */
+function itemLabel(item) {
+  return item && typeof item === 'object' && typeof item.name === 'string' ? item.name.trim() : '';
+}
+
+/** 这一项是不是这餐里最后一个能渲染的条目（后面再没有别的对象条目）。 */
+function isLastRenderableItem(items, index) {
+  return !(Array.isArray(items) ? items : []).some((it, i) => i !== index && it && typeof it === 'object');
+}
+
+/**
+ * 删条目的二次确认：列表直删与「修改」面板内删除共用这一份文案 ——
+ * 两处说同一句话，改文案只改这一个地方，不会只改到一边。
+ */
+function confirmRemoveItem(item, index, items) {
+  const name = itemLabel(item) || '这一项';
+  return confirmDialog({
+    title: '删除这一项？',
+    message: isLastRenderableItem(items, index)
+      ? `${name} · 这是这一餐的最后一项，整餐会一起删掉`
+      : `${name} · ${fmtKcal(item.grams)}g`,
+    okText: '删除',
+  });
+}
+
+/**
+ * 餐卡列表上的直删：删一条不用先打开「修改」面板。
+ * 二次确认与面板内删除同源，删除本身也走同一个 removeMealItem ——
+ * 「删最后一项连整餐一起删」的提示因此不可能出现两种说法。
+ */
+async function removeItemFromList(meal, index, reload) {
+  const items = Array.isArray(meal.items) ? meal.items : [];
+  const item = items[index];
+  // 脏记录防御：非对象条目没有可删的内容，提示一句就退（索引仍是原始数组位置）。
+  if (!item || typeof item !== 'object') {
+    toast('这一项读不出来，刷新后再试', 'error');
+    return;
+  }
+  if (!(await confirmRemoveItem(item, index, items))) return;
+  await removeMealItem(meal, index, reload);
 }
 
 // 「修改」面板：改克数（单位 chip + 克数 + 实时预览 + 目测参考）/ 替换食物 / 删除这一项。
@@ -1025,7 +1263,8 @@ async function editMealPortion(meal, index, reload) {
   const preview = el('div', { className: 'muted portion-preview' });
   const update = () => {
     const next = rescaleItem(item, grams.value);
-    preview.textContent = `${fmtKcal(next.kcal)} kcal · 碳水 ${fmt1(next.carb)}g · 蛋白质 ${fmt1(next.protein)}g · 脂肪 ${fmt1(next.fat)}g`;
+    // rescaleItem 只缩放已有的键：缺 fiber 的条目预览里也不会凭空出现纤维。
+    preview.textContent = `${fmtKcal(next.kcal)} kcal · 碳水 ${fmt1(next.carb)}g · 蛋白质 ${fmt1(next.protein)}g · 脂肪 ${fmt1(next.fat)}g${fiberPreviewSuffix(next)}`;
   };
   // 条目存的是 foodId：能对上库内食物就把它的常用单位摆出来，选中即换算克数。
   const food = foodById(item.foodId);
@@ -1065,14 +1304,8 @@ async function editMealPortion(meal, index, reload) {
     ],
   });
   if (action === 'delete') {
-    // 危险操作：先问一句。删掉最后一条能渲染的条目后这一餐就空了，连整餐一起删。
-    const lastOne = !items.some((it, i) => i !== index && it && typeof it === 'object');
-    const ok = await confirmDialog({
-      title: '删除这一项？',
-      message: lastOne ? `${item.name} · 这是这一餐的最后一项，整餐会一起删掉` : `${item.name} · ${fmtKcal(item.grams)}g`,
-      okText: '删除',
-    });
-    if (!ok) return;
+    // 危险操作：先问一句（文案与列表直删共用）。删掉最后一条能渲染的条目后这一餐就空了，连整餐一起删。
+    if (!(await confirmRemoveItem(item, index, items))) return;
     await removeMealItem(meal, index, reload);
     return;
   }
@@ -1171,12 +1404,20 @@ function renderMealCard(meal, reload) {
           el('span', { className: 'strong', text: itemName }),
           item.confidence ? confidencePill(item.confidence) : null,
         ),
-        el('div', { className: 'list__item--meta', text: `${itemGrams}g${hint ? `（${hint}）` : ''} · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}` }),
+        el('div', { className: 'list__item--meta', text: `${itemGrams}g${hint ? `（${hint}）` : ''} · ${fmtKcal(item.kcal)} kcal · 碳 ${fmt1(item.carb)} / 蛋 ${fmt1(item.protein)} / 脂 ${fmt1(item.fat)}${fiberMetaSuffix(item)}` }),
       ),
-      el('button', {
-        className: 'btn btn--ghost btn--sm', text: '修改',
-        onClick: () => editMealPortion(meal, index, reload),
-      }),
+      // 「修改」旁边给一个直删入口：删一条不该逼用户先打开整张修改面板。
+      el('div', { className: 'row item-row__edit' },
+        el('button', {
+          className: 'btn btn--ghost btn--sm', text: '修改',
+          onClick: () => editMealPortion(meal, index, reload),
+        }),
+        el('button', {
+          className: 'btn btn--ghost btn--sm btn--danger', text: '删',
+          attr: { 'aria-label': `删除 ${itemName || '这一项'}` },
+          onClick: () => removeItemFromList(meal, index, reload),
+        }),
+      ),
     ));
   });
   card.appendChild(list);
@@ -1256,12 +1497,22 @@ async function paint(root, date, reload) {
     for (const slot of SLOTS) {
       const group = meals.filter((m) => m.slot === slot.value);
       if (!group.length) continue;
-      root.appendChild(el('div', { className: 'h2', text: `${slot.label} · ${group.reduce((s, m) => s + sumItems(m.items || []).kcal, 0)} kcal` }));
+      const slotItems = [];
+      for (const groupMeal of group) {
+        for (const item of (Array.isArray(groupMeal.items) ? groupMeal.items : [])) slotItems.push(item);
+      }
+      root.appendChild(el('div', { className: 'h2', text: `${slot.label} · ${group.reduce((s, m) => s + sumItems(m.items || []).kcal, 0)} kcal${fiberSubtotalSuffix(slotItems)}` }));
       for (const meal of group) root.appendChild(renderMealCard(meal, reload));
     }
   }
 
   const intake = summary.intake || { kcal: 0, carb: 0, protein: 0, fat: 0 };
+  // 当日纤维：只累加有数据的条目，缺数据的条数一并带出来给用户一句实话。
+  const dayItems = [];
+  for (const dayMeal of meals) {
+    for (const item of (Array.isArray(dayMeal.items) ? dayMeal.items : [])) dayItems.push(item);
+  }
+  const fiberText = fiberSummaryText(fiberTotals(dayItems));
   root.appendChild(el('div', { className: 'card col' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
       el('div', { className: 'card__title', text: '当日合计' }),
@@ -1278,6 +1529,9 @@ async function paint(root, date, reload) {
       el('div', { className: 'col align-end' },
         el('div', { className: 'label', text: '碳水 / 蛋白质 / 脂肪' }),
         el('div', { className: 'strong', text: `${fmt1(intake.carb)} / ${fmt1(intake.protein)} / ${fmt1(intake.fat)} g` }),
+        // 用户决策：纤维只报摄取量，不给每日目标 —— 所以这里没有进度条。
+        fiberText ? el('div', { className: 'label', text: '膳食纤维' }) : null,
+        fiberText ? el('div', { className: 'strong', text: fiberText }) : null,
       ),
     ),
     bar({ value: intake.kcal, max: Math.max(1, Number(goals.calorieTarget) || 1), color: 'var(--brand)' }),

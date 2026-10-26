@@ -16,6 +16,31 @@ const ACTIVITIES = [
   { value: 'very_active', label: '高强度（体力工作/训练）' },
 ];
 
+/**
+ * 作息偏移档位（分钟）：整数分钟，全部落在 store 的 clamp 区间 -180..240 内。
+ * 用下拉而不是数字输入：档位有限（早/正常/新疆作息），用户不需要填分钟数，
+ * 也就没有「填了 37 这种数」的校验分支与非法态。
+ */
+export const SLOT_OFFSET_OPTIONS = [
+  { value: 0, label: '不偏移（默认）' },
+  { value: 60, label: '+1 小时' },
+  { value: 90, label: '+1.5 小时' },
+  { value: 120, label: '+2 小时（新疆常见）' },
+  { value: 150, label: '+2.5 小时' },
+  { value: 180, label: '+3 小时' },
+  { value: -60, label: '-1 小时（作息偏早）' },
+];
+
+export const SLOT_OFFSET_HINT = '按你的用餐时间整体后移：选 +2 小时，14:00 的午饭按 12:00 判定（记为午餐），21:30 的晚饭也还算晚餐。只影响「现在该记哪一餐」的默认选择，不改任何已有记录的日期。';
+
+/** 分钟 -> 「+2 小时 / -1 小时 / 不偏移」，给不在档位里的历史值兜底显示。 */
+function slotOffsetLabel(minutes) {
+  const m = Number(minutes) || 0;
+  if (!m) return '不偏移';
+  const hours = Math.round((m / 60) * 10) / 10;
+  return `${hours > 0 ? '+' : ''}${hours} 小时`;
+}
+
 const go = (hash) => window.HMS.navigate(hash);
 
 function inputBox(props = {}) {
@@ -226,6 +251,38 @@ export async function render(root) {
     el('div', { className: 'grid-2' }, labeled('饮水目标 (ml)', waterMl), labeled('目标体重 (kg)', goalWeightTarget)),
     estimateBtn,
     goalsSave,
+  ));
+
+  // ---- 作息偏移（紧挨「每日目标」：同属「按什么标准记账」，但不归 goals 管） ----
+  const offsetOptions = SLOT_OFFSET_OPTIONS.slice();
+  const savedOffset = Number(currentSettings.slotOffsetMinutes) || 0;
+  // 手改 / 历史数据里的非档位值也要显示得出来，否则下拉框会静默跳回「不偏移」
+  if (savedOffset && !offsetOptions.some((o) => o.value === savedOffset)) {
+    offsetOptions.unshift({ value: savedOffset, label: `${slotOffsetLabel(savedOffset)}（当前）` });
+  }
+  const slotOffset = selectBox(offsetOptions, savedOffset);
+
+  const slotOffsetSave = el('button', { className: 'btn btn--primary btn--block', text: '保存作息偏移' });
+  slotOffsetSave.addEventListener('click', async () => {
+    slotOffsetSave.disabled = true;
+    try {
+      await saveSettings({ slotOffsetMinutes: Number(slotOffset.value) });
+      toast('作息偏移已保存', 'ok');
+      await window.HMS.refresh();
+    } catch (err) {
+      toast(`保存失败：${err && err.message ? err.message : err}`, 'error');
+      slotOffsetSave.disabled = false;
+    }
+  });
+
+  root.appendChild(el('div', { className: 'card col' },
+    el('div', { className: 'card__head', style: { marginBottom: '0' } },
+      el('div', { className: 'card__title', text: '作息偏移' }),
+      el('div', { className: 'muted', text: '影响「现在算哪一餐」的默认选择' }),
+    ),
+    labeled('作息偏移', slotOffset),
+    el('div', { className: 'muted', text: SLOT_OFFSET_HINT }),
+    slotOffsetSave,
   ));
 
   // ---- 视觉识别 ----

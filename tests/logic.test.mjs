@@ -215,6 +215,107 @@ function testMetabolism() {
   });
 }
 
+// ---------- nutrition: 作息偏移 → 餐次槽位 ----------
+// 原口径在 views/food.js defaultSlot()：<10 点早餐 / <15 点午餐 / <21 点晚餐 / 其余加餐。
+// slotFromMinutes 把同一条窗口搬到「一天中的第几分钟」，并整条窗口按 offsetMinutes 平移：
+// effective = minutes - offsetMinutes（offset 为正 = 作息整体后移），越界按 1440 分钟循环折算。
+
+const SLOT_VALUES = ['breakfast', 'lunch', 'dinner', 'snack'];
+
+function testSlotFromMinutes() {
+  const s = nutrition.slotFromMinutes;
+
+  check('slotFromMinutes 无偏移时与既有的整点窗口口径一致', () => {
+    eq(typeof s, 'function', 'slotFromMinutes 必须从 nutrition.js 导出');
+    eq(s(0, 0), 'breakfast');
+    eq(s(9 * 60 + 59, 0), 'breakfast', '9:59 仍应是早餐');
+    eq(s(12 * 60, 0), 'lunch');
+    eq(s(14 * 60 + 59, 0), 'lunch');
+    eq(s(18 * 60, 0), 'dinner');
+    eq(s(23 * 60 + 59, 0), 'snack');
+    eq(s(12 * 60), 'lunch', 'offsetMinutes 缺省应为 0');
+  });
+
+  check('slotFromMinutes 三个窗口边界前后各 1 分钟都落在正确一侧', () => {
+    for (const [edge, before, after] of [
+      [10 * 60, 'breakfast', 'lunch'],
+      [15 * 60, 'lunch', 'dinner'],
+      [21 * 60, 'dinner', 'snack'],
+    ]) {
+      eq(s(edge - 1, 0), before, `${edge - 1} 分应是 ${before}`);
+      eq(s(edge, 0), after, `${edge} 分应是 ${after}`);
+      eq(s(edge + 1, 0), after, `${edge + 1} 分应是 ${after}`);
+      ok(SLOT_VALUES.includes(s(edge, 0)), '返回值必须落在四个槽位里');
+    }
+  });
+
+  check('slotFromMinutes 正偏移整体后移：14:00 + 2 小时等于 12:00 无偏移（新疆作息核心语义）', () => {
+    eq(s(14 * 60, 120), s(12 * 60, 0), '偏移 120 分钟的 14:00 必须与无偏移的 12:00 同槽');
+    eq(s(14 * 60, 120), 'lunch');
+    eq(s(21 * 60 + 30, 120), 'dinner', '21:30 的晚饭在 +2 小时后仍算晚餐');
+    eq(s(23 * 60, 120), 'snack');
+    // 窗口整体后移 120 分钟：早餐结束于 12:00、午餐结束于 17:00、晚餐结束于 23:00
+    eq(s(12 * 60 - 1, 120), 'breakfast');
+    eq(s(12 * 60, 120), 'lunch');
+    eq(s(17 * 60 - 1, 120), 'lunch');
+    eq(s(17 * 60, 120), 'dinner');
+    eq(s(23 * 60 - 1, 120), 'dinner');
+    eq(s(23 * 60, 120), 'snack');
+  });
+
+  check('slotFromMinutes 负偏移整体前移（窗口一起提前）', () => {
+    eq(s(9 * 60, -60), 'lunch', '9:00 加回 1 小时 = 10:00 → 午餐');
+    eq(s(9 * 60 - 1, -60), 'breakfast');
+    eq(s(14 * 60, -60), 'dinner', '14:00 加回 1 小时 = 15:00 → 晚餐');
+    eq(s(20 * 60, -60), 'snack');
+    eq(s(10 * 60, -60), s(11 * 60, 0), '负偏移必须与「等价的无偏移时刻」同槽');
+  });
+
+  check('slotFromMinutes 跨午夜回绕（深夜与凌晨两端）', () => {
+    eq(s(0, 120), 'snack', '0 点减 2 小时回绕到 22:00 → 加餐');
+    eq(s(60, 180), 'snack', '1 点减 3 小时回绕到 22:00 → 加餐');
+    eq(s(23 * 60 + 59, -120), 'breakfast', '23:59 加 2 小时回绕到 1:59 → 早餐');
+    eq(s(30, -60), 'breakfast');
+    eq(s(2 * 60, -120), 'breakfast');
+    eq(s(1439, 1439), 'breakfast', '偏移把时刻扯回 0 分');
+    eq(s(12 * 60, 24 * 60), s(12 * 60, 0), '整圈偏移等价于不偏移');
+  });
+
+  check('slotFromMinutes 非法入参不抛异常，回落到四槽之一', () => {
+    const junk = [NaN, Infinity, -Infinity, '', 'abc', '12:30', null, undefined, true, false, [], {}, [1, 2], Symbol.iterator];
+    for (const bad of junk) {
+      let slot = '';
+      try {
+        slot = s(bad, 0);
+      } catch (err) {
+        eq('抛异常', `非法分钟 ${String(bad)} 不该抛：${err && err.message}`);
+      }
+      ok(SLOT_VALUES.includes(slot), `非法分钟 ${String(bad)} 应回落到四个槽位之一，实得 ${slot}`);
+    }
+    eq(s(NaN, 0), 'breakfast', '非有限分钟按 0 分（凌晨）处理');
+    eq(s('abc', 0), 'breakfast');
+    eq(s(14 * 60, NaN), 'lunch', '非法偏移按 0 处理');
+    eq(s(14 * 60, Infinity), s(14 * 60, 0));
+    eq(s(14 * 60, Symbol.iterator), s(14 * 60, 0));
+    eq(s('840', '120'), s(840, 120), '字符串数字要按数字参与换算');
+    eq(s(14 * 60, '120'), 'lunch');
+  });
+
+  check('slotFromMinutes 越界分钟按一天循环折算，小数分钟取整后再判定', () => {
+    eq(s(1440, 0), s(0, 0), '24:00 回绕到 0:00');
+    eq(s(1440, 0), 'breakfast');
+    eq(s(-1, 0), 'snack', '-1 分回绕到 23:59');
+    eq(s(5000, 0), s(5000 % 1440, 0));
+    eq(s(5000, 0), 'lunch');
+    eq(s(840.4, 0), 'lunch', '小数分钟四舍五入后再判定');
+    eq(s(599.4, 0), 'breakfast');
+    eq(s(599.6, 0), 'lunch');
+    for (const v of [0, 1, 599, 600, 899, 900, 1259, 1260, 1439, -100, 99999, 0.4]) {
+      ok(SLOT_VALUES.includes(s(v, 0)), `${v} 分钟必须给出四槽之一`);
+    }
+  });
+}
+
 // ---------- nutrition: 食物与聚合 ----------
 
 function testFoodMath() {
@@ -978,6 +1079,129 @@ function testMealTemplatePure() {
     eq(asMeal.template.kind, 'meal');
     eq('meals' in asMeal.template, false);
   });
+
+  check('planMealTemplateSave 带 id 原地更新：条数不变、位置不变、id 与 createdAt 保留', () => {
+    const existing = [
+      { id: 'a', name: '早餐', slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }], createdAt: 111 },
+      { id: 'b', name: '午餐', slot: 'lunch', items: [], createdAt: 222 },
+      { id: 'c', name: '加餐', slot: 'snack', items: [], createdAt: 333 },
+    ];
+    const out = pure.planMealTemplateSave(existing, {
+      id: 'b',
+      name: '午餐改',
+      slot: 'dinner',
+      items: [{ name: '面条', grams: 200, kcal: 280 }],
+    }, 999);
+
+    eq(out.templates.length, 3, '原地更新不该改变条数');
+    deep(out.templates.map((t) => t.id), ['a', 'b', 'c'], '原地更新不该改变顺序');
+    eq(out.templates[1].name, '午餐改');
+    eq(out.templates[1].slot, 'dinner');
+    eq(out.templates[1].items.length, 1);
+    eq(out.templates[1].items[0].name, '面条');
+    eq(out.templates[1].id, 'b', '原地更新必须保留原 id');
+    eq(out.templates[1].createdAt, 222, '原地更新必须保留原 createdAt');
+    eq(out.templates[1].kind, 'meal');
+    eq('meals' in out.templates[1], false);
+    eq(out.templates[0].createdAt, 111, '相邻套餐不受影响');
+    eq(out.templates[0].slot, 'breakfast');
+    eq(out.template.id, 'b');
+    eq(out.template.createdAt, 222);
+    deep(out.template, out.templates[1], '返回的 template 应与落库那一条一致');
+
+    // 数字 id 与字符串 id 是同一条：两边都 String(id).trim() 后比对
+    const numericStored = pure.planMealTemplateSave(
+      [{ id: 111, name: '早餐', slot: 'breakfast', items: [], createdAt: 111 }],
+      { id: '111', name: '早餐改', slot: 'lunch', items: [] },
+      999,
+    );
+    eq(numericStored.templates.length, 1, '数字 id 存、字符串 id 传，应命中同一条');
+    eq(numericStored.template.id, '111');
+    eq(numericStored.templates[0].createdAt, 111, '命中同一条时 createdAt 同样保留');
+
+    const stringStored = pure.planMealTemplateSave(
+      [{ id: '900', name: '甲', slot: 'lunch', items: [], createdAt: 900 }],
+      { id: 900, name: '甲改', slot: 'dinner', items: [] },
+      999,
+    );
+    eq(stringStored.templates.length, 1, '字符串 id 存、数字 id 传，同样命中');
+    eq(stringStored.template.id, '900');
+    eq(stringStored.template.createdAt, 900);
+    eq(stringStored.template.slot, 'dinner');
+
+    // 原地更新时非法 slot 依旧回退 snack、非法 items 归一成空数组
+    const dirty = pure.planMealTemplateSave(existing, { id: 'c', name: '加餐改', slot: 'brunch', items: 'oops' }, 999);
+    eq(dirty.templates.length, 3);
+    eq(dirty.template.slot, 'snack');
+    deep(dirty.template.items, []);
+
+    // 空白 id 视同没有 id：不能把 '' 当成一个真 id 去命中空 id 记录
+    const blankId = pure.planMealTemplateSave([
+      { id: 'x', name: '有名字' },
+    ], { id: '   ', name: '空白 id', slot: 'lunch', items: [] }, 777);
+    eq(blankId.templates.length, 2);
+    eq(blankId.templates[0].id, 'x');
+    eq(blankId.template.id, '777', '空白 id 应走新建路径');
+  });
+
+  check('planMealTemplateSave 无 id / id 不存在时仍创建新套餐（向后兼容）', () => {
+    const existing = [{ id: 'a', name: '早餐', slot: 'breakfast', items: [], createdAt: 111 }];
+
+    const byName = pure.planMealTemplateSave(existing, { name: '早餐', slot: 'lunch', items: [{ name: '牛奶', kcal: 140 }] }, 2000);
+    eq(byName.templates.length, 1, '无 id 时同名覆盖语义不变');
+    eq(byName.template.id, 'a', '同名覆盖仍保留原 id');
+    eq(byName.template.createdAt, 111, '同名覆盖也保留原 createdAt');
+
+    const missingId = pure.planMealTemplateSave(existing, { id: '不存在', name: '新套餐', slot: 'x', items: [] }, 2000);
+    eq(missingId.templates.length, 2, 'id 不存在 → 新建');
+    eq(missingId.template.id, '2000', '新建沿用时间戳 id 语义');
+    eq(missingId.template.slot, 'snack');
+    eq(missingId.templates[0].name, '早餐', '新建不该动到既有套餐');
+
+    const noId = pure.planMealTemplateSave(existing, { name: '又一个', slot: 'lunch', items: [] }, 3000);
+    eq(noId.templates.length, 2);
+    eq(noId.template.name, '又一个');
+    eq(noId.template.createdAt, 3000, '新建套餐要带 createdAt 时间戳');
+    ok(Number.isFinite(noId.template.createdAt), 'createdAt 必须是有限数，不能是 NaN');
+
+    // 既有断言的口径不能被动到：空名照旧抛中文错，id 命中也不能例外
+    for (const input of [{ id: 'a', name: '   ' }, { id: '不存在', name: '' }, { id: 'a' }]) {
+      let msg = '';
+      try {
+        pure.planMealTemplateSave(existing, input, 4000);
+      } catch (err) {
+        msg = err.message;
+      }
+      eq(msg, '套餐名称不能为空');
+    }
+  });
+
+  check('normalizeMealTemplate 保留已有 createdAt，旧记录缺键时不凭空编造', () => {
+    const withStamp = pure.normalizeMealTemplate({ id: 't', name: '套餐', slot: 'lunch', items: [], createdAt: 1700000000000 });
+    eq(withStamp.createdAt, 1700000000000);
+    eq(withStamp.kind, 'meal');
+
+    const noStamp = pure.normalizeMealTemplate({ id: 't', name: '套餐', slot: 'lunch', items: [] });
+    eq('createdAt' in noStamp, false, '旧记录没有 createdAt 时不该被编造一个');
+
+    const dirty = pure.normalizeMealTemplate({ id: 't', name: '套餐', createdAt: 'abc' });
+    eq('createdAt' in dirty, false, '非法 createdAt 直接丢弃');
+    const nullish = pure.normalizeMealTemplate({ id: 't', name: '套餐', createdAt: null });
+    eq('createdAt' in nullish, false);
+
+    const day = pure.normalizeMealTemplate({
+      id: 'd',
+      name: '整日',
+      kind: 'day',
+      createdAt: 5,
+      meals: [
+        { slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] },
+        { slot: 'dinner', items: [{ name: '青菜', kcal: 30 }] },
+      ],
+    });
+    eq(day.createdAt, 5, '整日套餐同样保留 createdAt');
+    eq(day.kind, 'day');
+  });
 }
 
 function testRecentFoodItemsPure() {
@@ -1130,6 +1354,87 @@ function testAggregate() {
     ok(csv.includes('2026-10-01,lunch,'), '饮食明细应逐条目成行');
     ok(csv.includes('\r\n'), '应使用 CRLF');
     ok(pure.buildCSV({}).includes('# 饮水'), '空数据也应输出表头');
+  });
+
+  check('纤维聚合：部分条目缺 fiber 时仍是已知值之和（不因缺字段变 NaN）', () => {
+    const items = [
+      { name: '西兰花', grams: 200, kcal: 68, fiber: 5.2 },
+      { name: '米饭', grams: 150, kcal: 174 },
+      { name: '鸡蛋', grams: 60, kcal: 90, fiber: 0 },
+      { name: '牛奶', grams: 250, kcal: 140, fiber: '1.5' },
+    ];
+    const sum = nutrition.sumItems(items);
+    eq(sum.fiber, 6.7, '缺 fiber 的条目按 0 计，已知值照常相加');
+    for (const key of ['kcal', 'carb', 'protein', 'fat', 'fiber', 'sodium']) {
+      eq(Number.isFinite(sum[key]), true, `${key} 必须是有限数`);
+    }
+    eq(nutrition.sumItems([]).fiber, 0);
+    eq(nutrition.sumItems(null).fiber, 0);
+    eq(nutrition.sumItems([{ fiber: 1e308 }, { fiber: 1e308 }]).fiber, 0, '溢出仍旧归 0，不吐 Infinity');
+  });
+
+  check('纤维聚合：脏 fiber（null/空串/NaN/对象/字符串）一律按 0，脏条目跳过', () => {
+    const sum = nutrition.sumItems([
+      { fiber: 2.5 },
+      { fiber: null },
+      { fiber: '' },
+      { fiber: NaN },
+      { fiber: {} },
+      { fiber: 'abc' },
+      { fiber: Infinity },
+      null,
+      'oops',
+      3,
+    ]);
+    eq(sum.fiber, 2.5);
+    eq(typeof sum.fiber, 'number');
+    eq(sum.fiber, sum.fiber, 'fiber 不许是 NaN（NaN !== NaN）');
+    eq(Number.isFinite(nutrition.sumItems(this).fiber), true, '入参是 this 这类怪值也不许吐 NaN');
+  });
+
+  check('纤维日汇总：aggregateMeals / buildDaySummary 在缺 fiber 时给出有限值', () => {
+    const meals = [
+      { date: '2026-10-01', slot: 'breakfast', createdAt: 1, items: [{ name: '燕麦', kcal: 300, fiber: 6 }] },
+      {
+        date: '2026-10-01',
+        slot: 'lunch',
+        createdAt: 2,
+        items: [{ name: '米饭', kcal: 232 }, { name: '西兰花', kcal: 34, fiber: 3.3 }],
+      },
+    ];
+    eq(pure.aggregateMeals(meals).fiber, 9.3);
+    const day = pure.buildDaySummary({ date: '2026-10-01', meals });
+    eq(day.intake.fiber, 9.3);
+    for (const key of Object.keys(day.intake)) {
+      eq(Number.isFinite(day.intake[key]), true, `日汇总 ${key} 不该是 NaN`);
+    }
+
+    // 归一化会丢掉缺失的 fiber 键：聚合必须在「键不存在」的记录上照样成立
+    const normalized = meals.map((m) => pure.normalizeMealRecord(m));
+    eq('fiber' in normalized[1].items[0], false, '缺 fiber 的条目不该落一个假键');
+    eq(nutrition.sumItems(normalized.flatMap((m) => m.items)).fiber, 9.3);
+    eq(pure.buildDaySummary({ date: '2026-10-01', meals: normalized }).intake.fiber, 9.3);
+    eq(pure.aggregateMeals([{ items: [{ name: '白水', kcal: 0 }] }]).fiber, 0, '一条 fiber 都没有时是 0 而不是 NaN');
+  });
+
+  check('纤维导出：明细 CSV 缺 fiber 的条目留空，不写 NaN / undefined', () => {
+    const csv = pure.buildCSV({
+      meals: [{
+        date: '2026-10-01',
+        slot: 'lunch',
+        items: [
+          { name: '米饭', grams: 150, kcal: 174 },
+          { name: '西兰花', grams: 200, kcal: 68, fiber: 5.2 },
+        ],
+      }],
+    });
+    ok(!csv.includes('NaN'), 'CSV 不许出现 NaN 字面量');
+    ok(!csv.includes('undefined'), 'CSV 不许出现 undefined 字面量');
+    const rows = csv.split('\r\n');
+    const missing = rows.find((r) => r.startsWith('2026-10-01,lunch,米饭,'));
+    const known = rows.find((r) => r.startsWith('2026-10-01,lunch,西兰花,'));
+    eq(missing.split(',')[8], '', '缺 fiber 的条目：fiber 列留空');
+    eq(known.split(',')[8], '5.2', '有 fiber 的条目：fiber 列照常写出');
   });
 }
 
@@ -1895,6 +2200,231 @@ async function testStoreMealTemplates() {
       msg = err.message;
     }
     eq(msg, IDB_MSG);
+  });
+}
+
+// ---------- store: 作息偏移（settings.slotOffsetMinutes） ----------
+
+async function testStoreSlotOffset() {
+  await checkAsync('store: slotOffsetMinutes 缺省 0，越界一律 clamp 到 -180..240', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      eq((await store.getSettings()).slotOffsetMinutes, 0, '一次都没保存过时必须是 0');
+
+      await db.setMeta('settings', { apiKey: 'k', model: 'm', weightUnit: 'kg' });
+      eq((await store.getSettings()).slotOffsetMinutes, 0, '旧数据没有这个键 -> 0');
+
+      for (const [raw, want] of [
+        [0, 0], [240, 240], [241, 240], [999, 240], [999999999, 240],
+        [-180, -180], [-181, -180], [-999, -180],
+      ]) {
+        await db.setMeta('settings', { slotOffsetMinutes: raw });
+        eq((await store.getSettings()).slotOffsetMinutes, want, `${raw} 应 clamp 成 ${want}`);
+      }
+    });
+  });
+
+  await checkAsync('store: slotOffsetMinutes 脏值（缺省/空串/数组/NaN/1e999）归一后绝不出现 NaN', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const cases = [
+        [undefined, 0], [null, 0], ['', 0], ['   ', 0], [[], 0], [NaN, 0], ['abc', 0], ['24:00', 0],
+        [{}, 0], [false, 0],
+        [120, 120], ['120', 120], ['-60', -60], [119.6, 120], [150.4, 150],
+        [1e999, 240], [-1e999, -180], [Infinity, 240], [-Infinity, -180],
+      ];
+      for (const [raw, want] of cases) {
+        await db.setMeta('settings', { slotOffsetMinutes: raw });
+        const got = (await store.getSettings()).slotOffsetMinutes;
+        eq(got, want, `slotOffsetMinutes=${String(raw)} 应归一为 ${want}，实得 ${got}`);
+        eq(Number.isNaN(got), false, `slotOffsetMinutes=${String(raw)} 不该是 NaN`);
+        eq(Number.isInteger(got), true, '必须是整数分钟');
+        ok(got >= -180 && got <= 240, `${got} 超出了 -180..240`);
+      }
+
+      // 缺键与显式 undefined 都必须得到 0，且 getSettings 的其它键照旧
+      await db.setMeta('settings', { apiKey: 'k', model: 'm', baseUrl: 'u', weightUnit: 'jin' });
+      const s = await store.getSettings();
+      eq(s.slotOffsetMinutes, 0);
+      eq(s.weightUnit, 'jin');
+      eq(s.model, 'm');
+    });
+  });
+
+  await checkAsync('store: saveSettings 部分更新——只改偏移不冲掉别的键，脏值落库前归一', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.saveSettings({ apiKey: 'k1', model: 'm1' });
+      eq((await store.getSettings()).slotOffsetMinutes, 0);
+
+      await store.saveSettings({ slotOffsetMinutes: 150 });
+      let s = await store.getSettings();
+      eq(s.slotOffsetMinutes, 150);
+      eq(s.apiKey, 'k1', '改偏移不能冲掉 apiKey');
+      eq(s.model, 'm1', '改偏移不能冲掉 model');
+
+      await store.saveSettings({ apiKey: 'k2' });
+      s = await store.getSettings();
+      eq(s.slotOffsetMinutes, 150, '只改 apiKey 不能冲掉偏移');
+      eq(s.apiKey, 'k2');
+
+      await store.saveSettings({ weightUnit: 'jin' });
+      eq((await store.getSettings()).slotOffsetMinutes, 150, '只切单位不能冲掉偏移');
+
+      await store.saveSettings({ slotOffsetMinutes: '999' });
+      eq((await store.getSettings()).slotOffsetMinutes, 240, '越界字符串要 clamp');
+      await store.saveSettings({ slotOffsetMinutes: 'abc' });
+      eq((await store.getSettings()).slotOffsetMinutes, 0, '脏值按缺省 0 处理');
+      await store.saveSettings({ slotOffsetMinutes: -60 });
+      eq((await store.getSettings()).slotOffsetMinutes, -60);
+
+      const stored = await db.getMeta('settings', null);
+      eq(stored.slotOffsetMinutes, -60, '落库的就是归一后的整数');
+      eq(Number.isNaN(stored.slotOffsetMinutes), false);
+
+      // 显式选「不偏移」也要落库成 0：视图层读回来必须是 0 而不是 undefined
+      await store.saveSettings({ slotOffsetMinutes: 0 });
+      eq((await db.getMeta('settings', null)).slotOffsetMinutes, 0, '显式 0 要落库');
+      eq((await store.getSettings()).slotOffsetMinutes, 0);
+      // 只改 apiKey 的调用不该凭空长出一个键：旧数据形状保持不变（读出来仍是 0）
+      await store.saveSettings({ apiKey: 'k3' });
+      eq('slotOffsetMinutes' in (await db.getMeta('settings', null)), false, '没传且没存过时不落键');
+      eq((await store.getSettings()).slotOffsetMinutes, 0, '缺键读出来仍是 0');
+    });
+  });
+
+  await checkAsync('store: 归一化后的偏移可直接喂给 slotFromMinutes（两处口径同一套）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      for (const raw of [undefined, '', 'abc', 1e999, -1e999, 999, -999, 120, -60]) {
+        await db.setMeta('settings', { slotOffsetMinutes: raw });
+        const off = (await store.getSettings()).slotOffsetMinutes;
+        const slot = nutrition.slotFromMinutes(14 * 60, off);
+        ok(SLOT_VALUES.includes(slot), `偏移 ${off} 必须仍是 slotFromMinutes 能用的整数分钟`);
+      }
+      await db.setMeta('settings', { slotOffsetMinutes: 120 });
+      const off = (await store.getSettings()).slotOffsetMinutes;
+      eq(nutrition.slotFromMinutes(14 * 60, off), nutrition.slotFromMinutes(12 * 60, 0), '设置页存的 +2 小时要能直接驱动餐次判定');
+    });
+  });
+}
+
+// ---------- store: 套餐原地编辑（saveMealTemplate 透传 id） ----------
+
+async function testMealTemplateInPlaceStore() {
+  await checkAsync('store: saveMealTemplate 透传 id → 原地更新（条数不变、id/createdAt 保留）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      deep(await store.getMealTemplates(), []);
+
+      const t1 = await store.saveMealTemplate({
+        name: '套餐甲',
+        slot: 'breakfast',
+        items: [{ name: '鸡蛋', grams: 60, kcal: 90 }],
+      });
+      const t2 = await store.saveMealTemplate({
+        name: '套餐乙',
+        slot: 'lunch',
+        items: [{ name: '米饭', grams: 150, kcal: 174 }],
+      });
+      eq((await store.getMealTemplates()).length, 2);
+      ok(Number.isFinite(t1.createdAt), '新建套餐应带 createdAt');
+
+      const before = await store.getMealTemplates();
+      const updated = await store.saveMealTemplate({
+        id: t1.id,
+        name: '套餐甲改',
+        slot: 'dinner',
+        items: [{ name: '面条', grams: 200, kcal: 280 }],
+      });
+      const after = await store.getMealTemplates();
+
+      eq(after.length, 2, '原地更新不该新增条数');
+      eq(updated.id, t1.id, '返回的 id 必须是原 id');
+      eq(updated.createdAt, t1.createdAt, '原地更新必须保留 createdAt');
+      eq(updated.name, '套餐甲改');
+      eq(updated.slot, 'dinner');
+      eq(updated.items[0].name, '面条');
+      eq(after[0].id, before[0].id, '位置不变');
+      eq(after[0].createdAt, before[0].createdAt);
+      eq(after[0].name, '套餐甲改');
+      eq(after[1].id, t2.id, '其它套餐不受影响');
+      eq(after[1].name, '套餐乙');
+      deep(after.find((t) => t.id === t1.id), updated, '落库读回应与返回值一致');
+    });
+  });
+
+  await checkAsync('store: saveMealTemplate 的 id 不存在时新建，同样 id 不会顶掉别人', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const t1 = await store.saveMealTemplate({ name: '套餐甲', slot: 'breakfast', items: [] });
+      const t2 = await store.saveMealTemplate({ name: '套餐乙', slot: 'lunch', items: [] });
+
+      const fresh = await store.saveMealTemplate({ id: '早就删掉的 id', name: '套餐丙', slot: 'snack', items: [] });
+      const after = await store.getMealTemplates();
+      eq(after.length, 3, 'id 不存在 → 新建');
+      ok(after.some((t) => t.id === t1.id) && after.some((t) => t.id === t2.id), '既有套餐不能被顶掉');
+      ok(fresh.id !== '早就删掉的 id', '不存在的 id 不该被当成真 id 写进去');
+
+      // 删除后带同一个 id 再存：也走新建，且不能撞上别人的 id
+      await store.deleteMealTemplate(t1.id);
+      const recreated = await store.saveMealTemplate({ id: t1.id, name: '套餐甲改', slot: 'dinner', items: [] });
+      const finalList = await store.getMealTemplates();
+      eq(finalList.length, 3);
+      eq(new Set(finalList.map((t) => t.id)).size, 3, 'id 必须唯一');
+      eq(finalList.find((t) => t.name === '套餐甲改').id, recreated.id);
+
+      for (const t of await store.getMealTemplates()) await store.deleteMealTemplate(t.id);
+      deep(await store.getMealTemplates(), []);
+    });
+  });
+
+  await checkAsync('store: 整日套餐同名覆盖保留 createdAt，与单餐套餐共用一套 id/name 空间', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const day = await store.saveDayTemplate({
+        name: '整日三餐',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }] },
+          { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+        ],
+      });
+      ok(Number.isFinite(day.createdAt), '整日套餐同样要带 createdAt');
+
+      const over = await store.saveDayTemplate({
+        name: '整日三餐',
+        meals: [
+          { slot: 'lunch', items: [{ name: '鸡胸肉', grams: 100, kcal: 133 }] },
+          { slot: 'dinner', items: [{ name: '青菜', grams: 200, kcal: 30 }] },
+        ],
+      });
+      eq(over.id, day.id, '同名覆盖保留 id');
+      eq(over.createdAt, day.createdAt, '同名覆盖保留 createdAt');
+      eq((await store.getMealTemplates()).length, 1);
+    });
+  });
+}
+
+// ---------- 设置页：作息偏移控件的取值契约 ----------
+
+async function testSlotOffsetUiContract() {
+  await checkAsync('设置页作息偏移控件：档位都是 -180..240 的整数分钟且含「不偏移」', async () => {
+    const settingsView = await import('../views/settings.js');
+    const opts = settingsView.SLOT_OFFSET_OPTIONS;
+    ok(Array.isArray(opts) && opts.length >= 5, '作息偏移应有多个可选档位');
+    const values = opts.map((o) => o.value);
+    ok(values.includes(0), '必须有不偏移（0）这一档');
+    ok(values.includes(120), '+2 小时（新疆常用）档必须在');
+    ok(values.includes(-60), '至少要有一档负偏移');
+    deep(values, [...new Set(values)], '档位不能重复');
+    for (const o of opts) {
+      eq(Number.isInteger(o.value), true, `档位 ${o.value} 必须是整数分钟`);
+      eq(o.value >= -180 && o.value <= 240, true, `档位 ${o.value} 超出了 store 的 clamp 范围`);
+      eq(typeof o.label, 'string', '每档都要有文案');
+      ok(o.label.length > 0, '档位文案不能是空串');
+    }
+    eq(typeof settingsView.SLOT_OFFSET_HINT, 'string', '说明文案要能取到');
+    ok(settingsView.SLOT_OFFSET_HINT.includes('小时'), '说明文案要按「小时」讲人话');
   });
 }
 
@@ -4251,6 +4781,7 @@ async function testFuzzDataRegressions() {
 
 export async function run() {
   testDates();
+  testSlotFromMinutes();
   await testFuzzDataRegressions();
   testMetabolism();
   testBmiBoundaries();
@@ -4273,8 +4804,13 @@ export async function run() {
   await testModules();
   // 放最后：它会临时注入假 indexedDB 并清理，不干扰上面的「IDB 不可用」断言
   await testStoreSettings();
+  // 作息偏移：设置归一化 + saveSettings 部分更新 + 与 slotFromMinutes 的口径一致性
+  await testStoreSlotOffset();
+  await testSlotOffsetUiContract();
   // 同样注入假 indexedDB；每段都在 finally 里清掉 db.js 单例
   await testStoreMealTemplates();
+  // 套餐原地编辑：saveMealTemplate 透传 id 的落库路径
+  await testMealTemplateInPlaceStore();
   await testStoreExerciseLog();
   await testStoreExportStatus();
   await testSyncStore();

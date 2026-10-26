@@ -1,6 +1,6 @@
 // 今日总览（SPEC §7「今日」）。只读聚合 + 两个快捷写入（饮水）。
 import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1, markBusy } from '../js/ui.js';
-import { localDateStr, targetMacros, weightStats, sumItems, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
+import { localDateStr, targetMacros, weightStats, sumItems, round1, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
 import { daySummary, getGoals, recentWeights, addWater, getSettings, exportStatus } from '../js/store.js';
 // 导出下载只有一份实现（view 之间共用，避免两处逻辑漂移）。
 import { exportBackupJSON } from './settings.js';
@@ -90,6 +90,34 @@ function backupBar(status) {
   return bar;
 }
 
+/**
+ * 膳食纤维一行（用户决策：只显示摄取量，不设每日目标 —— 所以这里没有进度条、没有 target）。
+ * 缺数据的条目不参与累加，但必须说出来：一个不声不响的和会让人以为这就是全部摄入。
+ * 文案口径与 views/food.js 的 fiberSummaryText() 一致（两页说同一件事，用户不会看到两种解释）。
+ */
+function fiberRow(items) {
+  let total = 0;
+  let known = 0;
+  let sum = 0;
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== 'object') continue;
+    total += 1;
+    if (item.fiber == null || !Number.isFinite(Number(item.fiber))) continue;
+    known += 1;
+    sum += Number(item.fiber);
+  }
+  if (!total) return null;
+  const value = known ? `${fmt1(round1(sum))} g` : '暂无数据';
+  const note = !known ? '食物库暂无纤维数据' : total > known ? '部分食物无数据' : '';
+  return el('div', { className: 'col macro' },
+    el('div', { className: 'row row--between' },
+      el('span', { className: 'label', text: '膳食纤维' }),
+      el('span', { className: 'macro__nums' }, el('span', { className: 'strong', text: value })),
+    ),
+    note ? el('div', { className: 'muted', text: note }) : null,
+  );
+}
+
 function statBlock(label, value, unit) {
   return el('div', { className: 'stat' },
     el('div', { className: 'stat__line' },
@@ -115,6 +143,11 @@ export async function render(root) {
   const showWeight = (kg) => kgToUnit(kg, weightUnit);
 
   const intake = summary.intake || { kcal: 0, carb: 0, protein: 0, fat: 0 };
+  // 当日纤维：把所有餐次的条目摊平交给 fiberRow（它自己数缺数据的条数）。
+  const dayItems = [];
+  for (const meal of (Array.isArray(summary.meals) ? summary.meals : [])) {
+    for (const item of (Array.isArray(meal.items) ? meal.items : [])) dayItems.push(item);
+  }
   const burned = Number(summary.burned) || 0;
   const net = Number.isFinite(summary.netKcal) ? summary.netKcal : intake.kcal - burned;
   const calorieTarget = Number(goals.calorieTarget) || 1;
@@ -171,6 +204,7 @@ export async function render(root) {
     macroRow({ label: '碳水', value: intake.carb, target: macroTargets.carb, color: 'var(--carb)' }),
     macroRow({ label: '蛋白质', value: intake.protein, target: macroTargets.protein, color: 'var(--protein)' }),
     macroRow({ label: '脂肪', value: intake.fat, target: macroTargets.fat, color: 'var(--fat)' }),
+    fiberRow(dayItems),
   ));
 
   // 体重卡：没有数据时给下一步按钮，避免用户看死胡同。

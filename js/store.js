@@ -42,7 +42,13 @@ const DEFAULT_SETTINGS = {
   baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   // 只影响显示与输入：落库的体重永远是 kg
   weightUnit: 'kg',
+  // 作息偏移（分钟）：只影响「现在几点算哪一餐」的默认槽位，不改任何记录的日期
+  slotOffsetMinutes: 0,
 };
+
+// 作息偏移的允许区间：-3 小时（作息偏早）～ +4 小时（新疆 +2 小时留足余量）
+const SLOT_OFFSET_MIN = -180;
+const SLOT_OFFSET_MAX = 240;
 
 const SAFE_GOALS = {
   calorieTarget: 1800,
@@ -197,6 +203,17 @@ function normalizeWeightUnit(unit, fallback = DEFAULT_SETTINGS.weightUnit) {
   return WEIGHT_UNITS.includes(unit) ? unit : fallback;
 }
 
+/**
+ * 作息偏移归一化：整数分钟，clamp 到 -180..240；缺省、空串、数组、NaN、Symbol 一律 0。
+ * 溢出成 ±Infinity 的脏数（1e999）按「越界」处理掉到边界上 —— 结果恒为有限整数，绝不出现 NaN。
+ */
+function normalizeSlotOffset(v) {
+  if (typeof v === 'symbol') return 0;
+  const n = Number(v);
+  if (Number.isNaN(n)) return 0;
+  return clamp(Math.round(n), SLOT_OFFSET_MIN, SLOT_OFFSET_MAX);
+}
+
 export async function getSettings() {
   const saved = await db.getMeta('settings', null);
   const src = saved && typeof saved === 'object' ? saved : {};
@@ -206,10 +223,12 @@ export async function getSettings() {
     baseUrl: text(src.baseUrl) || DEFAULT_SETTINGS.baseUrl,
     // 旧数据没有这个键 -> 'kg'，视图层拿到的永远不是 undefined
     weightUnit: normalizeWeightUnit(src.weightUnit),
+    // 同样：旧数据没有这个键 -> 0，视图层拿到的永远是 -180..240 的整数
+    slotOffsetMinutes: normalizeSlotOffset(src.slotOffsetMinutes),
   };
 }
 
-/** 部分更新：只传 apiKey 时不能把 weightUnit / model / baseUrl 冲掉。 */
+/** 部分更新：只传 apiKey 时不能把 weightUnit / model / baseUrl / slotOffsetMinutes 冲掉。 */
 export async function saveSettings(s) {
   const cur = await getSettings();
   const src = s && typeof s === 'object' ? s : {};
@@ -219,6 +238,14 @@ export async function saveSettings(s) {
     baseUrl: text(src.baseUrl) || cur.baseUrl || DEFAULT_SETTINGS.baseUrl,
     weightUnit: src.weightUnit === undefined ? cur.weightUnit : normalizeWeightUnit(src.weightUnit),
   };
+  // 作息偏移：显式传了就归一后写入；0 = 「不偏移」= 等同于没设置，不为 0 时不必往 meta 里加键
+  // （既有断言钉死了旧数据 / 云端快照里 meta.settings 的形状，缺键时读出仍是 0，行为等价）。
+  const slotOffset = src.slotOffsetMinutes === undefined
+    ? cur.slotOffsetMinutes
+    : normalizeSlotOffset(src.slotOffsetMinutes);
+  // 显式传了就落库（哪怕 0 = 不偏移）；没传且从没设过 -> 不凭空加键。
+  // 理由：旧数据 / 云端快照里的 meta.settings 形状被既有断言钉死，缺键读出来同样是 0，行为等价。
+  if (src.slotOffsetMinutes !== undefined || slotOffset !== 0) next.slotOffsetMinutes = slotOffset;
   await db.setMeta('settings', next);
 }
 
@@ -316,10 +343,13 @@ export async function getMealTemplates() {
   return normalizeMealTemplates(await db.getMeta(MEAL_TEMPLATES_KEY, []));
 }
 
-/** 同名视为覆盖并保留原 id；name 为空抛中文错误。 */
-export async function saveMealTemplate({ name, slot, items } = {}) {
+/**
+ * 同名视为覆盖并保留原 id；带 id 且命中已有套餐时**原地更新那一条**（id/createdAt/位置都不变）。
+ * name 为空抛中文错误；id 不存在时照旧新建，向后兼容。
+ */
+export async function saveMealTemplate({ id, name, slot, items } = {}) {
   const existing = await getMealTemplates();
-  const { templates, template } = planMealTemplateSave(existing, { name, slot, items });
+  const { templates, template } = planMealTemplateSave(existing, { id, name, slot, items });
   await db.setMeta(MEAL_TEMPLATES_KEY, templates);
   return template;
 }
