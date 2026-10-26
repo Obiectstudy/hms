@@ -2172,6 +2172,245 @@ await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不�
       }
     });
 
+    // ---- 3.8.8 每日营养素目标（比例 + 克数）与每餐分配 ----
+    // 用户决策：指南(2022)口径 + 蛋白质按 g/kg + 纤维/钠纳入目标 + 目标要落到每一餐。
+    // 断言口径（两条互相独立）：
+    //   ① 真实链路：渲染文本里的每个读数都与 currentDailyTargets() 的返回值逐项对齐；
+    //   ② 受控注入：render(root, { targets }) 喂一份视图算不出来的目标，钉住「视图不按 BM/TDEE 重算」。
+    const gramsText = (n) => {
+      const r = Math.round(Number(n) * 10) / 10;
+      return Number.isInteger(r) ? String(r) : r.toFixed(1);
+    };
+    const targetCardOf = (root) => byClass(root, 'card').find((n) => n.textOf().includes('每日目标')) || null;
+    const targetRowOf = (card, label) => byClass(card, 'target-row').find((n) => n.textOf().includes(label)) || null;
+    const mealCardOf = (root, name) => byClass(root, 'card').find((c) => {
+      const text = c.textOf();
+      return text.includes(name) && text.includes('删整餐');
+    }) || null;
+    // 与视图同口径的求和：只累加已知值（缺字段的条目不参与），避免把「没数据」算成 0
+    const sumOfKey = (meals, key) => nutrition.round1((Array.isArray(meals) ? meals : []).reduce((acc, meal) => acc
+      + (Array.isArray(meal.items) ? meal.items : []).reduce((s, item) => s
+        + (item && item[key] != null && Number.isFinite(Number(item[key])) ? Number(item[key]) : 0), 0), 0));
+
+    await checkAsync('dashboard 每日目标表：热量与三大宏量同时给出克数与比例（读数取自 currentDailyTargets）', async () => {
+      clearCaseOverlays();
+      assert.equal(typeof store.currentDailyTargets, 'function', '前置：store.currentDailyTargets 必须导出（冻结接口）');
+      const t = await store.currentDailyTargets();
+      const dash = await renderView('dashboard');
+      const text = nodeText(dash);
+      assertNoLeak(text, 'dashboard(每日目标)');
+      const card = targetCardOf(dash);
+      assert.ok(card, '今日页没有「每日目标」卡：' + text.slice(0, 240));
+      const cardText = card.textOf();
+      assert.ok(cardText.includes('热量 ' + Math.round(t.calorieTarget) + ' kcal'),
+        '每日目标卡缺热量读数：' + cardText.slice(0, 240));
+      for (const [label, key] of [['碳水', 'carb'], ['蛋白质', 'protein'], ['脂肪', 'fat']]) {
+        const want = label + ' ' + gramsText(t[key].g) + ' g · ' + Math.round(t[key].pct) + '%';
+        assert.ok(cardText.includes(want), label + ' 没有同时给出克数与比例，期望「' + want + '」：' + cardText.slice(0, 300));
+      }
+      for (const label of ['热量', '碳水', '蛋白质', '脂肪']) {
+        assert.ok(targetRowOf(card, label), '每日目标表缺「' + label + '」行：' + cardText.slice(0, 300));
+      }
+    });
+
+    await checkAsync('dashboard 每日目标：纤维与钠各有进度条，钠超上限时提示「已超」而不是算作达标', async () => {
+      clearCaseOverlays();
+      const overItem = { name: '目标进度测试项', grams: 100, kcal: 300, carb: 10, protein: 20, fat: 10, fiber: 6.5, sodium: 2500 };
+      const mealId = await store.logMeal({ date: today, slot: 'dinner', source: 'manual', items: [overItem] });
+      try {
+        const t = await store.currentDailyTargets();
+        const summary = await store.daySummary(today);
+        const fiberValue = sumOfKey(summary.meals, 'fiber');
+        const sodiumValue = sumOfKey(summary.meals, 'sodium');
+        assert.ok(sodiumValue > t.sodium.mg, '前置：本用例的钠摄入应超过上限，实际 ' + sodiumValue + ' / ' + t.sodium.mg);
+
+        const dash = await renderView('dashboard');
+        const card = targetCardOf(dash);
+        assert.ok(card, '今日页没有「每日目标」卡');
+        const fiberRow = targetRowOf(card, '膳食纤维');
+        const sodiumRow = targetRowOf(card, '钠');
+        assert.ok(fiberRow, '每日目标卡里没有膳食纤维进度行：' + card.textOf().slice(0, 300));
+        assert.ok(sodiumRow, '每日目标卡里没有钠进度行：' + card.textOf().slice(0, 300));
+        assert.equal(byClass(fiberRow, 'bar').length, 1, '膳食纤维没有进度条：' + fiberRow.textOf());
+        assert.equal(byClass(sodiumRow, 'bar').length, 1, '钠没有进度条：' + sodiumRow.textOf());
+        assert.ok(fiberRow.textOf().includes(fiberValue.toFixed(1) + ' / ' + gramsText(t.fiber.g) + ' g'),
+          '纤维进度读数不对，期望 ' + fiberValue.toFixed(1) + ' / ' + gramsText(t.fiber.g) + ' g：' + fiberRow.textOf());
+        assert.ok(sodiumRow.textOf().includes(Math.round(sodiumValue) + ' / ' + gramsText(t.sodium.mg) + ' mg'),
+          '钠进度读数不对，期望 ' + Math.round(sodiumValue) + ' / ' + gramsText(t.sodium.mg) + ' mg：' + sodiumRow.textOf());
+
+        // 方向：钠是「不超过」型目标，超了必须说超了，不许出现「达标」这种越多越好的口径
+        const sodiumText = sodiumRow.textOf();
+        assert.ok(sodiumText.includes('已超'), '钠超上限却没有提示「已超」：' + sodiumText);
+        assert.ok(sodiumText.includes('上限'), '钠超上限的文案没有说明它是上限型目标：' + sodiumText);
+        assert.ok(!sodiumText.includes('达标'), '钠超上限时不该出现「达标」：' + sodiumText);
+        assert.equal(byClass(sodiumRow, 'bar__fill')[0].style.background, 'var(--warn)', '钠超上限时进度条没有换成警示色');
+        assert.equal(byClass(fiberRow, 'bar__fill')[0].style.background, 'var(--brand-2)', '纤维（下限型）不该用警示色');
+        // 纤维是「不少于」型：没到目标时说还差多少，不许写成「已超」
+        assert.ok(!fiberRow.textOf().includes('已超'), '纤维没到目标却被写成「已超」：' + fiberRow.textOf());
+        assert.ok(fiberRow.textOf().includes('还差'), '纤维没到目标时没有说明还差多少：' + fiberRow.textOf());
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('dashboard 推算依据行：按目标方向 · 蛋白 g/kg · 热量调整，逐字取自 basis', async () => {
+      clearCaseOverlays();
+      const t = await store.currentDailyTargets();
+      const dash = await renderView('dashboard');
+      const card = targetCardOf(dash);
+      assert.ok(card, '今日页没有「每日目标」卡');
+      const kindLabel = { cut: '减脂', maintain: '维持', bulk: '增肌' }[t.basis.goalKind];
+      assert.ok(kindLabel, '前置：basis.goalKind 应是 cut/maintain/bulk，实际 ' + t.basis.goalKind);
+      const want = [
+        '按' + kindLabel + '目标',
+        '蛋白 ' + gramsText(t.basis.gPerKg) + ' g/kg',
+        t.basis.calorieAdjustPct !== 0
+          ? '热量 ' + (t.basis.calorieAdjustPct > 0 ? '+' : '−') + gramsText(Math.abs(t.basis.calorieAdjustPct)) + '%'
+          : null,
+      ].filter(Boolean).join(' · ');
+      assert.ok(card.textOf().includes(want), '推算依据行与 basis 不一致，期望「' + want + '」：' + card.textOf().slice(0, 300));
+    });
+
+    await checkAsync('dashboard 受控注入：目标读数全部来自 currentDailyTargets 的返回值（视图不重算）', async () => {
+      clearCaseOverlays();
+      const controlled = {
+        calorieTarget: 1234,
+        protein: { g: 78.9, pct: 33, gPerKg: 1.1 },
+        fat: { g: 41.1, pct: 30 },
+        carb: { g: 165.4, pct: 37 },
+        fiber: { g: 21.5 },
+        sodium: { mg: 2345 },
+        water: { ml: 1900 },
+        basis: { goalKind: 'bulk', gPerKg: 1.1, calorieAdjustPct: 10 },
+      };
+      const dashView = await import('../views/dashboard.js');
+      const root = new dom.FakeNode('div');
+      await dashView.render(root, { targets: controlled });
+      const card = targetCardOf(root);
+      assert.ok(card, '注入受控目标后今日页没有「每日目标」卡：' + nodeText(root).slice(0, 200));
+      const text = card.textOf();
+      assert.ok(text.includes('热量 1234 kcal'), '热量没有取自注入值：' + text.slice(0, 240));
+      assert.ok(text.includes('碳水 165.4 g · 37%'), '碳水没有同时给出注入的克数与比例：' + text.slice(0, 240));
+      assert.ok(text.includes('蛋白质 78.9 g · 33%'), '蛋白质没有取自注入值（g/kg 口径的克数）：' + text.slice(0, 240));
+      assert.ok(text.includes('脂肪 41.1 g · 30%'), '脂肪没有取自注入值：' + text.slice(0, 240));
+      assert.ok(text.includes('按增肌目标 · 蛋白 1.1 g/kg · 热量 +10%'), '推算依据没有取自注入的 basis：' + text.slice(0, 240));
+      // 1234 / 78.9 / 165.4 都不可能由本机 profile/goals/体重算出来：视图若自己重算就会露馅
+      const real = await store.currentDailyTargets();
+      assert.notEqual(Math.round(real.calorieTarget), 1234, '前置：受控值不能与本机目标撞车');
+      assert.ok(!text.includes(Math.round(real.calorieTarget) + ' kcal'), '注入受控值后仍显示本机目标（视图在重算）：' + text.slice(0, 240));
+    });
+
+    await checkAsync('dashboard 目标降级：接口抛错 / 返回空 / 脏值时不崩、不上屏 NaN 或 undefined', async () => {
+      clearCaseOverlays();
+      const dashView = await import('../views/dashboard.js');
+      assert.equal(await dashView.dailyTargetsOrNull(async () => { throw new Error('boom'); }), null,
+        'currentDailyTargets 抛错时应降级成 null，而不是把异常抛给渲染');
+      assert.equal(await dashView.dailyTargetsOrNull(async () => null), null, '返回 null 时应降级');
+      const loaded = await dashView.dailyTargetsOrNull();
+      assert.ok(dashView.normalizeDailyTargets(loaded), '默认载入路径应拿得到可用目标（不抛）');
+      for (const bad of [{}, { calorieTarget: NaN }, { calorieTarget: 0 }, { calorieTarget: 'abc' }, 'x', 42, [], null, undefined]) {
+        assert.equal(dashView.normalizeDailyTargets(bad), null, '不可用的目标值应降级：' + JSON.stringify(bad));
+      }
+      assert.ok(dashView.normalizeDailyTargets({ calorieTarget: 1800 }), '正常目标不该被降级');
+      for (const bad of [null, {}, { calorieTarget: NaN }, { calorieTarget: 0 }, { calorieTarget: 'abc' }]) {
+        const root = new dom.FakeNode('div');
+        await dashView.render(root, { targets: bad });
+        const text = nodeText(root);
+        assert.ok(root.childNodes.length > 0, '目标坏值时今日页白屏');
+        assertNoLeak(text, 'dashboard(目标坏值 ' + JSON.stringify(bad) + ')');
+        assert.ok(!/Infinity/.test(text), '目标坏值时上屏了 Infinity：' + text.slice(0, 200));
+        assert.ok(text.includes('目标数据暂不可用'), '目标坏值时没有给一句说明：' + text.slice(0, 200));
+      }
+      // 半截脏值（热量可用、纤维/钠不可用）：能算的行照常画，坏的行不画进度、不拼 NaN
+      const partial = new dom.FakeNode('div');
+      await dashView.render(partial, { targets: { calorieTarget: 1800, carb: { g: 200, pct: 50 }, fiber: { g: NaN }, sodium: { mg: 'x' } } });
+      const partialText = nodeText(partial);
+      assertNoLeak(partialText, 'dashboard(目标半截脏值)');
+      assert.ok(!/Infinity/.test(partialText), '半截脏值上屏了 Infinity：' + partialText.slice(0, 200));
+      const partialCard = targetCardOf(partial);
+      assert.ok(partialCard, '半截脏值下没有渲染目标卡');
+      assert.ok(partialCard.textOf().includes('热量 1800 kcal'), '可用的目标行被脏值连坐：' + partialCard.textOf().slice(0, 240));
+      assert.ok(partialCard.textOf().includes('碳水 200 g · 50%'), '可用的宏量行被脏值连坐：' + partialCard.textOf().slice(0, 240));
+      assert.ok(!partialCard.textOf().includes('NaN'), '半截脏值把 NaN 拼进了目标卡：' + partialCard.textOf().slice(0, 240));
+    });
+
+    await checkAsync('food 每餐卡片显示该餐目标与「已记 / 目标」，snack 不显示目标行', async () => {
+      clearCaseOverlays();
+      assert.equal(typeof nutrition.mealTargetsOf, 'function', '前置：nutrition.mealTargetsOf 必须导出（冻结接口）');
+      const t = await store.currentDailyTargets();
+      const summary = await store.daySummary(today);
+      const root = await renderView('food');
+      for (const slot of ['breakfast', 'lunch']) {
+        const meal = summary.meals.find((m) => m.slot === slot);
+        assert.ok(meal && Array.isArray(meal.items) && meal.items.length, '前置：种子里应有 ' + slot + ' 记录');
+        const target = nutrition.mealTargetsOf(t, slot);
+        assert.ok(target, '前置：' + slot + ' 应能算出该餐目标');
+        const card = mealCardOf(root, meal.items[0].name);
+        assert.ok(card, '找不到 ' + slot + ' 的餐卡：' + nodeText(root).slice(0, 200));
+        const cardText = card.textOf();
+        assert.ok(cardText.includes('目标 ' + Math.round(target.kcal) + ' kcal'), slot + ' 没有显示该餐目标：' + cardText.slice(0, 240));
+        assert.ok(cardText.includes('蛋白 ' + gramsText(target.proteinG) + ' g'), slot + ' 没有显示该餐蛋白目标：' + cardText.slice(0, 240));
+        assert.ok(cardText.includes('已记 ' + nutrition.sumItems(meal.items).kcal + ' / 目标 ' + Math.round(target.kcal) + ' kcal'),
+          slot + ' 没有显示「已记 / 目标」对比：' + cardText.slice(0, 240));
+      }
+      assert.equal(nutrition.mealTargetsOf(t, 'snack'), null, '前置：snack 不分配目标');
+      const snackId = await store.logMeal({
+        date: today, slot: 'snack', source: 'manual',
+        items: [{ name: '加餐对比测试项', grams: 100, kcal: 150, carb: 10, protein: 5, fat: 5 }],
+      });
+      try {
+        const root2 = await renderView('food');
+        const snackCard = mealCardOf(root2, '加餐对比测试项');
+        assert.ok(snackCard, '找不到加餐餐卡');
+        const snackText = snackCard.textOf();
+        assert.ok(!snackText.includes('目标'), 'snack 不该出现目标行（也不许写 0 或 —）：' + snackText);
+        assert.ok(!snackText.includes('已记'), 'snack 不该出现「已记 / 目标」：' + snackText);
+      } finally {
+        await store.deleteMeal(snackId);
+      }
+    });
+
+    await checkAsync('food 受控注入：每餐目标随注入的 targets 变化；目标坏值时整行不渲染', async () => {
+      clearCaseOverlays();
+      assert.equal(typeof nutrition.mealTargetsOf, 'function', '前置：nutrition.mealTargetsOf 必须导出（冻结接口）');
+      const controlled = {
+        calorieTarget: 1000,
+        protein: { g: 60, pct: 24, gPerKg: 1.0 },
+        fat: { g: 27.8, pct: 25 },
+        carb: { g: 127.5, pct: 51 },
+        fiber: { g: 25 },
+        sodium: { mg: 2000 },
+        water: { ml: 1500 },
+        basis: { goalKind: 'cut', gPerKg: 1.0, calorieAdjustPct: -20 },
+      };
+      const foodView = await import('../views/food.js');
+      const summary = await store.daySummary(today);
+      const lunch = summary.meals.find((m) => m.slot === 'lunch');
+      assert.ok(lunch && Array.isArray(lunch.items) && lunch.items.length, '前置：种子里应有午餐记录');
+      const controlledTarget = nutrition.mealTargetsOf(controlled, 'lunch');
+      const realTarget = nutrition.mealTargetsOf(await store.currentDailyTargets(), 'lunch');
+      assert.ok(controlledTarget && realTarget, '前置：午餐两侧都应算得出目标');
+      assert.notEqual(Math.round(controlledTarget.kcal), Math.round(realTarget.kcal), '前置：受控餐次目标应与本机不同');
+
+      const root = new dom.FakeNode('div');
+      await foodView.render(root, { targets: controlled });
+      const card = mealCardOf(root, lunch.items[0].name);
+      assert.ok(card, '受控注入后找不到午餐餐卡');
+      assert.ok(card.textOf().includes('目标 ' + Math.round(controlledTarget.kcal) + ' kcal'),
+        '每餐目标没有取自注入值：' + card.textOf().slice(0, 240));
+      assert.ok(!card.textOf().includes('目标 ' + Math.round(realTarget.kcal) + ' kcal'),
+        '每餐目标仍显示本机值（视图在重算）：' + card.textOf().slice(0, 240));
+
+      for (const bad of [null, {}, { calorieTarget: NaN }, { calorieTarget: 0 }]) {
+        const badRoot = new dom.FakeNode('div');
+        await foodView.render(badRoot, { targets: bad });
+        const text = nodeText(badRoot);
+        assert.ok(badRoot.childNodes.length > 0, '目标坏值时饮食页白屏');
+        assertNoLeak(text, 'food(目标坏值 ' + JSON.stringify(bad) + ')');
+        assert.ok(!/目标 \d+ kcal/.test(text), '目标坏值时仍渲染了每餐目标行：' + text.slice(0, 240));
+      }
+    });
+
     // ---- 3.8.7 餐内「已添加」列表直删：不用先进「修改」面板，二次确认与面板内删除同源 ----
     await checkAsync('food 列表直删：条目上有紧凑删除入口，取消后一项都不动', async () => {
       clearCaseOverlays();

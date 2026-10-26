@@ -10,11 +10,12 @@ import {
   localDateStr,
   daysAgo,
   ageFromBirthday,
-  bmrMifflinStJeor,
-  tdee,
   weightStats,
   round1,
   WEIGHT_UNITS,
+  dailyTargets,
+  inferGoalKind,
+  GUIDE,
 } from './nutrition.js';
 import {
   normalizeItems,
@@ -50,14 +51,29 @@ const DEFAULT_SETTINGS = {
 const SLOT_OFFSET_MIN = -180;
 const SLOT_OFFSET_MAX = 240;
 
+// 无档案 / 档案不全时的保底目标（与 nutrition.js 的 SAFE_TARGET_INPUT 同口径：
+// 男 60kg / 170cm / 30 岁 / 久坐 + 维持档 → 1800 kcal、蛋白 60kg×1.1≈65g、水 max(1700, 2100)=2100ml）。
 const SAFE_GOALS = {
   calorieTarget: 1800,
   carbPct: 50,
   proteinPct: 20,
   fatPct: 30,
-  waterMl: 2000,
+  waterMl: 2100,
   weightTargetKg: null,
+  goalKind: 'maintain',
+  proteinGPerKg: null,
+  fiberG: GUIDE.fiberDefaultG,
+  sodiumMg: GUIDE.sodiumMaxMg,
 };
+
+// 目标方向的档位值（可手改目标体重的推断结果）
+const GOAL_KINDS = ['cut', 'maintain', 'bulk'];
+
+// 蛋白质 g/kg 的可存区间：覆盖三档（1.0~2.0）并留出手改余量；越界一律回到「按档位默认」
+const PROTEIN_G_PER_KG_MIN = 0.5;
+const PROTEIN_G_PER_KG_MAX = 3;
+
+
 
 const ACTIVITIES = ['sedentary', 'light', 'moderate', 'active', 'very_active'];
 
@@ -130,13 +146,19 @@ export async function saveProfile(p) {
   await db.setMeta('profile', profile);
 }
 
-async function latestWeightKg() {
+/**
+ * 最新体重（kg）。override 给了正数就直接用（currentDailyTargets 用 profile 里刚记的体重，
+ * 免得它比 IDB 里的 weights 慢一拍）；否则读 weights。
+ */
+async function latestWeightKg(override) {
+  const forced = num(override);
+  if (forced > 0) return forced;
   try {
     const rows = await db.getAll('weights');
     const stats = weightStats(rows);
     return stats.latest;
   } catch {
-    // 目标估算不该因为 IDB 不可用就整页崩掉，退化成按 60kg 估水
+    // 目标估算不该因为 IDB 不可用就整页崩掉，退化成按安全默认体重估
     return null;
   }
 }
@@ -149,44 +171,123 @@ async function safeGetProfile() {
   }
 }
 
-/** 依据档案估算目标。不落库；调用方要保存才调 saveGoals。 */
-export async function computeDefaultGoals(profile) {
-  const p = profile === undefined ? await safeGetProfile() : profile;
-  if (!p || typeof p !== 'object') return { ...SAFE_GOALS };
-
-  const weightKg = await latestWeightKg();
-  const weightTargetKg = num(p.weightTargetKg) > 0 ? round1(num(p.weightTargetKg)) : null;
-  const age = ageFromBirthday(p.birthday) || 30;
-  const bmr = bmrMifflinStJeor({
-    sex: p.sex,
-    weightKg: weightKg || 0,
-    heightCm: num(p.heightCm),
-    age,
-  });
-  if (!bmr) return { ...SAFE_GOALS, weightTargetKg };
-
-  const daily = tdee(bmr, p.activity);
-  return {
-    calorieTarget: clamp(Math.round(daily), 1200, 4000),
-    carbPct: 50,
-    proteinPct: 20,
-    fatPct: 30,
-    // 35ml/kg，取整到 50ml，别给用户一个 2437ml 这种没法执行的数
-    waterMl: clamp(Math.round(((weightKg || 60) * 35) / 50) * 50, 1500, 4000),
-    weightTargetKg,
-  };
+// 目标体重：只有正数才算设置了（0 / 负 / 脏值一律 null）
+function targetWeightOf(v) {
+  return num(v) > 0 ? round1(num(v)) : null;
 }
 
-function normalizeGoals(g) {
+/**
+ * 归一化「存下来的目标」：比例 / 克数 / 饮水仍是老字段，另加目标方向与纤维、钠。
+ * 目标方向（goalKind）：显式设置优先；老数据没这个键时按（当前体重 vs 目标体重）推断。
+ * 全部字段都保证有限数：脏值回落 SAFE_GOALS，不产生 NaN。
+ */
+export function normalizeGoals(g, ctx = {}) {
   const src = g && typeof g === 'object' ? g : {};
+  const weightTargetKg = targetWeightOf(src.weightTargetKg);
+  const weightKg = num(ctx.weightKg);
+  const explicit = typeof src.goalKind === 'string' && GOAL_KINDS.includes(src.goalKind)
+    ? src.goalKind
+    : null;
+  const gPerKg = num(src.proteinGPerKg);
   return {
     calorieTarget: clamp(Math.round(num(src.calorieTarget, SAFE_GOALS.calorieTarget)), 800, 6000),
     carbPct: clamp(Math.round(num(src.carbPct, SAFE_GOALS.carbPct)), 0, 100),
     proteinPct: clamp(Math.round(num(src.proteinPct, SAFE_GOALS.proteinPct)), 0, 100),
     fatPct: clamp(Math.round(num(src.fatPct, SAFE_GOALS.fatPct)), 0, 100),
     waterMl: clamp(Math.round(num(src.waterMl, SAFE_GOALS.waterMl)), 200, 8000),
-    weightTargetKg: num(src.weightTargetKg) > 0 ? round1(num(src.weightTargetKg)) : null,
+    weightTargetKg,
+    goalKind: explicit || inferGoalKind(weightKg, weightTargetKg),
+    // null = 「按档位默认 g/kg」，而不是「0 g/kg」
+    proteinGPerKg: gPerKg > 0 ? round1(clamp(gPerKg, PROTEIN_G_PER_KG_MIN, PROTEIN_G_PER_KG_MAX)) : null,
+    fiberG: round1(clamp(num(src.fiberG, SAFE_GOALS.fiberG), GUIDE.fiberMinG, GUIDE.fiberMaxG)),
+    sodiumMg: Math.round(clamp(num(src.sodiumMg, SAFE_GOALS.sodiumMg), 500, GUIDE.sodiumMaxMg)),
   };
+}
+
+/**
+ * 依据档案估算目标（《中国居民膳食指南(2022)》口径）。不落库；调用方要保存才调 saveGoals。
+ * 热量 / 比例 / 克数 / 纤维 / 钠 / 饮水全部出自 nutrition.js 的 dailyTargets()，
+ * 这里只负责把档案、最新体重、目标体重拼成它的入参，并把结果摊平成 goals 的形状。
+ */
+export async function computeDefaultGoals(profile) {
+  const p = profile === undefined ? await safeGetProfile() : profile;
+  if (!p || typeof p !== 'object') return { ...SAFE_GOALS };
+
+  const weightKg = await latestWeightKg(p.weightKg);
+  const weightTargetKg = targetWeightOf(p.weightTargetKg);
+  const t = dailyTargets({
+    sex: p.sex,
+    // 体重缺失：交给 dailyTargets 走安全默认（与「按 60kg 估水」的旧行为同值）
+    weightKg: weightKg || 0,
+    heightCm: num(p.heightCm),
+    age: ageFromBirthday(p.birthday),
+    activity: p.activity,
+    weightTargetKg,
+    goalKind: p.goalKind,
+  });
+
+  return {
+    calorieTarget: t.calorieTarget,
+    carbPct: t.carb.pct,
+    proteinPct: t.protein.pct,
+    fatPct: t.fat.pct,
+    waterMl: t.water.ml,
+    weightTargetKg,
+    goalKind: t.basis.goalKind,
+    // 实际生效的档位系数（未显式设置时就是该档中值）：界面据此显示「按 1.4 g/kg（减脂）」
+    proteinGPerKg: t.protein.gPerKg,
+    fiberG: t.fiber.g,
+    sodiumMg: t.sodium.mg,
+  };
+}
+
+// 档案 + 目标一起算：goalKind / 蛋白 g/kg 由档案与目标体重定，比例与克数再由 dailyTargets 出。
+async function dailyTargetsFrom(profile, goals, weightOverride) {
+  const p = profile && typeof profile === 'object' ? profile : {};
+  const g = goals && typeof goals === 'object' ? goals : {};
+  const weightKg = await latestWeightKg(weightOverride || p.weightKg);
+  const weightTargetKg = targetWeightOf(g.weightTargetKg != null ? g.weightTargetKg : p.weightTargetKg);
+  const goalKind = GOAL_KINDS.includes(g.goalKind)
+    ? g.goalKind
+    : inferGoalKind(weightKg, weightTargetKg);
+  return dailyTargets({
+    sex: p.sex,
+    weightKg: weightKg || 0,
+    heightCm: num(p.heightCm),
+    age: ageFromBirthday(p.birthday),
+    activity: p.activity,
+    calorieTarget: num(g.calorieTarget) > 0 ? num(g.calorieTarget) : undefined,
+
+    weightTargetKg,
+    goalKind,
+    proteinGPerKg: num(g.proteinGPerKg) > 0 ? num(g.proteinGPerKg) : undefined,
+    fiberG: num(g.fiberG) > 0 ? num(g.fiberG) : undefined,
+    sodiumMg: num(g.sodiumMg) > 0 ? num(g.sodiumMg) : undefined,
+  });
+}
+
+/**
+ * 当前生效的每日目标（比例 + 克数 + 依据 + 三餐分配直接可算）。
+ * 只读：不落库、不写 meta。档案 / 目标都读不到时返回安全默认，绝不抛。
+ */
+export async function currentDailyTargets() {
+  const [profile, goals] = await Promise.all([safeGetProfile(), getGoals()]);
+  return dailyTargetsFrom(profile, goals);
+}
+
+/**
+ * 目标方向变更后的「按新方向重算」（设置页切减脂/维持/增肌时用）。
+ * 显式传入的 calorieTarget / fiberG / sodiumMg / 体重目标会保留，其余按指南重算；不落库。
+ */
+export async function targetsForGoalKind(goalKind, overrides = {}) {
+  const [profile, saved] = await Promise.all([safeGetProfile(), getGoals()]);
+  const o = overrides && typeof overrides === 'object' ? overrides : {};
+  const merged = {
+    ...saved,
+    goalKind: GOAL_KINDS.includes(goalKind) ? goalKind : saved.goalKind,
+    ...o,
+  };
+  return dailyTargetsFrom(profile, merged, merged.weightKg);
 }
 
 export async function getGoals() {

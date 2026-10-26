@@ -1,9 +1,9 @@
 // 设置页（SPEC §7「设置」）：档案 / 目标 / 视觉识别 / 数据 / 关于。
 import { el, toast, confirmDialog, fmt1 } from '../js/ui.js';
-import { localDateStr } from '../js/nutrition.js';
+import { localDateStr, ageFromBirthday, GUIDE, dailyTargets, mealTargetsOf } from '../js/nutrition.js';
 import {
-  getProfile, saveProfile, getGoals, saveGoals, computeDefaultGoals,
-  getSettings, saveSettings, currentAccount,
+  getProfile, saveProfile, getGoals, saveGoals,
+  getSettings, saveSettings, currentAccount, recentWeights,
   exportJSON, exportCSV, importJSON, clearAllData, exportStatus,
 } from '../js/store.js';
 import { testConnection, MODEL_CANDIDATES, DEFAULT_BASE_URL, DEFAULT_MODEL } from '../js/vision.js';
@@ -15,6 +15,51 @@ const ACTIVITIES = [
   { value: 'active', label: '活跃（每周 6~7 次）' },
   { value: 'very_active', label: '高强度（体力工作/训练）' },
 ];
+
+/** 目标方向（决定蛋白质 g/kg 档位与热量调整）：值必须落在 store / nutrition 认的三档里。 */
+export const GOAL_KIND_OPTIONS = [
+  { value: 'cut', label: '减脂（热量 −20%）' },
+  { value: 'maintain', label: '维持（热量不变）' },
+  { value: 'bulk', label: '增肌（热量 +10%）' },
+];
+
+export const GOAL_KIND_LABELS = { cut: '减脂', maintain: '维持', bulk: '增肌' };
+
+/** 三餐供能比（早 30 / 午 40 / 晚 30），供显示用；数值来自 GUIDE.mealSlotPct。 */
+const MEAL_SLOT_LABELS = { breakfast: '早餐', lunch: '午餐', dinner: '晚餐' };
+
+/**
+ * 由档案 + 当前体重算出「按指南该吃多少」的入参（纯函数，不碰 DOM / 存储，可直接单测）。
+ * 表单里已填的纤维 / 钠 / 目标体重优先（用户手改过就按手改的算）；档案缺项交给 dailyTargets 兜底。
+ */
+export function targetInputFrom(profile, currentWeightKg, goalKind, form = {}) {
+  const p = profile && typeof profile === 'object' ? profile : {};
+  const f = form && typeof form === 'object' ? form : {};
+  // 空串 / 全空白 / null / undefined = 「没填」，不是 0（输入框清空就等于没表态）
+  const asNum = (v) => {
+    if (v == null || typeof v === 'string' && v.trim() === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const weight = asNum(currentWeightKg);
+  const formTarget = asNum(f.weightTargetKg);
+  const profileTarget = asNum(p.weightTargetKg);
+  const fiber = asNum(f.fiberG);
+  const sodium = asNum(f.sodiumMg);
+  return {
+    sex: p.sex,
+    weightKg: weight != null && weight > 0 ? weight : undefined,
+    heightCm: asNum(p.heightCm) ?? undefined,
+    age: p.birthday ? ageFromBirthday(p.birthday) : undefined,
+    activity: p.activity,
+    weightTargetKg: formTarget != null ? formTarget : profileTarget,
+    goalKind,
+    // 已显式设过的 g/kg 要沿用（用户手填过就不再被档位中值覆盖）
+    proteinGPerKg: asNum(f.proteinGPerKg) ?? asNum(p.proteinGPerKg) ?? undefined,
+    fiberG: fiber != null && fiber > 0 ? fiber : undefined,
+    sodiumMg: sodium != null && sodium > 0 ? sodium : undefined,
+  };
+}
 
 /**
  * 作息偏移档位（分钟）：整数分钟，全部落在 store 的 clamp 区间 -180..240 内。
@@ -171,14 +216,20 @@ export async function render(root) {
     profileSave,
   ));
 
-  // ---- 每日目标 ----
+  // ---- 每日目标（《中国居民膳食指南(2022)》口径：比例 + 克数都给） ----
   const calorieTarget = inputBox({ type: 'number', inputmode: 'numeric', step: '10', value: String(goals.calorieTarget || '') });
   const carbPct = inputBox({ type: 'number', inputmode: 'numeric', step: '1', value: String(goals.carbPct || '') });
   const proteinPct = inputBox({ type: 'number', inputmode: 'numeric', step: '1', value: String(goals.proteinPct || '') });
   const fatPct = inputBox({ type: 'number', inputmode: 'numeric', step: '1', value: String(goals.fatPct || '') });
   const waterMl = inputBox({ type: 'number', inputmode: 'numeric', step: '50', value: String(goals.waterMl || '') });
+  const fiberG = inputBox({ type: 'number', inputmode: 'decimal', step: '1', value: String(goals.fiberG != null ? goals.fiberG : GUIDE.fiberDefaultG) });
+  const sodiumMg = inputBox({ type: 'number', inputmode: 'numeric', step: '50', value: String(goals.sodiumMg != null ? goals.sodiumMg : GUIDE.sodiumMaxMg) });
   const goalWeightTarget = inputBox({ type: 'number', inputmode: 'decimal', step: '0.1', value: goals.weightTargetKg != null ? String(goals.weightTargetKg) : '' });
+  const goalKind = selectBox(GOAL_KIND_OPTIONS, goals.goalKind || 'maintain');
   const ratioHint = el('div', { className: 'muted', text: '' });
+  const basisLine = el('div', { className: 'muted', text: '' });
+  const planBox = el('div', { className: 'col' });
+  const basis = el('div', { className: 'col' });
 
   const sumRatio = () => Number(carbPct.value) + Number(proteinPct.value) + Number(fatPct.value);
   const updateRatioHint = () => {
@@ -188,17 +239,119 @@ export async function render(root) {
   for (const node of [carbPct, proteinPct, fatPct]) node.addEventListener('input', updateRatioHint);
   updateRatioHint();
 
+  // 目标方向 → 蛋白质 g/kg 档位（界面直接写出档位系数，用户不必猜）
+  const proteinBand = () => GUIDE.proteinGPerKg[goalKind.value] || GUIDE.proteinGPerKg.maintain;
+
+  /**
+   * 界面用的目标推算：一律走 nutrition.js 的 dailyTargets()（与 store 同一口径）。
+   * 优先用表单里当前的值（用户切档位时立刻能看到新目标），档案/体重兜底。只读、不落库。
+   */
+  const computeTargets = async (kind = goalKind.value) => {
+    // 最新体重：读取失败（无 IDB / 新用户）就交给 dailyTargets 的安全默认
+    const track = await recentWeights(1).catch(() => []);
+    const latest = Array.isArray(track) && track.length ? track[0] : null;
+    return dailyTargets(targetInputFrom(profileRaw, latest && latest.weightKg, kind, {
+      weightTargetKg: goalWeightTarget.value,
+      proteinGPerKg: goals.proteinGPerKg != null ? goals.proteinGPerKg : undefined,
+      fiberG: fiberG.value,
+      sodiumMg: sodiumMg.value,
+    }));
+  };
+
+  /** 一行营养素的「克数 · 占多少 %」；ratio 由 caller 传入（蛋白要带 g/kg 档位说明）。 */
+  const targetRow = (label, grams, ratio, unit = 'g') =>
+    el('div', { className: 'row row--between' },
+      el('span', { text: label }),
+      el('span', { className: 'muted', text: `${fmt1(grams)} ${unit} · 占 ${ratio}` }),
+    );
+
+  const renderPlan = (t) => {
+    planBox.textContent = '';
+    planBox.appendChild(el('div', { className: 'card__head', style: { marginBottom: '0' } },
+      el('div', { className: 'card__title', text: '每日营养目标（比例 + 克数）' }),
+      el('div', { className: 'muted', text: `${Math.round(t.calorieTarget)} kcal` }),
+    ));
+    planBox.appendChild(targetRow('热量', t.calorieTarget, '100%', 'kcal'));
+    planBox.appendChild(targetRow('蛋白质', t.protein.g, `${t.protein.pct}% · 按 ${fmt1(t.protein.gPerKg)} g/kg（${GOAL_KIND_LABELS[t.basis.goalKind] || ''}）`));
+    planBox.appendChild(targetRow('碳水', t.carb.g, `${t.carb.pct}%（指南 50~65%）`));
+    planBox.appendChild(targetRow('脂肪', t.fat.g, `${t.fat.pct}%（指南 20~30%）`));
+    planBox.appendChild(targetRow('膳食纤维', t.fiber.g, `指南 ${GUIDE.fiberMinG}~${GUIDE.fiberMaxG} g`));
+    planBox.appendChild(targetRow('钠', t.sodium.mg, `不超过 ${GUIDE.sodiumMaxMg} mg（盐 <${GUIDE.saltMaxG} g）`, 'mg'));
+    planBox.appendChild(targetRow('饮水', t.water.ml, '按 35ml/kg 与指南基线取大', 'ml'));
+    const meals = Object.keys(MEAL_SLOT_LABELS).map((slot) => {
+      const m = mealTargetsOf(t, slot);
+      return m ? `${MEAL_SLOT_LABELS[slot]} ${m.kcal} kcal（碳 ${fmt1(m.carbG)} / 蛋 ${fmt1(m.proteinG)} / 脂 ${fmt1(m.fatG)} 克）` : '';
+    });
+    planBox.appendChild(el('div', { className: 'muted', text: meals.filter(Boolean).join(' · ') }));
+    planBox.appendChild(el('div', { className: 'muted', text: '加餐不单独分配，从三餐里匀。' }));
+  };
+
+  const renderBasis = (t) => {
+    const b = t.basis;
+    const kcalRound = (v) => Math.round(Number(v) || 0);
+    basisLine.textContent = `推算：基础代谢 ${kcalRound(b.bmr)} kcal → 每日消耗 ${kcalRound(b.tdee)} kcal → 按「${GOAL_KIND_LABELS[b.goalKind] || b.goalKind}」调整 ${b.calorieAdjustPct >= 0 ? '+' : ''}${b.calorieAdjustPct}% = ${t.calorieTarget} kcal`;
+    basis.textContent = '';
+    basis.appendChild(basisLine);
+    basis.appendChild(el('div', { className: 'muted', text: `蛋白质档位：${GOAL_KIND_LABELS[b.goalKind] || b.goalKind} ${fmt1(proteinBand().min)}~${fmt1(proteinBand().max)} g/kg，实际按 ${fmt1(b.gPerKg)} g/kg（体重 × 系数）。` }));
+    basis.appendChild(el('div', { className: 'muted', text: `依据《中国居民膳食指南(2022)》：碳水 ${GUIDE.carbPctMin}~${GUIDE.carbPctMax}%、脂肪 ${GUIDE.fatPctMin}~${GUIDE.fatPctMax}%、纤维 ${GUIDE.fiberMinG}~${GUIDE.fiberMaxG} g、钠 ≤${GUIDE.sodiumMaxMg} mg（盐 <${GUIDE.saltMaxG} g）、三餐供能比早 30 / 午 40 / 晚 30。` }));
+  };
+
+  let lastTargets = null;
+
+  /** 重算并刷新整块目标卡（切档位 / 改体重目标 / 点估算都走这里）。 */
+  const refreshTargets = async (kind = goalKind.value) => {
+    try {
+      const t = await computeTargets(kind);
+      lastTargets = t;
+      renderPlan(t);
+      renderBasis(t);
+    } catch (err) {
+      basis.textContent = '';
+      basis.appendChild(el('div', { className: 'muted', text: '目标推算失败，可手动填写下面的数值。' }));
+      toast(`目标推算失败：${err && err.message ? err.message : err}`, 'error');
+    }
+  };
+
+  // 切档位：立刻把推算结果填进输入框（蛋白质百分比随档位变，热量也随之变），记得保存才落库
+  /** 把推算结果灌进输入框（手改入口仍然是这些框，保留「估算 → 微调 → 保存」的既有流程）。 */
+  const fillInputs = (computed) => {
+    lastTargets = computed;
+    calorieTarget.value = String(computed.calorieTarget);
+    carbPct.value = String(computed.carb.pct);
+    proteinPct.value = String(computed.protein.pct);
+    fatPct.value = String(computed.fat.pct);
+    waterMl.value = String(computed.water.ml);
+    fiberG.value = String(computed.fiber.g);
+    sodiumMg.value = String(computed.sodium.mg);
+    updateRatioHint();
+  };
+
+  goalKind.addEventListener('change', async () => {
+    try {
+      fillInputs(await computeTargets(goalKind.value));
+      await refreshTargets(goalKind.value);
+      toast(`已按「${GOAL_KIND_LABELS[goalKind.value] || goalKind.value}」重算，记得保存`, 'info');
+    } catch (err) {
+      toast(`重算失败：${err && err.message ? err.message : err}`, 'error');
+    }
+  });
+  // 改目标体重会改变档位推断（目标低于当前 → 减脂），输入框里的占比也要跟着走
+  goalWeightTarget.addEventListener('change', async () => {
+    try {
+      fillInputs(await computeTargets(goalKind.value));
+    } catch {
+      /* 推算失败就让用户手填，不打断 */
+    }
+    await refreshTargets(goalKind.value);
+  });
+
   const estimateBtn = el('button', { className: 'btn btn--ghost btn--block', text: '按档案自动估算' });
   estimateBtn.addEventListener('click', async () => {
     try {
-      const computed = await computeDefaultGoals(profileRaw);
-      calorieTarget.value = String(computed.calorieTarget);
-      carbPct.value = String(computed.carbPct);
-      proteinPct.value = String(computed.proteinPct);
-      fatPct.value = String(computed.fatPct);
-      waterMl.value = String(computed.waterMl);
-      if (computed.weightTargetKg != null) goalWeightTarget.value = String(computed.weightTargetKg);
-      updateRatioHint();
+      const computed = await computeTargets(goalKind.value);
+      fillInputs(computed);
+      renderPlan(computed);
+      renderBasis(computed);
       toast('已按 BMR/TDEE 估算，记得保存', 'info');
     } catch (err) {
       toast(`估算失败：${err && err.message ? err.message : err}`, 'error');
@@ -231,6 +384,13 @@ export async function render(root) {
         fatPct: Math.round(Number(fatPct.value)),
         waterMl: Math.round(water),
         weightTargetKg: numberOrNull(goalWeightTarget.value) || undefined,
+        goalKind: goalKind.value,
+        // 落库的是「实际生效的档位系数」（切档后 = 该档中值），下次打开界面依据行才对得上
+        proteinGPerKg: (goals.proteinGPerKg != null
+          ? goals.proteinGPerKg
+          : (lastTargets ? lastTargets.basis.gPerKg : undefined)),
+        fiberG: numberOrNull(fiberG.value) || undefined,
+        sodiumMg: numberOrNull(sodiumMg.value) || undefined,
       });
       toast('目标已保存', 'ok');
       await window.HMS.refresh();
@@ -245,13 +405,20 @@ export async function render(root) {
       el('div', { className: 'card__title', text: '每日目标' }),
       el('div', { className: 'muted', text: `当前 ${fmt1(goals.calorieTarget)} kcal` }),
     ),
+    labeled('目标方向', goalKind),
     labeled('热量目标 (kcal)', calorieTarget),
     el('div', { className: 'grid-3' }, labeled('碳水 %', carbPct), labeled('蛋白质 %', proteinPct), labeled('脂肪 %', fatPct)),
     ratioHint,
+    el('div', { className: 'grid-2' }, labeled('膳食纤维 (g)', fiberG), labeled('钠 (mg)', sodiumMg)),
     el('div', { className: 'grid-2' }, labeled('饮水目标 (ml)', waterMl), labeled('目标体重 (kg)', goalWeightTarget)),
+    planBox,
+    basis,
     estimateBtn,
     goalsSave,
   ));
+
+  // 首屏先渲染一次推算结果（异步，不阻塞其它卡片）
+  refreshTargets(goals.goalKind || 'maintain');
 
   // ---- 作息偏移（紧挨「每日目标」：同属「按什么标准记账」，但不归 goals 管） ----
   const offsetOptions = SLOT_OFFSET_OPTIONS.slice();

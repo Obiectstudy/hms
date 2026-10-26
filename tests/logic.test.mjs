@@ -20,6 +20,7 @@ import zlib from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 
 import * as nutrition from '../js/nutrition.js';
+import { GUIDE, dailyTargets, mealTargetsOf } from '../js/nutrition.js';
 import * as pure from '../js/pure.js';
 import * as db from '../js/db.js';
 import * as store from '../js/store.js';
@@ -75,6 +76,16 @@ function near(actual, expected, eps, msg) {
   assert.ok(
     typeof actual === 'number' && Math.abs(actual - expected) <= eps,
     `${msg ?? '数值不在容差内'}：actual=${actual} expected=${expected} eps=${eps}`,
+  );
+}
+
+/** 「约等于」断言：差值不超过 tol 才算过；任一侧非有限数直接算失败。 */
+function closeStrict(actual, expected, msg, tol = 0.05) {
+  assert.ok(
+    typeof actual === 'number' && typeof expected === 'number'
+      && Number.isFinite(actual) && Number.isFinite(expected)
+      && Math.abs(actual - expected) <= tol,
+    (msg || '数值应相等') + '：actual=' + actual + ' expected=' + expected + ' tol=' + tol,
   );
 }
 
@@ -211,6 +222,331 @@ function testMetabolism() {
     for (const target of [1200, 1500, 1800, 2000, 2400, 3000]) {
       const grams = nutrition.targetMacros(target, { carb: 0.45, protein: 0.25, fat: 0.3 });
       near(nutrition.kcalFromMacros(grams), target, 3, `${target}kcal 反算应自洽`);
+    }
+  });
+}
+
+// ---------- nutrition: 每日营养素目标（《中国居民膳食指南(2022)》口径） ----------
+// 口径来源见 js/nutrition.js 的 GUIDE 常量注释：三大营养素供能比、纤维 25~30g、钠 ≤2000mg、
+// 蛋白质 g/kg 分档（减脂 1.2~1.6 / 维持 1.0~1.2 / 增肌 1.6~2.0）、三餐供能比 30/40/30。
+
+const TARGET_PERSON = Object.freeze({
+  sex: 'male', weightKg: 70, heightCm: 175, age: 30, activity: 'moderate',
+});
+
+/** 4/4/9 反算热量：守恒式的左边。 */
+const kcalOf = (t) => 4 * t.protein.g + 4 * t.carb.g + 9 * t.fat.g;
+
+/** 三大营养素供能比之和必须是整数 100（不许 99.9 这种看不出错的和）。 */
+function assertPctSum100(t, label) {
+  const sum = t.protein.pct + t.fat.pct + t.carb.pct;
+  eq(Number.isInteger(sum), true, label + ' 三项占比之和应是整数，实际 ' + sum);
+  eq(sum, 100, label + ' 三项占比之和必须是 100，实际 ' + sum);
+}
+
+/** 脏值输入也不许吐出 NaN / 负数：整份目标逐字段过一遍。 */
+function assertFiniteTargets(t, label) {
+  const flat = [t.calorieTarget, t.protein.g, t.protein.pct, t.protein.gPerKg, t.fat.g, t.fat.pct, t.carb.g, t.carb.pct, t.fiber.g, t.sodium.mg, t.water.ml];
+  ok(flat.every((v) => Number.isFinite(v)), label + ' 出现非有限数：' + JSON.stringify(t));
+  ok(t.calorieTarget >= 1200 && t.calorieTarget <= 4000, label + ' 热量越界：' + t.calorieTarget);
+  ok([t.protein.g, t.fat.g, t.carb.g, t.fiber.g, t.sodium.mg, t.water.ml].every((v) => v >= 0), label + ' 出现负数：' + JSON.stringify(t));
+  ok(['cut', 'maintain', 'bulk'].includes(t.basis.goalKind), label + ' goalKind 非法：' + t.basis.goalKind);
+  ok(Number.isFinite(t.basis.calorieAdjustPct) && Number.isFinite(t.basis.gPerKg), label + ' basis 不是数：' + JSON.stringify(t.basis));
+}
+
+async function testDailyTargets() {
+  check('GUIDE 口径与《中国居民膳食指南(2022)》一致', () => {
+    eq(GUIDE.carbPctMin, 50);
+    eq(GUIDE.carbPctMax, 65);
+    eq(GUIDE.fatPctMin, 20);
+    eq(GUIDE.fatPctMax, 30);
+    eq(GUIDE.carbPctFloor, 50);
+    eq(GUIDE.fatPctTarget, 25);
+    eq(GUIDE.fiberMinG, 25);
+    eq(GUIDE.fiberMaxG, 30);
+    eq(GUIDE.fiberDefaultG, 25);
+    eq(GUIDE.sodiumMaxMg, 2000);
+    eq(GUIDE.saltMaxG, 5);
+    eq(GUIDE.waterBaseMaleMl, 1700);
+    eq(GUIDE.waterBaseFemaleMl, 1500);
+    eq(GUIDE.waterPerKgMl, 35);
+    eq(GUIDE.waterMinMl, 1500);
+    eq(GUIDE.waterMaxMl, 4000);
+    deep(GUIDE.proteinGPerKg.cut, { min: 1.2, max: 1.6 });
+    deep(GUIDE.proteinGPerKg.maintain, { min: 1.0, max: 1.2 });
+    deep(GUIDE.proteinGPerKg.bulk, { min: 1.6, max: 2.0 });
+    deep(GUIDE.mealSlotPct, { breakfast: 30, lunch: 40, dinner: 30 });
+  });
+
+  check('dailyTargets 五种目标方向组合都守恒：4/4/9 反算 ≈ 热量 且 占比和 = 100', () => {
+    const cases = [
+      ['减脂（目标低于当前）', { ...TARGET_PERSON, weightTargetKg: 65 }],
+      ['维持（目标等于当前）', { ...TARGET_PERSON, weightTargetKg: 70 }],
+      ['增肌（目标高于当前）', { ...TARGET_PERSON, weightTargetKg: 75 }],
+      ['无目标体重（回落维持）', { ...TARGET_PERSON }],
+      ['显式增肌', { ...TARGET_PERSON, goalKind: 'bulk' }],
+    ];
+    for (const [label, input] of cases) {
+      const t = dailyTargets(input);
+      near(kcalOf(t), t.calorieTarget, 5, label + ' 克数守恒失败：4×蛋 ' + t.protein.g + ' + 4×碳 ' + t.carb.g + ' + 9×脂 ' + t.fat.g + ' vs ' + t.calorieTarget);
+      assertPctSum100(t, label);
+      assertFiniteTargets(t, label);
+    }
+  });
+
+  check('蛋白质 g/kg 三档单调递增（同体重下 减脂 < 维持 < 增肌）', () => {
+    const t = (goalKind) => dailyTargets({ ...TARGET_PERSON, goalKind });
+    const p = (goalKind) => t(goalKind).basis.gPerKg;
+    // 档内取中值：减脂 1.4 / 维持 1.1 / 增肌 1.8（三条带由指南定义，互不重叠）
+    closeStrict(p('cut'), 1.4, '减脂应取 1.2~1.6 的中值 1.4');
+    closeStrict(p('maintain'), 1.1, '维持应取 1.0~1.2 的中值 1.1');
+    closeStrict(p('bulk'), 1.8, '增肌应取 1.6~2.0 的中值 1.8');
+    ok(p('cut') >= GUIDE.proteinGPerKg.cut.min && p('cut') <= GUIDE.proteinGPerKg.cut.max, '减脂档系数应落在 1.2~1.6');
+    ok(p('maintain') >= GUIDE.proteinGPerKg.maintain.min && p('maintain') <= GUIDE.proteinGPerKg.maintain.max, '维持档系数应落在 1.0~1.2');
+    ok(p('bulk') >= GUIDE.proteinGPerKg.bulk.min && p('bulk') <= GUIDE.proteinGPerKg.bulk.max, '增肌档系数应落在 1.6~2.0');
+    // 三条带整体上移：下一档的下限必须严格高于上一档的下限（同一体重下克数才可能形成递增序列）
+    ok(GUIDE.proteinGPerKg.maintain.min < GUIDE.proteinGPerKg.cut.min, '减脂下限必须高于维持下限');
+    ok(GUIDE.proteinGPerKg.cut.min < GUIDE.proteinGPerKg.bulk.min, '增肌下限必须高于减脂下限');
+    // 克数：每公斤蛋白摄入量 = 档位系数（克数 = 体重 × 系数，四舍五入到 0.1g）
+    closeStrict(t('cut').protein.g / 70, p('cut'), '每公斤蛋白克数应等于系数', 0.1);
+    closeStrict(t('maintain').protein.g / 70, p('maintain'), '每公斤蛋白克数应等于系数', 0.1);
+    closeStrict(t('bulk').protein.g / 70, p('bulk'), '每公斤蛋白克数应等于系数', 0.1);
+    // 同体重、同档案下，降档必须真的少吃蛋白：增肌 1.8 > 减脂 1.4 > 维持 1.1
+    ok(t('maintain').protein.g < t('cut').protein.g, '维持的 g/kg 必须小于减脂');
+    ok(t('cut').protein.g < t('bulk').protein.g, '减脂的 g/kg 必须小于增肌');
+    ok(t('maintain').protein.g < t('bulk').protein.g, '维持的 g/kg 必须小于增肌');
+    deep(Object.keys(t('cut').basis).sort(), ['bmr', 'calorieAdjustPct', 'gPerKg', 'goalKind', 'tdee']);
+  });
+
+  check('蛋白质克数按体重线性变化（g/kg 口径，不是固定百分比）', () => {
+    const at = (weightKg) => dailyTargets({ ...TARGET_PERSON, weightKg, goalKind: 'cut' });
+    const t70 = at(70);
+    const t60 = at(60);
+    const t80 = at(80);
+    ok(t60.protein.g !== t70.protein.g && t80.protein.g !== t70.protein.g, '体重变了蛋白克数必须跟着变');
+    near(t60.protein.g, 60 * 1.4, 0.1, '60kg 应给 84g（60 × 1.4 g/kg）');
+    near(t80.protein.g, 80 * 1.4, 0.1, '80kg 应给 112g（80 × 1.4 g/kg）');
+    // 克数严格按体重等比（蛋白克数不受热量 clamp 影响）
+    near(t60.protein.g / t70.protein.g, 60 / 70, 0.01, '60/70 体重应等比缩放蛋白克数');
+    near(t80.protein.g / t70.protein.g, 80 / 70, 0.01, '80/70 体重应等比缩放蛋白克数');
+    // 占比走的是热量基准（70kg 减脂会撞 1200 下界），因此只要求单调：体重越重、蛋白供能比越高
+    ok(t60.protein.pct <= t70.protein.pct && t70.protein.pct <= t80.protein.pct, '蛋白占比应随体重单调不减：' + t60.protein.pct + '/' + t70.protein.pct + '/' + t80.protein.pct);
+    // 系数取档内中值（减脂 (1.2+1.6)/2 = 1.4），克数 = 体重 × 中值
+    near(t70.protein.g, nutrition.round1(70 * 1.4), 0.1, '减脂蛋白应按中值 1.4 g/kg 折算');
+  });
+
+  check('显式 g/kg 优先，越界回落到该档区间（脏值不产生 NaN）', () => {
+    near(dailyTargets({ ...TARGET_PERSON, goalKind: 'bulk', proteinGPerKg: 2.0 }).protein.g, 140, 0.1, '显式 2.0 g/kg 必须生效');
+    eq(dailyTargets({ ...TARGET_PERSON, goalKind: 'bulk', proteinGPerKg: 2.0 }).basis.gPerKg, 2);
+    near(dailyTargets({ ...TARGET_PERSON, goalKind: 'bulk', proteinGPerKg: 5 }).protein.g, 70 * 2.0, 0.1, '超上限应夹到 2.0');
+    near(dailyTargets({ ...TARGET_PERSON, goalKind: 'cut', proteinGPerKg: 0.5 }).protein.g, 70 * 1.2, 0.1, '低于下限应夹到 1.2');
+    near(dailyTargets({ ...TARGET_PERSON, goalKind: 'cut', proteinGPerKg: 'abc' }).protein.g, 70 * 1.4, 0.1, '非法值回落档内中值 1.4');
+    assertFiniteTargets(dailyTargets({ ...TARGET_PERSON, goalKind: 'cut', proteinGPerKg: NaN }), 'NaN g/kg');
+    assertFiniteTargets(dailyTargets({ ...TARGET_PERSON, goalKind: 'cut', proteinGPerKg: Infinity }), 'Infinity g/kg');
+  });
+
+  check('脂肪固定 25% 供能、碳水吃剩余供能，且不低于指南下限 50%', () => {
+    for (const goalKind of ['cut', 'maintain', 'bulk']) {
+      const t = dailyTargets({ ...TARGET_PERSON, goalKind });
+      near(t.fat.pct / 100, 0.25, 0.005, goalKind + ' 脂肪应取指南中值 25%');
+      ok(t.fat.pct >= 20 && t.fat.pct <= 30, goalKind + ' 脂肪占比应落在 20~30%：' + t.fat.pct);
+      ok(t.carb.pct >= 50 && t.carb.pct <= 65, goalKind + ' 碳水占比应落在 50~65%：' + t.carb.pct);
+      // 碳水 = 剩余供能 = 100 − 蛋白 − 脂肪（碳水不触底时）
+      ok(t.carb.pct === 100 - t.protein.pct - t.fat.pct, goalKind + ' 碳水应等于剩余供能');
+      // 占比显示成整数百分比，所以克数与「显示占比」最多差半个百分点（≈0.013×热量/4 g）
+      near(4 * t.carb.g, (t.carb.pct / 100) * t.calorieTarget, 0.013 * t.calorieTarget, goalKind + ' 碳水克数与显示占比不一致');
+    }
+  });
+
+  check('热量按目标方向调整：减脂 −20% / 维持 0% / 增肌 +10%（相对 TDEE）', () => {
+    const bmr = nutrition.bmrMifflinStJeor(TARGET_PERSON);
+    const base = nutrition.tdee(bmr, TARGET_PERSON.activity);
+    for (const [label, input, pct] of [
+      ['减脂', { ...TARGET_PERSON, weightTargetKg: 65 }, -20],
+      ['维持', { ...TARGET_PERSON, weightTargetKg: 70 }, 0],
+      ['增肌', { ...TARGET_PERSON, weightTargetKg: 75 }, 10],
+    ]) {
+      const t = dailyTargets(input);
+      eq(t.basis.calorieAdjustPct, pct, label + ' 调整幅度不对');
+      near(t.calorieTarget, base * (1 + pct / 100), 7, label + ' 热量未按 TDEE 调整：' + t.calorieTarget + ' vs ' + base);
+      eq(t.calorieTarget, Math.round(t.calorieTarget), label + ' 热量必须是整数');
+    }
+  });
+
+  check('极端体重：热量被 clamp 到 1200 / 4000 时仍然自洽、非负', () => {
+    for (const [label, input] of [
+      ['极轻体重', { ...TARGET_PERSON, weightKg: 25, weightTargetKg: 20 }],
+      ['极重体重', { ...TARGET_PERSON, weightKg: 300, weightTargetKg: 250 }],
+      ['热量下界', { sex: 'female', weightKg: 40, heightCm: 150, age: 80, activity: 'sedentary', goalKind: 'cut' }],
+      ['热量上界', { sex: 'male', weightKg: 180, heightCm: 220, age: 18, activity: 'very_active', goalKind: 'bulk' }],
+    ]) {
+      const t = dailyTargets(input);
+      near(kcalOf(t), t.calorieTarget, 5, label + ' 守恒失败');
+      assertPctSum100(t, label);
+      assertFiniteTargets(t, label);
+      ok(t.protein.g > 0 && t.fat.g > 0 && t.carb.g >= 0, label + ' 克数出现 0/负：' + JSON.stringify(t));
+    }
+    ok(dailyTargets({ ...TARGET_PERSON, weightKg: 8, weightTargetKg: 5, goalKind: 'cut' }).calorieTarget >= 1200, '极轻体重必须夹到 1200 下界');
+    ok(dailyTargets({ ...TARGET_PERSON, weightKg: 400, weightTargetKg: 500, goalKind: 'bulk' }).calorieTarget <= 4000, '极重体重必须夹到 4000 上界');
+  });
+
+  check('碳水触底 50% 后三者占比仍自洽（和恒为 100，克数仍守恒）', () => {
+    // 高蛋白 + 低热量：蛋白占比逼近 50%，脂肪 25% 会挤掉碳水 → 必须走 50% 兜底
+    const t = dailyTargets({ sex: 'female', weightKg: 40, heightCm: 80, age: 120, activity: 'sedentary', goalKind: 'bulk', proteinGPerKg: 2.0 });
+    eq(t.calorieTarget, 1200, '前置：该组合应撞热量下界（TDEE 699 × 1.1）');
+    eq(t.carb.pct >= 50, true, '碳水必须被兜到 50%：' + t.carb.pct);
+    assertPctSum100(t, '碳水兜底');
+    near(kcalOf(t), t.calorieTarget, 5, '碳水兜底后仍须守恒');
+    eq(t.protein.pct + t.fat.pct, 100 - t.carb.pct, '兜底后蛋白+脂肪应等于剩余供能');
+    ok(t.protein.pct + t.fat.pct <= 50, '兜底后蛋白+脂肪不该超过 50%：' + t.protein.pct + '+' + t.fat.pct);
+    ok(t.fat.pct <= 25, '兜底时脂肪应被让位给碳水：' + t.fat.pct);
+  });
+
+  check('饮水 = max(指南基线, 35ml/kg)，取整到 50ml 且 clamp 1500~4000', () => {
+    eq(dailyTargets({ ...TARGET_PERSON, sex: 'female', weightKg: 50 }).water.ml, 1750, '女性 50kg：max(1500, 1750)');
+    eq(dailyTargets({ ...TARGET_PERSON, sex: 'male', weightKg: 40 }).water.ml, 1700, '男性基线 1700');
+    eq(dailyTargets({ ...TARGET_PERSON, sex: 'female', weightKg: 80 }).water.ml, 2800, '35ml/kg 生效');
+    eq(dailyTargets({ ...TARGET_PERSON, sex: 'male', weightKg: 300 }).water.ml, 4000, '必须夹到 4000 上界');
+    eq(dailyTargets({ ...TARGET_PERSON, sex: 'female', weightKg: 20 }).water.ml % 50, 0, '饮水应取整到 50ml');
+  });
+
+  check('纤维与钠：取指南默认值，可在入参覆盖并 clamp', () => {
+    eq(dailyTargets(TARGET_PERSON).fiber.g, GUIDE.fiberDefaultG, '纤维默认取 25g');
+    eq(dailyTargets(TARGET_PERSON).sodium.mg, GUIDE.sodiumMaxMg, '钠默认取 2000mg');
+    eq(dailyTargets({ ...TARGET_PERSON, fiberG: 28 }).fiber.g, 28, '区间内的覆盖值必须生效');
+    eq(dailyTargets({ ...TARGET_PERSON, fiberG: 32 }).fiber.g, GUIDE.fiberMaxG, '高于指南上限 30g 应夹到上限');
+    eq(dailyTargets({ ...TARGET_PERSON, sodiumMg: 1500 }).sodium.mg, 1500);
+    eq(dailyTargets({ ...TARGET_PERSON, fiberG: 10 }).fiber.g, GUIDE.fiberMinG, '纤维低于指南下限应夹到 25g');
+    eq(dailyTargets({ ...TARGET_PERSON, sodiumMg: 6000 }).sodium.mg, GUIDE.sodiumMaxMg, '钠高于指南上限应夹到 2000mg');
+    eq(dailyTargets({ ...TARGET_PERSON, fiberG: 'x' }).fiber.g, GUIDE.fiberDefaultG);
+    eq(dailyTargets({ ...TARGET_PERSON, sodiumMg: NaN }).sodium.mg, GUIDE.sodiumMaxMg);
+  });
+
+  check('goalKind 由 weightTargetKg 与当前体重推断（三种情形 + 缺省）', () => {
+    const kind = (input) => dailyTargets({ ...TARGET_PERSON, ...input }).basis.goalKind;
+    eq(kind({ weightTargetKg: 65 }), 'cut', '目标低于当前体重 → 减脂');
+    eq(kind({ weightTargetKg: 75 }), 'bulk', '目标高于当前体重 → 增肌');
+    eq(kind({ weightTargetKg: 70 }), 'maintain', '目标等于当前体重 → 维持');
+    eq(kind({}), 'maintain', '没有目标体重 → 维持');
+    eq(kind({ weightTargetKg: null }), 'maintain');
+    eq(kind({ weightTargetKg: 0 }), 'maintain');
+    eq(kind({ weightTargetKg: 65, goalKind: 'bulk' }), 'bulk', '显式设置优先于推断');
+    eq(kind({ weightTargetKg: 75, goalKind: 'cut' }), 'cut', '显式设置优先于推断');
+    eq(kind({ goalKind: '减脂' }), 'cut', '中文档位名也要认');
+    eq(kind({ weightTargetKg: 65, goalKind: '乱写的' }), 'cut', '不可识别的档位名回落推断');
+  });
+
+  check('mealTargetsOf：三餐之和 ≈ 日总量、snack 与非法 slot 返回 null', () => {
+    for (const goalKind of ['cut', 'maintain', 'bulk']) {
+      const t = dailyTargets({ ...TARGET_PERSON, goalKind });
+      const sum = { kcal: 0, carbG: 0, proteinG: 0, fatG: 0, fiberG: 0 };
+      for (const slot of ['breakfast', 'lunch', 'dinner']) {
+        const m = mealTargetsOf(t, slot);
+        ok(m && typeof m === 'object', goalKind + '/' + slot + ' 必须返回对象');
+        deep(Object.keys(m).sort(), ['carbG', 'fatG', 'fiberG', 'kcal', 'proteinG']);
+        ok(Number.isFinite(m.kcal) && Number.isFinite(m.carbG + m.proteinG + m.fatG + m.fiberG), slot + ' 出现 NaN');
+        sum.kcal += m.kcal;
+        sum.carbG += m.carbG;
+        sum.proteinG += m.proteinG;
+        sum.fatG += m.fatG;
+        sum.fiberG += m.fiberG;
+      }
+      eq(sum.kcal, t.calorieTarget, goalKind + ' 三餐热量之和应严格等于日总量（±0 kcal）');
+      near(sum.proteinG, t.protein.g, 1, goalKind + ' 三餐蛋白之和应≈日蛋白');
+      near(sum.carbG, t.carb.g, 1.5, goalKind + ' 三餐碳水之和应≈日碳水');
+      near(sum.fatG, t.fat.g, 1, goalKind + ' 三餐脂肪之和应≈日脂肪');
+      near(sum.fiberG, t.fiber.g, 1, goalKind + ' 三餐纤维之和应≈日纤维');
+      // 三餐供能比 30/40/30
+      near(mealTargetsOf(t, 'breakfast').kcal, t.calorieTarget * 0.3, 1.5, '早餐应占 30%');
+      near(mealTargetsOf(t, 'lunch').kcal, t.calorieTarget * 0.4, 1.5, '午餐应占 40%');
+      near(mealTargetsOf(t, 'dinner').kcal, t.calorieTarget * 0.3, 1.5, '晚餐应占 30%');
+      eq(mealTargetsOf(t, 'breakfast').kcal + mealTargetsOf(t, 'lunch').kcal + mealTargetsOf(t, 'dinner').kcal, t.calorieTarget, '三餐热量之和应正好等于日总量');
+    }
+    eq(mealTargetsOf(dailyTargets(TARGET_PERSON), 'snack'), null, "'snack' 不分配，必须返回 null");
+    eq(mealTargetsOf(dailyTargets(TARGET_PERSON), 'brunch'), null, '非法 slot → null');
+    eq(mealTargetsOf(dailyTargets(TARGET_PERSON), ''), null);
+    eq(mealTargetsOf(dailyTargets(TARGET_PERSON), 'Breakfast'), null, '大小写不同也算非法 slot');
+    eq(mealTargetsOf(dailyTargets(TARGET_PERSON), undefined), null);
+    eq(mealTargetsOf(dailyTargets(TARGET_PERSON), 7), null);
+    const t = dailyTargets(TARGET_PERSON);
+    eq(mealTargetsOf({ ...t, calorieTarget: NaN }, 'lunch'), null, '日总量是脏值时不给餐次目标');
+    eq(mealTargetsOf(null, 'lunch'), null, 'targets 缺失时返回 null，不抛');
+    eq(mealTargetsOf(undefined, 'lunch'), null);
+  });
+
+  check('dailyTargets 脏值一律回落安全默认：不抛、不 NaN', () => {
+    const dirty = [
+      ['性别缺失', { weightKg: 70, heightCm: 175, age: 30, activity: 'moderate' }],
+      ['性别非法', { sex: 'x', weightKg: 70, heightCm: 175, age: 30, activity: 'moderate' }],
+      ['身高 0', { sex: 'male', weightKg: 70, heightCm: 0, age: 30 }],
+      ['体重 0', { sex: 'male', weightKg: 0, heightCm: 175, age: 30 }],
+      ['年龄 0', { sex: 'male', weightKg: 70, heightCm: 175, age: 0 }],
+      ['activity 非法', { sex: 'male', weightKg: 70, heightCm: 175, age: 30, activity: 'unknown' }],
+      ['全空对象', {}],
+      ['undefined', undefined],
+      ['null', null],
+      ['字符串', 'abc'],
+      ['数字', 42],
+      ['数组', [1, 2, 3]],
+      ['NaN 字段', { sex: 'male', weightKg: NaN, heightCm: NaN, age: NaN, activity: NaN }],
+      ['Symbol 字段', { sex: 'male', weightKg: Symbol('w'), heightCm: Symbol('h'), age: Symbol('a') }],
+    ];
+    for (const [label, input] of dirty) {
+      let t = null;
+      try {
+        t = dailyTargets(input);
+      } catch (err) {
+        ok(false, label + ' 不该抛异常：' + (err && err.message));
+      }
+      assertFiniteTargets(t, label);
+      near(kcalOf(t), t.calorieTarget, 5, label + ' 守恒失败');
+      assertPctSum100(t, label);
+      eq(mealTargetsOf(t, 'lunch') !== null, true, label + ' 脏值回落后的目标仍应能分配到餐');
+    }
+    // 性别缺失按男性公式兜底（与 bmrMifflinStJeor 的既有口径一致）
+    eq(dailyTargets({ weightKg: 70, heightCm: 175, age: 30, activity: 'moderate' }).calorieTarget,
+      dailyTargets({ sex: 'male', weightKg: 70, heightCm: 175, age: 30, activity: 'moderate' }).calorieTarget,
+      '性别缺失应与男性同口径');
+  });
+
+  await checkAsync('store.computeDefaultGoals / getGoals 与 dailyTargets 同源（含新字段）', async () => {
+    const profile = { sex: 'male', birthday: '1996-01-01', heightCm: 175, activity: 'moderate' };
+    const goals = await store.computeDefaultGoals(profile);
+    const t = dailyTargets({ ...profile, age: nutrition.ageFromBirthday(profile.birthday) });
+    for (const key of ['calorieTarget', 'carbPct', 'proteinPct', 'fatPct', 'waterMl', 'weightTargetKg', 'goalKind', 'proteinGPerKg', 'fiberG', 'sodiumMg']) {
+      eq(key in goals, true, 'goals 缺少字段：' + key);
+    }
+    eq(goals.calorieTarget, t.calorieTarget, 'computeDefaultGoals 的热量应与 dailyTargets 一致');
+    eq(goals.carbPct, t.carb.pct, '碳水占比应与 dailyTargets 一致');
+    eq(goals.proteinPct, t.protein.pct, '蛋白占比应与 dailyTargets 一致');
+    eq(goals.fatPct, t.fat.pct, '脂肪占比应与 dailyTargets 一致');
+    eq(goals.proteinPct + goals.fatPct + goals.carbPct, 100, '三项占比之和必须是 100');
+    eq(goals.waterMl, t.water.ml, '饮水目标应与 dailyTargets 一致');
+    eq(goals.fiberG, t.fiber.g);
+    eq(goals.sodiumMg, t.sodium.mg);
+    eq(goals.goalKind, t.basis.goalKind);
+    eq(goals.proteinGPerKg, t.basis.gPerKg);
+    eq(goals.waterMl % 50, 0, '饮水目标仍必须是 50ml 的整数倍');
+
+    // 目标方向显式覆盖：computeDefaultGoals 只认档案里的档位（本套件无 IDB，getGoals/currentDailyTargets 走不了）
+    const bulkGoals = await store.computeDefaultGoals({ ...profile, goalKind: 'bulk' });
+    eq(bulkGoals.goalKind, 'bulk', '档案里的显式档位必须被采用');
+    ok(bulkGoals.proteinGPerKg >= GUIDE.proteinGPerKg.bulk.min, '增肌档系数必须落在 1.6~2.0：' + bulkGoals.proteinGPerKg);
+    const tBulk = dailyTargets({ ...profile, goalKind: 'bulk' });
+    eq(bulkGoals.calorieTarget, tBulk.calorieTarget, '增肌档热量应与 dailyTargets 一致');
+    eq(bulkGoals.carbPct + bulkGoals.proteinPct + bulkGoals.fatPct, 100, '增肌档三项占比之和也必须是 100');
+
+    // currentDailyTargets / targetsForGoalKind 必须在 store 上导出（真跑一遍由假 IDB 段覆盖）
+    eq(typeof store.currentDailyTargets, 'function', 'currentDailyTargets 必须导出');
+    eq(typeof store.targetsForGoalKind, 'function', 'targetsForGoalKind 必须导出');
+    if (IDB_ABSENT) {
+      let msg = '';
+      try {
+        await store.currentDailyTargets();
+      } catch (err) {
+        msg = err.message;
+      }
+      eq(msg, IDB_MSG, '无 IDB 时读路径仍应抛明确中文错误（与 getGoals 同口径）');
     }
   });
 }
@@ -1825,13 +2161,20 @@ async function testModules() {
   });
 
   await checkAsync('computeDefaultGoals 无档案时给安全默认值（不落库、不抛错）', async () => {
+    // 冻结接口新增 goalKind / proteinGPerKg / fiberG / sodiumMg 四个字段（其余键与取值原样不改）：
+    // 断言仍然是「整份对象逐键 deepStrictEqual」，把新键一并钉死，不是放宽。
     deep(await store.computeDefaultGoals(null), {
       calorieTarget: 1800,
       carbPct: 50,
       proteinPct: 20,
       fatPct: 30,
-      waterMl: 2000,
+      // 唯一取值变化：waterMl 2000 → 2100（旧的写死 2000 改成指南口径 max(男 1700, 60kg×35) = 2100）
+      waterMl: 2100,
       weightTargetKg: null,
+      goalKind: 'maintain',
+      proteinGPerKg: null,
+      fiberG: 25,
+      sodiumMg: 2000,
     });
   });
 
@@ -2133,6 +2476,186 @@ async function withFakeIdb(fn) {
     if (prev === undefined) delete globalThis.indexedDB;
     else globalThis.indexedDB = prev;
   }
+}
+
+// ---------- views/settings.js：目标卡的纯逻辑（不碰 DOM 也能测） ----------
+
+async function testSettingsTargetsUiContract() {
+  await checkAsync('设置页：targetInputFrom 把档案 + 当前体重 + 表单拼成指南入参', async () => {
+    const settingsView = await import('../views/settings.js');
+    eq(typeof settingsView.targetInputFrom, 'function', 'targetInputFrom 必须导出（目标卡的可测入口）');
+    const profile = { sex: 'female', birthday: '1990-06-01', heightCm: 160, activity: 'light', weightTargetKg: 60 };
+    const input = settingsView.targetInputFrom(profile, 66.5, 'cut', { weightTargetKg: '58.5', fiberG: '28', sodiumMg: '1500' });
+    deep(input, {
+      sex: 'female',
+      weightKg: 66.5,
+      heightCm: 160,
+      age: nutrition.ageFromBirthday('1990-06-01'),
+      activity: 'light',
+      weightTargetKg: 58.5,
+      goalKind: 'cut',
+      proteinGPerKg: undefined,
+      fiberG: 28,
+      sodiumMg: 1500,
+    });
+
+    const t = dailyTargets(input);
+    assertFiniteTargets(t, '设置页入参');
+    near(kcalOf(t), t.calorieTarget, 5, '设置页入参的守恒失败');
+    eq(t.carb.pct + t.fat.pct + t.protein.pct, 100);
+    eq(t.fiber.g, 28, '表单里的纤维必须生效');
+    eq(t.sodium.mg, 1500, '表单里的钠必须生效');
+    eq(t.basis.goalKind, 'cut');
+    eq(mealTargetsOf(t, 'dinner') !== null, true, '设置页渲染的三餐行要能算出来');
+    eq(mealTargetsOf(t, 'snack'), null);
+
+    // 档案缺体重 / 身高 / 生日 / 性别：全部交给 dailyTargets 兜底，不许 NaN
+    deep(settingsView.targetInputFrom({}, null, 'maintain', {}), {
+      sex: undefined,
+      weightKg: undefined,
+      heightCm: undefined,
+      age: undefined,
+      activity: undefined,
+      weightTargetKg: null,
+      goalKind: 'maintain',
+      proteinGPerKg: undefined,
+      fiberG: undefined,
+      sodiumMg: undefined,
+    });
+    const fallback = dailyTargets(settingsView.targetInputFrom(null, undefined, 'maintain', {}));
+    assertFiniteTargets(fallback, '设置页空档案');
+    eq(fallback.basis.goalKind, 'maintain');
+
+    // 表单里的脏值（空串 / 'abc'）不该被当成 0 传下去
+    const dirtyForm = settingsView.targetInputFrom(profile, 'abc', 'bulk', { weightTargetKg: '', fiberG: 'abc', sodiumMg: '' });
+    eq(dirtyForm.weightKg, undefined, '体重脏值应交给兜底');
+    eq(dirtyForm.weightTargetKg, 60, '表单空值应回落到档案里的目标体重');
+    eq(dirtyForm.fiberG, undefined);
+    eq(dirtyForm.sodiumMg, undefined);
+    const bulk = dailyTargets(dirtyForm);
+    eq(bulk.basis.goalKind, 'bulk');
+    assertFiniteTargets(bulk, '设置页脏表单');
+
+    // 档位选项：三档齐全、值与 GUIDE 的蛋白分档一一对应
+    const values = settingsView.GOAL_KIND_OPTIONS.map((o) => o.value);
+    deep(values, ['cut', 'maintain', 'bulk']);
+    for (const o of settingsView.GOAL_KIND_OPTIONS) {
+      eq(typeof o.label === 'string' && o.label.length > 0, true, '档位必须有可读中文标签');
+      ok(o.label.includes(settingsView.GOAL_KIND_LABELS[o.value]), '标签里应带档位名：' + o.label);
+      deep(Object.keys(GUIDE.proteinGPerKg[o.value]).sort(), ['max', 'min']);
+    }
+  });
+}
+
+// ---------- store: 每日目标（指南口径）与 goals 持久化的真跑一遍 ----------
+
+async function testStoreDailyTargets() {
+  await checkAsync('store: currentDailyTargets 与档案/目标同源（含新字段与三餐分配）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.saveProfile({
+        nickname: '我',
+        sex: 'male',
+        birthday: '1996-01-01',
+        heightCm: 175,
+        activity: 'moderate',
+        weightTargetKg: 65,
+      });
+      // 记一条当前体重，让「目标 65 vs 当前 72」这条推断有实据
+      await store.logWeight({ date: nutrition.daysAgo(0), weightKg: 72 });
+      const goals = await store.getGoals(); // 无存档 → 按档案算
+      eq(goals.goalKind, 'cut', '目标 65 < 当前 72 → 减脂');
+
+      const t = await store.currentDailyTargets();
+      assertFiniteTargets(t, 'currentDailyTargets');
+      near(kcalOf(t), t.calorieTarget, 5, 'currentDailyTargets 守恒失败');
+      eq(t.protein.pct + t.fat.pct + t.carb.pct, 100, '三项占比之和必须是 100');
+      eq(t.fiber.g, GUIDE.fiberDefaultG, '纤维默认 25g');
+      eq(t.sodium.mg, GUIDE.sodiumMaxMg, '钠默认 2000mg');
+      eq(t.water.ml % 50, 0, '饮水取整到 50ml');
+      eq(t.calorieTarget, goals.calorieTarget, 'currentDailyTargets 与 getGoals 的热量必须一致');
+      const lunch = mealTargetsOf(t, 'lunch');
+      ok(lunch && lunch.kcal > 0, '三餐分配必须能算出来');
+      eq(mealTargetsOf(t, 'snack'), null);
+    });
+  });
+
+  await checkAsync('store: goals 归一化新字段（缺省 / 越界 clamp / 脏值不产生 NaN）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      // 老数据（没有新键）→ 目标方向按目标体重推断，其余取指南默认
+      await store.saveGoals({ calorieTarget: 1800, carbPct: 50, proteinPct: 20, fatPct: 30, waterMl: 2000, weightTargetKg: 70 });
+      const legacy = await store.getGoals();
+      for (const key of ['calorieTarget', 'carbPct', 'proteinPct', 'fatPct', 'waterMl', 'weightTargetKg', 'goalKind', 'proteinGPerKg', 'fiberG', 'sodiumMg']) {
+        eq(key in legacy, true, '归一份缺少字段：' + key);
+      }
+      eq(legacy.goalKind, 'maintain', '无记录体重 + 无档位 → 维持');
+      eq(legacy.proteinGPerKg, null, '没设过 g/kg → null（表示按档位默认）');
+      eq(legacy.fiberG, GUIDE.fiberDefaultG);
+      eq(legacy.sodiumMg, GUIDE.sodiumMaxMg);
+
+      // 显式档位 + 越界值：clamp 到指南区间
+      await store.saveGoals({ goalKind: 'bulk', proteinGPerKg: 9, fiberG: 999, sodiumMg: 99999, weightTargetKg: 70 });
+      const clamped = await store.getGoals();
+      eq(clamped.goalKind, 'bulk');
+      eq(clamped.proteinGPerKg, 3, 'g/kg 上限 3');
+      eq(clamped.fiberG, GUIDE.fiberMaxG, '纤维上限 30g');
+      eq(clamped.sodiumMg, GUIDE.sodiumMaxMg, '钠上限 2000mg');
+      await store.saveGoals({ goalKind: 'cut', proteinGPerKg: 0.1, fiberG: -5, sodiumMg: -1 });
+      const floored = await store.getGoals();
+      eq(floored.goalKind, 'cut');
+      eq(floored.proteinGPerKg, 0.5, 'g/kg 下限 0.5');
+      eq(floored.fiberG, GUIDE.fiberMinG, '纤维下限 25g');
+      eq(floored.sodiumMg, 500, '钠下限 500mg');
+
+      // 脏值：不产生 NaN、不抛出
+      await store.saveGoals({
+        calorieTarget: NaN, carbPct: 'x', proteinPct: null, fatPct: undefined, waterMl: 'abc',
+        weightTargetKg: 'x', goalKind: '乱写的', proteinGPerKg: 'x', fiberG: NaN, sodiumMg: {}
+      });
+      const dirty = await store.getGoals();
+      // 数值字段逐个查有限性；goalKind 是枚举、proteinGPerKg 允许 null
+      for (const key of ['calorieTarget', 'carbPct', 'proteinPct', 'fatPct', 'waterMl', 'fiberG', 'sodiumMg']) {
+        eq(Number.isFinite(dirty[key]), true, '脏值产生了非有限数：' + key + '=' + dirty[key]);
+      }
+      eq(['cut', 'maintain', 'bulk'].includes(dirty.goalKind), true, 'goalKind 必须是三档之一：' + dirty.goalKind);
+      eq(dirty.proteinGPerKg, null, '不可识别的 g/kg 应回落 null（= 按档位默认），不是 NaN');
+      eq(dirty.goalKind, 'maintain', '不可识别的档位名回落推断');
+      eq(dirty.fiberG, GUIDE.fiberDefaultG);
+      eq(dirty.sodiumMg, GUIDE.sodiumMaxMg);
+
+      // 目标体重与当前体重比较：显式档位优先于推断
+      await store.logWeight({ date: nutrition.daysAgo(0), weightKg: 80 });
+      await store.saveGoals({ goalKind: 'cut', weightTargetKg: 70 });
+      const cutT = await store.currentDailyTargets();
+      eq(cutT.basis.goalKind, 'cut');
+      assertFiniteTargets(cutT, 'currentDailyTargets(80kg/70kg 目标)');
+    });
+  });
+
+  await checkAsync('store: targetsForGoalKind 切档重算（保留手改项，不落库）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      await store.saveProfile({ sex: 'female', birthday: '1990-06-01', heightCm: 160, activity: 'light', weightTargetKg: 60 });
+      await store.logWeight({ date: nutrition.daysAgo(0), weightKg: 70 });
+      const before = await store.getGoals();
+      const bulk = await store.targetsForGoalKind('bulk');
+      assertFiniteTargets(bulk, 'targetsForGoalKind(bulk)');
+      eq(bulk.basis.goalKind, 'bulk');
+      eq(bulk.basis.calorieAdjustPct, 10, '增肌 = TDEE +10%');
+      ok(bulk.calorieTarget > 0 && bulk.calorieTarget <= 4000, '热量必须在区间内');
+      eq(bulk.protein.pct + bulk.fat.pct + bulk.carb.pct, 100);
+      const cut = await store.targetsForGoalKind('cut');
+      eq(cut.basis.calorieAdjustPct, -20, '减脂 = TDEE −20%');
+      ok(cut.protein.g < bulk.protein.g, '同一体重下减脂蛋白应少于增肌');
+      ok(cut.calorieTarget < bulk.calorieTarget, '减脂热量应低于增肌');
+      // 不落库：切档查询不改变已保存的目标
+      deep(await store.getGoals(), before, 'targetsForGoalKind 不许改已保存的目标');
+      const kept = await store.targetsForGoalKind('bulk', { sodiumMg: 1500, fiberG: 28 });
+      eq(kept.sodium.mg, 1500, '手改的钠目标要保留');
+      eq(kept.fiber.g, 28, '手改的纤维目标要保留');
+    });
+  });
 }
 
 async function testStoreMealTemplates() {
@@ -5027,6 +5550,7 @@ export async function run() {
   testSlotFromMinutes();
   await testFuzzDataRegressions();
   testMetabolism();
+  await testDailyTargets();
   testBmiBoundaries();
   testExerciseBurn();
   testFoodMath();
@@ -5048,6 +5572,8 @@ export async function run() {
   // 放最后：它会临时注入假 indexedDB 并清理，不干扰上面的「IDB 不可用」断言
   await testStoreSettings();
   // 作息偏移：设置归一化 + saveSettings 部分更新 + 与 slotFromMinutes 的口径一致性
+  await testSettingsTargetsUiContract();
+  await testStoreDailyTargets();
   await testStoreSlotOffset();
   await testSlotOffsetUiContract();
   // 同样注入假 indexedDB；每段都在 finally 里清掉 db.js 单例

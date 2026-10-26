@@ -16,12 +16,22 @@ const ACTIVITY_FACTORS = {
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 function num(value, fallback = 0) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
+  try {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  } catch {
+    // Number(Symbol()) 会抛 TypeError；纯计算层不许把异常漏给调用方
+    return fallback;
+  }
 }
 
 function pad2(n) {
   return String(n).padStart(2, '0');
+}
+
+/** 夹取到区间；两侧都必须是有限数（调用方只传常量，不做脏值防御）。 */
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
 }
 
 /** 取整；非有限值一律归 0（与 round1 同口径：溢出也是「非有限」，不许吐 ±Infinity）。 */
@@ -132,6 +142,272 @@ export function tdee(bmr, activity) {
   if (base <= 0) return 0;
   const factor = ACTIVITY_FACTORS[activity] ?? ACTIVITY_FACTORS.sedentary;
   return Math.round(base * factor);
+}
+
+// ---------- 《中国居民膳食指南(2022)》每日目标口径 ----------
+// 纯函数层：只算数、不碰 DOM / 存储，Node 里可直接 import（顶层零副作用）。
+
+/**
+ * 指南口径常量。每条的依据：
+ * - carbPctMin/Max 50~65%、fatPctMin/Max 20~30%：指南「平衡膳食宝塔」给出的三大营养素供能比区间。
+ * - proteinGPerKg 分档：指南建议成人 1.0~1.2 g/kg；减脂 1.2~1.6、增肌 1.6~2.0 是运动营养学的常见扩展档。
+ * - mealSlotPct 30/40/30：早/午/晚三餐供能比，晚餐不过量。
+ * - fiber 25~30g：指南膳食纤维推荐量（成人 25~30 g/d）。
+ * - sodium ≤2000mg（= 食盐 <5g）：指南「少盐」限值，5g 盐 × 39.3% 钠占比 ≈ 1965mg，取整到 2000mg。
+ * - water：指南基线（男 1700 / 女 1500 ml）与 35 ml/kg 取大者 —— 运动量/体重越大越该多喝。
+ */
+export const GUIDE = Object.freeze({
+  carbPctMin: 50,
+  carbPctMax: 65,
+  fatPctMin: 20,
+  fatPctMax: 30,
+  fatPctTarget: 25,
+  // 碳水 = 剩余供能，但不能低过指南下限（见 dailyTargets 的 50% 兜底）
+  carbPctFloor: 50,
+  proteinGPerKg: Object.freeze({
+    cut: Object.freeze({ min: 1.2, max: 1.6 }),
+    maintain: Object.freeze({ min: 1.0, max: 1.2 }),
+    bulk: Object.freeze({ min: 1.6, max: 2.0 }),
+  }),
+  mealSlotPct: Object.freeze({ breakfast: 30, lunch: 40, dinner: 30 }),
+  fiberMinG: 25,
+  fiberMaxG: 30,
+  fiberDefaultG: 25,
+  sodiumMaxMg: 2000,
+  saltMaxG: 5,
+  waterBaseMaleMl: 1700,
+  waterBaseFemaleMl: 1500,
+  waterPerKgMl: 35,
+  waterMinMl: 1500,
+  waterMaxMl: 4000,
+  calorieTargetMin: 1200,
+  calorieTargetMax: 4000,
+  // 目标方向 → 在 TDEE 上的调整幅度（%）：减脂 −20 / 维持 0 / 增肌 +10
+  calorieAdjustPct: Object.freeze({ cut: -20, maintain: 0, bulk: 10 }),
+});
+
+/**
+ * 安全默认（档案缺失时用）：60kg / 170cm / 30 岁 / 久坐 / 男。
+ * 它是「兜底」，不是「估算」—— 只保证不抛、不 NaN、落在合理区间，方便用户再手改。
+ */
+export const SAFE_TARGET_INPUT = Object.freeze({
+  sex: 'male',
+  weightKg: 60,
+  heightCm: 170,
+  age: 30,
+  activity: 'sedentary',
+});
+
+const MIN_WEIGHT_KG = 20;
+const MAX_WEIGHT_KG = 300;
+const MIN_HEIGHT_CM = 80;
+const MAX_HEIGHT_CM = 250;
+const MIN_AGE = 10;
+const MAX_AGE = 120;
+
+const GOAL_KINDS = ['cut', 'maintain', 'bulk'];
+
+// 显式档位名的别名（中文界面直接传 '减脂' 也要认出）
+const GOAL_KIND_ALIASES = {
+  cut: 'cut', 减脂: 'cut', 减肥: 'cut', 减重: 'cut',
+  maintain: 'maintain', 维持: 'maintain', 保持: 'maintain',
+  bulk: 'bulk', 增肌: 'bulk', 增重: 'bulk',
+};
+
+/** 档位名归一：认英文/中文别名，认不出来返回 null（交给调用方回落推断）。 */
+function goalKindOf(value) {
+  if (typeof value !== 'string') return null;
+  return GOAL_KIND_ALIASES[value.trim().toLowerCase()] ?? null;
+}
+
+/** 档内取中值：减脂 1.4 / 维持 1.1 / 增肌 1.8 g/kg。 */
+function midOf(range) {
+  return (range.min + range.max) / 2;
+}
+
+/**
+ * 目标方向推断：目标体重 < 当前 → 减脂；> → 增肌；相等 / 缺失 → 维持。
+ * 导出给 store.js 复用，避免两处各写一份推断逻辑后慢慢跑偏。
+ */
+export function inferGoalKind(weightKg, weightTargetKg) {
+  const target = num(weightTargetKg);
+  if (!(target > 0) || !(weightKg > 0)) return 'maintain';
+  const diff = round1(weightKg - target);
+  if (diff > 0) return 'cut';
+  if (diff < 0) return 'bulk';
+  return 'maintain';
+}
+
+/** 三餐供能比合计必定 100。 */
+function mealPctSum() {
+  const slots = Object.keys(GUIDE.mealSlotPct);
+  return slots.reduce((sum, slot) => sum + GUIDE.mealSlotPct[slot], 0);
+}
+
+/**
+ * 按个人数据推算每日营养目标：比例与克数都给。非法 / 缺失入参一律回落安全默认，绝不抛、绝不 NaN。
+ *
+ * 口径（《中国居民膳食指南(2022)》）：
+ * - 热量：Mifflin-St Jeor BMR × 活动量 = TDEE，再按目标方向调整（减脂 −20% / 维持 0% / 增肌 +10%），clamp 1200~4000。
+ * - 蛋白质：体重 × 档内中值 g/kg（显式 proteinGPerKg 优先，越界夹到该档区间）。
+ * - 脂肪：指南中值 25% 供能 → 克数 = 热量 × 25% ÷ 9。
+ * - 碳水：剩余供能（100% − 蛋白 − 脂肪）÷ 4；低于指南下限 50% 时按 50% 兜底并把
+ *   蛋白/脂肪按比例压回剩余供能，保证三者占比仍自洽（和恒为 100）。
+ * - 纤维 25g（可在入参覆盖）/ 钠 ≤2000mg（同上）；饮水取 max(指南基线, 35ml/kg)，取整 50ml。
+ *
+ * 克数与占比都按同一组份额反算，所以 4×蛋白 + 4×碳水 + 9×脂肪 ≈ 热量（1 位小数舍入误差 ≤ 2 kcal）。
+ */
+export function dailyTargets(input) {
+  const src = input && typeof input === 'object' ? input : {};
+  const sex = src.sex === 'female' ? 'female' : 'male';
+
+  // 体重 / 身高 / 年龄为 0 或非有限 → 回落安全默认（调用方如果真给了 0，说明档案没填）
+  // 真实体重（可能缺失）；下面给 BMR/饮水用的兜底值不能拿去推断目标方向，
+  // 否则「没有体重记录 + 目标体重 65」会被拿 60kg 兜底值判成增肌。
+  const rawWeightKg = num(src.weightKg);
+  let weightKg = rawWeightKg;
+  if (!(weightKg > 0)) weightKg = SAFE_TARGET_INPUT.weightKg;
+  weightKg = Math.min(MAX_WEIGHT_KG, Math.max(MIN_WEIGHT_KG, weightKg));
+
+  let heightCm = num(src.heightCm);
+  if (!(heightCm > 0)) heightCm = SAFE_TARGET_INPUT.heightCm;
+  heightCm = Math.min(MAX_HEIGHT_CM, Math.max(MIN_HEIGHT_CM, heightCm));
+
+  let age = num(src.age);
+  if (!(age > 0)) age = SAFE_TARGET_INPUT.age;
+  age = Math.min(MAX_AGE, Math.max(MIN_AGE, age));
+
+  const activity = ACTIVITY_FACTORS[src.activity] ? src.activity : 'sedentary';
+  const weightTargetKg = num(src.weightTargetKg) > 0 ? num(src.weightTargetKg) : null;
+
+  // 目标方向：显式 > 按目标体重推断
+  const explicit = goalKindOf(src.goalKind);
+  const goalKind = explicit || inferGoalKind(rawWeightKg, weightTargetKg);
+  const range = GUIDE.proteinGPerKg[goalKind];
+  const calorieAdjustPct = GUIDE.calorieAdjustPct[goalKind];
+
+  // 蛋白质 g/kg：显式值合法就用它，否则取档内中值；显式值越界 / 脏值一律夹到该档区间
+  const wanted = num(src.proteinGPerKg);
+  const gPerKg = wanted > 0
+    ? Math.min(range.max, Math.max(range.min, wanted))
+    : midOf(range);
+
+  const fiberRaw = num(src.fiberG);
+  const fiberG = round1(fiberRaw > 0
+    ? clamp(fiberRaw, GUIDE.fiberMinG, GUIDE.fiberMaxG)
+    : GUIDE.fiberDefaultG);
+
+  const sodiumRaw = num(src.sodiumMg);
+  const sodiumMg = Math.round(sodiumRaw > 0
+    ? clamp(sodiumRaw, 500, GUIDE.sodiumMaxMg)
+    : GUIDE.sodiumMaxMg);
+
+  const bmr = bmrMifflinStJeor({ sex, weightKg, heightCm, age });
+  const daily = tdee(bmr, activity);
+  const rawKcal = daily * (1 + calorieAdjustPct / 100);
+  const autoKcal = clamp(
+    Math.round(Number.isFinite(rawKcal) ? rawKcal : GUIDE.calorieTargetMin),
+    GUIDE.calorieTargetMin,
+    GUIDE.calorieTargetMax,
+  );
+  // 用户在设置里填过热量目标就以它为准：否则今日页顶部的环/pill（用 goals.calorieTarget）
+  // 会与这里的推算值打架，同一屏出现两个热量目标。克数一律按最终热量反算。
+  const overrideKcal = num(src.calorieTarget);
+  const calorieTarget = overrideKcal > 0
+    ? clamp(Math.round(overrideKcal), GUIDE.calorieTargetMin, GUIDE.calorieTargetMax)
+    : autoKcal;
+
+  // ---- 三大营养素：先算份额，再按同一组份额反算克数（保证「占比和 = 100%」和克数守恒同时成立）----
+  let proteinShare = (weightKg * gPerKg * 4) / calorieTarget;
+  let fatShare = GUIDE.fatPctTarget / 100;
+
+  if (proteinShare + fatShare > 1) {
+    // 极端档案（体重大 / 热量低）下蛋白+脂肪会吃满热量，碳水就没位置了
+    proteinShare = Math.min(1, proteinShare);
+    fatShare = 0;
+  }
+  let carbShare = 1 - proteinShare - fatShare;
+
+  if (carbShare < GUIDE.carbPctFloor / 100) {
+    // 碳水低于指南下限：兜到 50%，蛋白与脂肪按现有份额的比例压回剩下 50%（保持相对关系不失真）
+    const rest = Math.max(1e-9, proteinShare + fatShare);
+    const scale = 0.5 / rest;
+    carbShare = 0.5;
+    proteinShare *= scale;
+    fatShare *= scale;
+  }
+
+  // 占比取整：碳水 = 100 − 蛋白 − 脂肪，保证整数和恒为 100
+  const proteinPctInt = Math.round(proteinShare * 100);
+  const fatPctInt = Math.round(fatShare * 100);
+  const carbPctInt = 100 - proteinPctInt - fatPctInt;
+
+  // 克数按各自的占比反算（同一组份额），4/4/9 反推热量 ≈ calorieTarget
+  const proteinG = round1((proteinShare * calorieTarget) / 4);
+  const fatG = round1((fatShare * calorieTarget) / 9);
+  const carbG = round1((carbShare * calorieTarget) / 4);
+
+  // 饮水：指南基线（男 1700 / 女 1500）与 35ml/kg 取大者，取整到 50ml，clamp 1500~4000
+  const waterBaseMl = sex === 'female' ? GUIDE.waterBaseFemaleMl : GUIDE.waterBaseMaleMl;
+  const waterRaw = Math.max(waterBaseMl, weightKg * GUIDE.waterPerKgMl);
+  const waterMl = clamp(Math.round(waterRaw / 50) * 50, GUIDE.waterMinMl, GUIDE.waterMaxMl);
+
+  return {
+    calorieTarget,
+    protein: { g: proteinG, pct: proteinPctInt, gPerKg: round1(gPerKg) },
+    fat: { g: fatG, pct: fatPctInt },
+    carb: { g: carbG, pct: carbPctInt },
+    fiber: { g: fiberG },
+    sodium: { mg: sodiumMg },
+    water: { ml: waterMl },
+    // 界面「依据」行用：基础代谢 → 每日消耗 → 目标调整
+    basis: { calorieFromGoal: overrideKcal > 0, autoCalorieTarget: autoKcal,
+      goalKind,
+      gPerKg: round1(gPerKg),
+      calorieAdjustPct,
+      bmr,
+      tdee: daily,
+    },
+  };
+}
+
+/**
+ * 某一餐应吃多少：取 dailyTargets 的结果 + 餐次，按三餐供能比（早 30 / 午 40 / 晚 30）切分。
+ * 'snack'（加餐）不分配 → 返回 null；非法 slot / 非法 targets 同样返回 null（调用方不必先校验）。
+ */
+export function mealTargetsOf(targets, slot) {
+  const share = typeof slot === 'string' ? GUIDE.mealSlotPct[slot] : undefined;
+  if (!share) return null;
+  const t = targets && typeof targets === 'object' ? targets : null;
+  if (!t) return null;
+  const kcal = num(t.calorieTarget);
+  if (!(kcal > 0) || !Number.isInteger(kcal)) return null;
+  const shareSum = mealPctSum();
+  const pct = share / shareSum;
+  const grams = (value) => round1(num(value) * pct);
+  const out = {
+    kcal: Math.round(kcal * pct),
+    carbG: grams(t.carb?.g),
+    proteinG: grams(t.protein?.g),
+    fatG: grams(t.fat?.g),
+    fiberG: grams(t.fiber?.g),
+  };
+  // 三餐热量之和必须正好等于日总量（独立取整会让 30/40/30 对不上）：
+  // 前两餐按比例取整，最后一餐吃余数 —— 它是 round(kcal×0.3) + round(kcal×0.4) 的差，
+  // 与独立取整最多差 1 kcal。
+  const lastSlot = Object.keys(GUIDE.mealSlotPct).pop();
+  if (slot === lastSlot) out.kcal = kcal - lastMealKcalBefore(kcal, shareSum, lastSlot);
+  return out;
+}
+
+/** 最后一餐之前各餐的取整热量之和。 */
+function lastMealKcalBefore(kcal, shareSum, lastSlot) {
+  let sum = 0;
+  for (const [key, pct] of Object.entries(GUIDE.mealSlotPct)) {
+    if (key === lastSlot) continue;
+    sum += Math.round((kcal * pct) / shareSum);
+  }
+  return sum;
 }
 
 /** 'YYYY-MM-DD' 生日 -> 周岁（按本地日期比较，未过今年生日减 1）。 */

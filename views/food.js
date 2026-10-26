@@ -3,10 +3,15 @@ import {
   el, clear, toast, openSheet, confirmDialog, emptyState, fmtKcal, fmt1, fmtDateCN, fmtTime, bar,
 } from '../js/ui.js';
 import { localDateStr, parseDateStr, round1, slotFromMinutes, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
+// mealTargetsOf 走命名空间导入：命名导入缺导出会在模块链接期直接抛 SyntaxError（整页连同套件一起崩），
+// 而这条接口由并行的实现方交付 —— 中间态按「没有餐次目标」降级（整行不渲染）。
+import * as nutritionApi from '../js/nutrition.js';
 import {
   getSettings, getGoals, daySummary, logMeal, updateMeal, deleteMeal, savePhoto,
   getMealTemplates, saveMealTemplate, saveDayTemplate, deleteMealTemplate, recentFoodItems,
 } from '../js/store.js';
+// 同一条防御：每日目标接口未落地时，饮食页照常渲染、只是没有每餐目标行。
+import * as storeApi from '../js/store.js';
 import { fileToDataUrl, analyzeFoodPhoto, MODEL_CANDIDATES } from '../js/vision.js';
 import * as foodsLib from '../js/foods.js';
 
@@ -422,6 +427,65 @@ export function fiberSubtotalSuffix(items) {
   const t = fiberTotals(items);
   if (!t.known) return '';
   return ` · 纤 ${fmt1(t.value)}${t.missing > 0 ? '（部分食物无数据）' : ''}`;
+}
+
+/* ---------- 该餐目标（用户决策：目标要落到每一餐） ---------- */
+
+/** 与 views/dashboard.js 同口径的数字文本；两个视图各自持有，避免视图之间互相 import。 */
+function numText(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '';
+  const r = Math.round(v * 10) / 10;
+  if (!Number.isFinite(r)) return '';
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
+}
+
+/** 每日目标载入守卫（与 dashboard 同口径）：接口未落地 / 读库抛错 → null。fetcher 只用于测试注入。 */
+export async function dailyTargetsOrNull(fetcher) {
+  const load = typeof fetcher === 'function'
+    ? fetcher
+    : (typeof storeApi.currentDailyTargets === 'function' ? () => storeApi.currentDailyTargets() : null);
+  if (!load) return null;
+  try {
+    return await load();
+  } catch (error) {
+    if (typeof console !== 'undefined') console.warn('[HMS] 每日目标不可用：', error);
+    return null;
+  }
+}
+
+/**
+ * 该餐目标：接口未落地 / slot 非法 / 目标脏值 → null（调用方整行不渲染，不写 0 或 —）。
+ * 'snack'（加餐）不在分配表里，接口本身就返回 null —— 这里不替它编一个数。
+ */
+export function mealTargetOf(targets, slot) {
+  if (typeof nutritionApi.mealTargetsOf !== 'function') return null;
+  try {
+    const t = nutritionApi.mealTargetsOf(targets, slot);
+    if (!t || typeof t !== 'object') return null;
+    const kcal = Number(t.kcal);
+    if (!Number.isFinite(kcal) || kcal <= 0) return null;
+    const proteinG = Number(t.proteinG);
+    return { kcal, proteinG: Number.isFinite(proteinG) && proteinG > 0 ? proteinG : null };
+  } catch (error) {
+    return null;
+  }
+}
+
+/** 目标行：`目标 600 kcal · 蛋白 45 g`（蛋白缺数据就不编，只留热量）。没有目标返回空串。 */
+export function mealTargetText(target) {
+  const kcal = Number(target && target.kcal);
+  if (!Number.isFinite(kcal) || kcal <= 0) return '';
+  const parts = [`目标 ${fmtKcal(kcal)} kcal`];
+  if (target && target.proteinG != null) parts.push(`蛋白 ${numText(target.proteinG)} g`);
+  return parts.join(' · ');
+}
+
+/** 对比行：`已记 520 / 目标 600 kcal`；没有目标就没有对比（snack / 降级时整块不渲染）。 */
+export function mealRecordedText(recordedKcal, target) {
+  const kcal = Number(target && target.kcal);
+  if (!Number.isFinite(kcal) || kcal <= 0) return '';
+  return `已记 ${fmtKcal(recordedKcal)} / 目标 ${fmtKcal(kcal)} kcal`;
 }
 
 /* ---------- 常吃套餐（SPEC §7 饮食：一键记入 + 存为套餐） ---------- */
@@ -1541,7 +1605,7 @@ async function replaceMealItemFlow(meal, index, item, rawGrams, reload) {
   }
 }
 
-function renderMealCard(meal, reload) {
+function renderMealCard(meal, reload, mealTarget) {
   const card = el('div', { className: 'card' },
     el('div', { className: 'card__head' },
       el('div', { className: 'row' },
@@ -1568,8 +1632,16 @@ function renderMealCard(meal, reload) {
       ),
     ),
   );
-  const list = el('div', { className: 'list' });
   const mealItems = Array.isArray(meal.items) ? meal.items : [];
+  // 该餐目标 + 「已记 / 目标」：snack 与降级（拿不到目标）时整块不渲染 —— 不写 0、不写 —。
+  const targetText = mealTargetText(mealTarget);
+  if (targetText) {
+    card.appendChild(el('div', { className: 'col meal-target' },
+      el('div', { className: 'label', text: targetText }),
+      el('div', { className: 'muted', text: mealRecordedText(sumItems(mealItems).kcal, mealTarget) }),
+    ));
+  }
+  const list = el('div', { className: 'list' });
   mealItems.forEach((item, index) => {
     // 脏记录防御：条目不是对象就跳过渲染（索引仍对应原始数组位置，份量按钮靠它定位原条目）。
     if (!item || typeof item !== 'object') return;
@@ -1602,7 +1674,7 @@ function renderMealCard(meal, reload) {
   return card;
 }
 
-async function paint(root, date, reload) {
+async function paint(root, date, reload, targets) {
   const today = localDateStr();
   const [summary, settings, goals, templates] = await Promise.all([
     daySummary(date), getSettings(), getGoals(), getMealTemplates(),
@@ -1680,7 +1752,9 @@ async function paint(root, date, reload) {
         for (const item of (Array.isArray(groupMeal.items) ? groupMeal.items : [])) slotItems.push(item);
       }
       root.appendChild(el('div', { className: 'h2', text: `${slot.label} · ${group.reduce((s, m) => s + sumItems(m.items || []).kcal, 0)} kcal${fiberSubtotalSuffix(slotItems)}` }));
-      for (const meal of group) root.appendChild(renderMealCard(meal, reload));
+      // 目标按餐次算一次（同一餐次的多条记录共用同一份目标），snack 拿到的是 null。
+      const slotTarget = mealTargetOf(targets, slot.value);
+      for (const meal of group) root.appendChild(renderMealCard(meal, reload, slotTarget));
     }
   }
 
@@ -1717,16 +1791,24 @@ async function paint(root, date, reload) {
   ));
 }
 
-export async function render(root) {
+/**
+ * targets 只用于测试注入（钉住「每餐目标全部来自 currentDailyTargets()」这条契约）；
+ * 生产路径不传，走 store.currentDailyTargets()。注意：目标拿到之后才调 paint ——
+ * content: ({ close }) => … 这类非 async 回调里绝不能出现 await（整页语法错误）。
+ */
+export async function render(root, options = {}) {
   let date = localDateStr();
   let seq = 0;
+  const injected = options && 'targets' in options ? options.targets : undefined;
   const reload = async (nextDate) => {
     if (nextDate) date = nextDate;
     const current = ++seq;
     // 连点套餐、快速切日期都会并发触发 reload：先画到临时容器，最后一次整体替换，
     // 否则两次 paint 交错会把整页内容追加两遍。
     const staging = el('div');
-    await paint(staging, date, reload);
+    // 目标只读 + 失败降级：取不到就没有每餐目标行，饮食页其余部分照常。
+    const targets = injected !== undefined ? injected : await dailyTargetsOrNull();
+    await paint(staging, date, reload, targets);
     if (current !== seq) return;
     const kids = Array.from(staging.childNodes);
     clear(root);

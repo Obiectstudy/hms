@@ -2,6 +2,9 @@
 import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1, markBusy } from '../js/ui.js';
 import { localDateStr, targetMacros, weightStats, sumItems, round1, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
 import { daySummary, getGoals, recentWeights, addWater, getSettings, exportStatus } from '../js/store.js';
+// currentDailyTargets 走命名空间导入：命名导入缺导出会在模块链接期直接抛 SyntaxError（整页连同套件一起崩），
+// 而这条接口由并行的实现方交付 —— 中间态必须能降级。与 views/food.js 里 foodsLib.foodUnits 同一套防御。
+import * as storeApi from '../js/store.js';
 // 导出下载只有一份实现（view 之间共用，避免两处逻辑漂移）。
 import { exportBackupJSON } from './settings.js';
 
@@ -48,11 +51,187 @@ function macroRow({ label, value, target, color, unit = 'g' }) {
       el('span', { className: 'label', text: label }),
       el('span', { className: 'macro__nums' },
         el('span', { className: 'strong', text: fmt1(value) }),
-        el('span', { className: 'muted', text: ` / ${Math.round(target)} ${unit}` }),
+        // 目标用与「每日目标」表同一套数字文本：同屏两处不该出现 126 / 125.5 这种分歧。
+        el('span', { className: 'muted', text: ` / ${numText(target) || '0'} ${unit}` }),
       ),
     ),
     bar({ value, max: target, color }),
   );
+}
+
+/**
+ * 三大宏量进度条的上限：优先用 currentDailyTargets() 的克数（与「每日目标」表同源），
+ * 目标拿不到时才回落到 goals 占比的 4/4/9 反算 —— 降级不等于让进度条消失。
+ */
+function targetMacroGrams(targets, goals) {
+  const fallback = targetMacros(Number(goals.calorieTarget) || 1, {
+    carb: goals.carbPct, protein: goals.proteinPct, fat: goals.fatPct,
+  });
+  const t = normalizeDailyTargets(targets);
+  if (!t) return fallback;
+  const pick = (key) => {
+    const grams = Number(t[key] && t[key].g);
+    return Number.isFinite(grams) && grams > 0 ? grams : fallback[key];
+  };
+  return { carb: pick('carb'), protein: pick('protein'), fat: pick('fat') };
+}
+
+/* ---------- 每日目标（用户决策：指南口径 + 蛋白 g/kg + 纤维 / 钠纳入目标） ---------- */
+
+/** 数字文本：整数不带小数点、有小数保留 1 位；非有限值（脏数据 / 溢出）返回空串，由调用方整行不渲染。 */
+function numText(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '';
+  const r = Math.round(v * 10) / 10;
+  if (!Number.isFinite(r)) return '';
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
+}
+
+/** 目标对象是否可用：热量是有限正数才算（空对象 / 脏值 / 接口没落地一律 null → 降级卡）。 */
+export function normalizeDailyTargets(raw) {
+  const t = raw && typeof raw === 'object' ? raw : null;
+  if (!t) return null;
+  const kcal = Number(t.calorieTarget);
+  return Number.isFinite(kcal) && kcal > 0 ? t : null;
+}
+
+/**
+ * 目标载入守卫：接口没落地 / 读库抛错 一律降级成 null（目标卡退化成一行说明，不整页白屏）。
+ * fetcher 只用于测试注入，生产路径永远是 store.currentDailyTargets()。
+ */
+export async function dailyTargetsOrNull(fetcher) {
+  const load = typeof fetcher === 'function'
+    ? fetcher
+    : (typeof storeApi.currentDailyTargets === 'function' ? () => storeApi.currentDailyTargets() : null);
+  if (!load) return null;
+  try {
+    return await load();
+  } catch (error) {
+    if (typeof console !== 'undefined') console.warn('[HMS] 每日目标不可用：', error);
+    return null;
+  }
+}
+
+/** 目标表：热量 + 三大宏量，宏量一行里同时给克数与供能比（如「碳水 260 g · 52%」）。 */
+export function dailyTargetRows(targets) {
+  const t = normalizeDailyTargets(targets);
+  if (!t) return [];
+  const rows = [];
+  const kcal = numText(t.calorieTarget);
+  if (kcal) rows.push({ key: 'kcal', label: '热量', text: `${kcal} kcal` });
+  for (const [key, label] of [['carb', '碳水'], ['protein', '蛋白质'], ['fat', '脂肪']]) {
+    const grams = numText(t[key] && t[key].g);
+    const pct = numText(t[key] && t[key].pct);
+    if (!grams || !pct) continue;
+    rows.push({ key, label, text: `${grams} g · ${pct}%` });
+  }
+  return rows;
+}
+
+/** 推算依据一行：按减脂目标 · 蛋白 1.4 g/kg · 热量 −20%（缺字段就只说能说的那几段）。 */
+export function basisText(basis) {
+  const b = basis && typeof basis === 'object' ? basis : {};
+  const kind = { cut: '减脂', maintain: '维持', bulk: '增肌' }[b.goalKind];
+  const adjust = Number(b.calorieAdjustPct);
+  const parts = [];
+  if (kind) parts.push(`按${kind}目标`);
+  const perKg = numText(b.gPerKg);
+  if (perKg) parts.push(`蛋白 ${perKg} g/kg`);
+  if (Number.isFinite(adjust) && adjust !== 0) parts.push(`热量 ${adjust > 0 ? '+' : '−'}${numText(Math.abs(adjust))}%`);
+  return parts.join(' · ');
+}
+
+/**
+ * 上限型目标（钠）的进度：超了说「已超」，没超说「距上限」。
+ * 方向不能反 —— 钠是「不超过」，超了是风险，不是「完成得更多」。
+ */
+export function limitProgress(value, limit, unit = '') {
+  const v = Number(value);
+  const m = Number(limit);
+  if (!Number.isFinite(v) || !Number.isFinite(m) || m <= 0) return null;
+  const over = v > m;
+  return {
+    warn: over,
+    main: `${numText(v)} / ${numText(m)}${unit}`,
+    note: over
+      ? `已超 ${numText(round1(v - m))}${unit} · 钠是上限目标`
+      : `距上限还有 ${numText(round1(m - v))}${unit}`,
+  };
+}
+
+/** 下限型目标（纤维）的进度：「还差 X」/「已达标」；超了不是问题。 */
+export function floorProgress(value, target, unit = '') {
+  const v = Number(value);
+  const m = Number(target);
+  if (!Number.isFinite(v) || !Number.isFinite(m) || m <= 0) return null;
+  const done = v >= m;
+  return {
+    warn: false,
+    main: `${numText(v)} / ${numText(m)}${unit}`,
+    note: done ? '已达标' : `还差 ${numText(round1(m - v))}${unit}`,
+  };
+}
+
+/**
+ * 纤维 / 钠的进度行。缺数据的条目只报「暂无数据」，不画进度条 —— 缺数据不是 0。
+ * missing > 0 时追加一句实话（与 views/food.js 的纤维口径一致），免得用户以为这就是全部摄入。
+ */
+function progressRow({ label, totals, targets, unit, kind, color }) {
+  const value = totals.value;
+  const target = Number(targets);
+  const progress = value == null
+    ? null
+    : (kind === 'limit' ? limitProgress(value, target, unit) : floorProgress(value, target, unit));
+  const main = progress
+    ? progress.main
+    : (value == null ? '暂无数据' : `${numText(value)}${unit}`);
+  const note = progress
+    ? `${progress.note}${totals.missing > 0 ? '（部分食物无数据）' : ''}`
+    : (value == null ? '食物库暂无这项数据' : '目标数据不完整');
+  return el('div', { className: 'col macro target-row' },
+    el('div', { className: 'row row--between' },
+      el('span', { className: 'label', text: label }),
+      el('span', { className: 'macro__nums strong', text: main }),
+    ),
+    progress ? bar({ value, max: target, color: progress.warn ? 'var(--warn)' : color }) : null,
+    note ? el('div', { className: `muted${progress && progress.warn ? ' trend-up' : ''}`, text: note }) : null,
+  );
+}
+
+/**
+ * 每日目标卡：目标表（比例 + 克数）+ 纤维 / 钠进度 + 推算依据。
+ * 数据一律来自 currentDailyTargets()：这里不重算 BM / TDEE，也没有第二套口径。
+ */
+function targetCard(targets, dayItems) {
+  const card = el('div', { className: 'card col' },
+    el('div', { className: 'card__head', style: { marginBottom: '0' } },
+      el('div', { className: 'card__title', text: '每日目标' }),
+    ),
+  );
+  const t = normalizeDailyTargets(targets);
+  if (!t) {
+    card.appendChild(el('div', { className: 'muted', text: '目标数据暂不可用' }));
+    return card;
+  }
+  for (const row of dailyTargetRows(t)) {
+    card.appendChild(el('div', { className: 'col macro target-row' },
+      el('div', { className: 'row row--between' },
+        el('span', { className: 'label', text: row.label }),
+        el('span', { className: 'macro__nums strong', text: row.text }),
+      ),
+    ));
+  }
+  card.appendChild(progressRow({
+    label: '膳食纤维', totals: nutrientTotals(dayItems, 'fiber'), targets: t.fiber && t.fiber.g,
+    unit: ' g', kind: 'floor', color: 'var(--brand-2)',
+  }));
+  card.appendChild(progressRow({
+    label: '钠', totals: nutrientTotals(dayItems, 'sodium'), targets: t.sodium && t.sodium.mg,
+    unit: ' mg', kind: 'limit', color: 'var(--brand-2)',
+  }));
+  const basis = basisText(t.basis);
+  if (basis) card.appendChild(el('div', { className: 'muted', text: basis }));
+  return card;
 }
 
 /** 顶部备份提醒条：--warn 系配色，导出成功后自己消失；关闭只作用于当前这次渲染，不写进设置。 */
@@ -91,28 +270,38 @@ function backupBar(status) {
 }
 
 /**
- * 膳食纤维一行（用户决策：只显示摄取量，不设每日目标 —— 所以这里没有进度条、没有 target）。
- * 缺数据的条目不参与累加，但必须说出来：一个不声不响的和会让人以为这就是全部摄入。
- * 文案口径与 views/food.js 的 fiberSummaryText() 一致（两页说同一件事，用户不会看到两种解释）。
+ * 只累加有已知值的条目，并把「有多少条缺数据」一起带出来。
+ * known = 0 时 value 是 null —— 界面据此说「暂无数据」，而不是报一个看起来像「一点都没吃」的 0。
  */
-function fiberRow(items) {
+function nutrientTotals(items, key) {
   let total = 0;
   let known = 0;
   let sum = 0;
   for (const item of Array.isArray(items) ? items : []) {
     if (!item || typeof item !== 'object') continue;
     total += 1;
-    if (item.fiber == null || !Number.isFinite(Number(item.fiber))) continue;
+    const raw = item[key];
+    if (raw == null || !Number.isFinite(Number(raw))) continue;
     known += 1;
-    sum += Number(item.fiber);
+    sum += Number(raw);
   }
+  return { value: known ? round1(sum) : null, known, total, missing: total - known };
+}
+
+/**
+ * 膳食纤维一行（宏量营养素卡里的「当日摄取」口径：只报摄取量，进度在「每日目标」卡里给）。
+ * 缺数据的条目不参与累加，但必须说出来：一个不声不响的和会让人以为这就是全部摄入。
+ * 文案口径与 views/food.js 的 fiberSummaryText() 一致（两页说同一件事，用户不会看到两种解释）。
+ */
+function fiberRow(items) {
+  const { value, known, total } = nutrientTotals(items, 'fiber');
   if (!total) return null;
-  const value = known ? `${fmt1(round1(sum))} g` : '暂无数据';
+  const shown = value == null ? '暂无数据' : `${fmt1(value)} g`;
   const note = !known ? '食物库暂无纤维数据' : total > known ? '部分食物无数据' : '';
   return el('div', { className: 'col macro' },
     el('div', { className: 'row row--between' },
       el('span', { className: 'label', text: '膳食纤维' }),
-      el('span', { className: 'macro__nums' }, el('span', { className: 'strong', text: value })),
+      el('span', { className: 'macro__nums' }, el('span', { className: 'strong', text: shown })),
     ),
     note ? el('div', { className: 'muted', text: note }) : null,
   );
@@ -128,14 +317,21 @@ function statBlock(label, value, unit) {
   );
 }
 
-export async function render(root) {
+/**
+ * targets 只用于测试注入（钉住「读数全部来自 currentDailyTargets()」这条契约）；
+ * 生产路径不传，走 store.currentDailyTargets()。
+ */
+export async function render(root, options = {}) {
   const date = localDateStr();
-  const [summary, goals, weights, settings, exportState] = await Promise.all([
+  const injected = options && 'targets' in options ? options.targets : undefined;
+  const [summary, goals, weights, settings, exportState, targets] = await Promise.all([
     daySummary(date),
     getGoals(),
     recentWeights(30),
     getSettings(),
     exportStatus(),
+    // 目标只读 + 失败降级：取不到就画一句说明，不让异常冒到渲染外面（今日页其余部分照常）。
+    injected !== undefined ? Promise.resolve(injected) : dailyTargetsOrNull(),
   ]);
   // 体重只按「设置里的单位」显示；库里始终是 kg，差值同样要换算（0.1kg = 0.2斤）。
   const weightUnit = settings && settings.weightUnit === 'jin' ? 'jin' : 'kg';
@@ -194,9 +390,7 @@ export async function render(root) {
     ),
   ));
 
-  const macroTargets = targetMacros(calorieTarget, {
-    carb: goals.carbPct, protein: goals.proteinPct, fat: goals.fatPct,
-  });
+  const macroTargets = targetMacroGrams(targets, goals);
   root.appendChild(el('div', { className: 'card col' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
       el('div', { className: 'card__title', text: '宏量营养素' }),
@@ -206,6 +400,10 @@ export async function render(root) {
     macroRow({ label: '脂肪', value: intake.fat, target: macroTargets.fat, color: 'var(--fat)' }),
     fiberRow(dayItems),
   ));
+
+  // 每日目标（比例 + 克数 + 纤维 / 钠进度 + 推算依据）：口径与克数一律取自 currentDailyTargets()，
+  // 这里不重算 BM / TDEE，也不再存第二套目标。
+  root.appendChild(targetCard(targets, dayItems));
 
   // 体重卡：没有数据时给下一步按钮，避免用户看死胡同。
   const stats = weightStats(Array.isArray(weights) ? weights : []);
