@@ -183,8 +183,8 @@ export async function clearAllData(): Promise<void>    // 业务数据 + photos�
 //    { id, name, kind: 'meal'|'day', slot?, items?, meals?: [{ slot, items }] }
 //    kind='meal' 走 slot+items；kind='day' 走 meals（≥2 餐，用于「整日一键」）
 export async function getMealTemplates(): Promise<Template[]>       // 脏数据过滤，绝不抛；老数据（无 kind）归一为 kind='meal'
-export async function saveMealTemplate({ name, slot, items }): Promise<Template>  // 同名覆盖并保留 id；空名抛「套餐名称不能为空」
-export async function saveDayTemplate({ name, meals }): Promise<Template>         // 整日套餐：meals 归一化后少于 2 餐抛「整日套餐至少要两餐」
+export async function saveMealTemplate({ id?, name, slot, items }): Promise<Template>  // 同名覆盖并保留 id；空名抛「套餐名称不能为空」
+export async function saveDayTemplate({ id?, name, meals }): Promise<Template>         // 整日套餐：meals 归一化后少于 2 餐抛「整日套餐至少要两餐」
 export async function deleteMealTemplate(id): Promise<void>                       // 通吃两种
 export async function recentFoodItems(limit = 12): Promise<Array<{ name, lastDate, slot, item }>>
 //  只取最近 200 条 meals；按 item.name（trim 后）去重，保留最后一次出现的信息；limit 在去重后生效
@@ -475,7 +475,7 @@ body：
 
 ### v1.7 · 2026-10-21 · 整日套餐与三处交互收敛
 - **数据**：`Template` 增加 `kind: 'meal' | 'day'`；`kind='day'` 用 `meals: [{ slot, items }]`（≥2 餐）。
-  新增 `saveDayTemplate({ name, meals })`；`getMealTemplates()` 把老数据（只有 slot/items）归一为 `kind='meal'`，
+  新增 `saveDayTemplate({ id?, name, meals })`；`getMealTemplates()` 把老数据（只有 slot/items）归一为 `kind='meal'`，
   用户不需要重存。`deleteMealTemplate` 通吃两种。
 - **交互**（用户反馈）：
   1. 手动添加弹层：**搜索框移到最上**，「最近吃过」默认折叠成一行 `最近吃过 (8)`，点开才展开；

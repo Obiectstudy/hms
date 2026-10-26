@@ -1080,6 +1080,187 @@ function testMealTemplatePure() {
     eq('meals' in asMeal.template, false);
   });
 
+  check('planDayTemplateSave 带 id 原地更新：条数不变、位置不变、id 与 createdAt 保留', () => {
+    const existing = [
+      { id: 'a', name: '早餐套餐', slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }], createdAt: 111 },
+      {
+        id: 'd1',
+        name: '工作日常餐',
+        kind: 'day',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '牛奶', grams: 250, kcal: 140 }] },
+          { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+        ],
+        createdAt: 222,
+      },
+      { id: 'c', name: '加餐', slot: 'snack', items: [], createdAt: 333 },
+    ];
+    const out = pure.planDayTemplateSave(existing, {
+      id: 'd1',
+      name: '工作日常餐',
+      meals: [
+        { slot: 'lunch', items: [{ name: '鸡胸肉', grams: 100, kcal: 133 }] },
+        { slot: 'dinner', items: [{ name: '西兰花', grams: 200, kcal: 68 }] },
+        { slot: 'snack', items: [{ name: '酸奶', grams: 100, kcal: 72 }] },
+      ],
+    }, 999);
+
+    eq(out.templates.length, 3, '原地更新不该改变条数');
+    deep(out.templates.map((t) => t.id), ['a', 'd1', 'c'], '原地更新不该改变顺序');
+    eq(out.templates[1].id, 'd1', '原地更新必须保留原 id');
+    eq(out.templates[1].createdAt, 222, '原地更新必须保留原 createdAt');
+    eq(out.templates[1].kind, 'day');
+    eq('slot' in out.templates[1], false, '整日套餐不应带单餐 slot 键');
+    deep(out.templates[1].meals.map((m) => m.slot), ['lunch', 'dinner', 'snack'], 'meals 应被整体替换');
+    eq(out.templates[1].meals[0].items[0].name, '鸡胸肉');
+    eq(out.templates[0].createdAt, 111, '相邻套餐不受影响');
+    eq(out.templates[0].kind, 'meal');
+    eq(out.template.id, 'd1');
+    eq(out.template.createdAt, 222);
+    deep(out.template, out.templates[1], '返回的 template 应与落库那一条一致');
+
+    // 数字 id 与字符串 id 是同一条：两边都 String(id).trim() 后比对
+    const numericStored = pure.planDayTemplateSave(
+      [{
+        id: 111,
+        name: '整日',
+        kind: 'day',
+        meals: [
+          { slot: 'lunch', items: [{ name: '米饭', kcal: 174 }] },
+          { slot: 'dinner', items: [{ name: '面', kcal: 200 }] },
+        ],
+        createdAt: 111,
+      }],
+      {
+        id: '111',
+        name: '整日改',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '包子', kcal: 220 }] },
+          { slot: 'dinner', items: [{ name: '面', kcal: 200 }] },
+        ],
+      },
+      999,
+    );
+    eq(numericStored.templates.length, 1, '数字 id 存、字符串 id 传，应命中同一条');
+    eq(numericStored.template.id, '111');
+    eq(numericStored.template.createdAt, 111, '命中同一条时 createdAt 同样保留');
+    eq(numericStored.template.name, '整日改');
+  });
+
+  check('planDayTemplateSave 带 id：命中 id 指向的那一条，不退化成同名覆盖', () => {
+    const two = () => [
+      { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+      { slot: 'dinner', items: [{ name: '青菜', grams: 200, kcal: 30 }] },
+    ];
+    const existing = [
+      { id: 'd1', name: '旧名字', kind: 'day', meals: two(), createdAt: 222 },
+      { id: 'd2', name: '别的日子', kind: 'day', meals: two(), createdAt: 333 },
+    ];
+
+    // 改了名字也必须命中 id 那一条：不然「编辑顺手改名」会派生出一条新套餐，旧记录永远删不掉
+    const renamed = pure.planDayTemplateSave(existing, { id: 'd1', name: '新名字', meals: two() }, 999);
+    eq(renamed.templates.length, 2, '按 id 原地更新，不该新增一条');
+    eq(renamed.templates[0].id, 'd1', '命中的是 id 指向的那一条');
+    eq(renamed.templates[0].name, '新名字');
+    eq(renamed.templates[0].createdAt, 222, '改名也保留原 createdAt');
+    eq(renamed.templates[1].id, 'd2', '不是命中目标的同名套餐不能被动到');
+    eq(renamed.templates[1].name, '别的日子');
+
+    // 脏数据里出现重名时，命中的同样必须是 id 指向的那一条（不是数组里第一个同名的）
+    const dupes = [
+      { id: 'x1', name: '撞名', kind: 'day', meals: two(), createdAt: 1 },
+      { id: 'x2', name: '撞名', kind: 'day', meals: two(), createdAt: 2 },
+    ];
+    const hitSecond = pure.planDayTemplateSave(dupes, { id: 'x2', name: '撞名', meals: two() }, 999);
+    eq(hitSecond.templates.length, 2, '重名时按 id 命中，不该新增');
+    eq(hitSecond.template.id, 'x2', '重名时命中的必须是 id 指向的那一条');
+    eq(hitSecond.templates[1].createdAt, 2);
+    eq(hitSecond.templates[0].createdAt, 1, '另一个同名的套餐不能被动到');
+
+    // 空白 id 视同没有 id：不能把 '' 当成一个真 id 去命中空 id 记录
+    const blankId = pure.planDayTemplateSave(
+      [{ id: 'd1', name: '整日', kind: 'day', meals: two(), createdAt: 222 }],
+      { id: '   ', name: '新整日', meals: two() },
+      777,
+    );
+    eq(blankId.templates.length, 2, '空白 id 应走新建路径');
+    eq(blankId.template.id, '777');
+  });
+
+  check('planDayTemplateSave 带 id：空餐丢弃、脏条目归一化，丢到不足两餐照旧抛中文错', () => {
+    const two = () => [
+      { slot: 'breakfast', items: [{ name: '牛奶', grams: 250, kcal: 140 }] },
+      { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+    ];
+    const existing = [{ id: 'd1', name: '工作日常餐', kind: 'day', meals: two(), createdAt: 222 }];
+
+    // 空 items 的餐次与全是非对象条目的餐次都直接丢弃；非法 slot 回退 snack；脏条目不进落库数据
+    const out = pure.planDayTemplateSave(existing, {
+      id: 'd1',
+      name: '工作日常餐',
+      meals: [
+        { slot: 'lunch', items: [{ name: '鸡胸肉', grams: 100, kcal: 133 }] },
+        { slot: 'dinner', items: [] },
+        { slot: 'brunch', items: [{ name: '酸奶', grams: 100, kcal: 72 }, null, 'oops'] },
+      ],
+    }, 999);
+    eq(out.templates.length, 1, '空餐丢弃不该让套餐从列表里消失');
+    eq(out.template.id, 'd1');
+    eq(out.template.createdAt, 222);
+    deep(out.template.meals.map((m) => m.slot), ['lunch', 'snack'], '空餐丢弃、非法 slot 回退 snack');
+    deep(out.template.meals[1].items.map((i) => i.name), ['酸奶'], '非对象条目不进落库数据');
+
+    // 丢到只剩一餐：整日套餐的既有下限不变，照旧抛中文错（视图层必须替用户挡住这一步）
+    let msg = '';
+    try {
+      pure.planDayTemplateSave(out.templates, {
+        id: 'd1',
+        name: '工作日常餐',
+        meals: [{ slot: 'lunch', items: [{ name: '鸡胸肉', grams: 100, kcal: 133 }] }],
+      }, 999);
+    } catch (err) {
+      msg = err.message;
+    }
+    eq(msg, '整日套餐至少要两餐', '原地更新同样受「至少要两餐」约束');
+
+    // 抛错的那一次没有留下半成品：再存一次两餐，读出来仍是原地那一条、createdAt 没被冲掉
+    const back = pure.planDayTemplateSave(out.templates, {
+      id: 'd1',
+      name: '工作日常餐',
+      meals: [
+        { slot: 'lunch', items: [{ name: '鸡胸肉', grams: 100, kcal: 133 }] },
+        { slot: 'dinner', items: [{ name: '青菜', grams: 200, kcal: 30 }] },
+      ],
+    }, 999);
+    eq(back.templates.length, 1);
+    eq(back.template.id, 'd1');
+    eq(back.template.createdAt, 222, '失败的那次不该把 createdAt 冲掉');
+  });
+
+  check('planDayTemplateSave 无 id / id 不存在时仍是老语义（同名覆盖 / 新建）', () => {
+    const two = () => [
+      { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+      { slot: 'dinner', items: [{ name: '青菜', grams: 200, kcal: 30 }] },
+    ];
+    const existing = [{ id: 'd1', name: '工作日常餐', kind: 'day', meals: two(), createdAt: 222 }];
+
+    const byName = pure.planDayTemplateSave(existing, { name: '工作日常餐', meals: two() }, 2000);
+    eq(byName.templates.length, 1, '无 id 时同名覆盖语义不变');
+    eq(byName.template.id, 'd1', '同名覆盖仍保留原 id');
+    eq(byName.template.createdAt, 222, '同名覆盖也保留原 createdAt');
+
+    const missingId = pure.planDayTemplateSave(existing, { id: '不存在', name: '新整日', meals: two() }, 2000);
+    eq(missingId.templates.length, 2, 'id 不存在 → 新建');
+    eq(missingId.template.id, '2000', '新建沿用时间戳 id 语义');
+    eq(missingId.template.createdAt, 2000, '新建整日套餐要带 createdAt 时间戳');
+    eq(missingId.templates[0].name, '工作日常餐', '新建不该动到既有套餐');
+
+    const noId = pure.planDayTemplateSave(existing, { name: '又一个整日', meals: two() }, 3000);
+    eq(noId.templates.length, 2);
+    eq(noId.template.name, '又一个整日');
+    eq('slot' in noId.template, false, '整日套餐不带单餐 slot');
+  });
+
   check('planMealTemplateSave 带 id 原地更新：条数不变、位置不变、id 与 createdAt 保留', () => {
     const existing = [
       { id: 'a', name: '早餐', slot: 'breakfast', items: [{ name: '鸡蛋', grams: 60, kcal: 90 }], createdAt: 111 },
@@ -2403,9 +2584,71 @@ async function testMealTemplateInPlaceStore() {
       eq((await store.getMealTemplates()).length, 1);
     });
   });
+
+  await checkAsync('store: saveDayTemplate 透传 id → 原地更新（条数不变、id/createdAt/位置保留）', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      deep(await store.getMealTemplates(), []);
+
+      const two = () => [
+        { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+        { slot: 'dinner', items: [{ name: '青菜', grams: 200, kcal: 30 }] },
+      ];
+      const d1 = await store.saveDayTemplate({ name: '整日甲', meals: two() });
+      const d2 = await store.saveDayTemplate({ name: '整日乙', meals: two() });
+      eq((await store.getMealTemplates()).length, 2);
+      ok(Number.isFinite(d1.createdAt), '新建整日套餐应带 createdAt');
+
+      const before = await store.getMealTemplates();
+      const updated = await store.saveDayTemplate({
+        id: d1.id,
+        name: '整日甲改',
+        meals: [
+          { slot: 'breakfast', items: [{ name: '包子', grams: 100, kcal: 220 }] },
+          { slot: 'dinner', items: [] },
+          { slot: 'snack', items: [{ name: '酸奶', grams: 100, kcal: 72 }] },
+        ],
+      });
+      const after = await store.getMealTemplates();
+
+      eq(after.length, 2, '原地更新不该新增条数');
+      eq(updated.id, d1.id, '返回的 id 必须是原 id');
+      eq(updated.createdAt, d1.createdAt, '原地更新必须保留 createdAt');
+      eq(updated.name, '整日甲改');
+      eq(updated.kind, 'day');
+      deep(updated.meals.map((m) => m.slot), ['breakfast', 'snack'], '空餐次在落库前被剔除');
+      eq(after[0].id, before[0].id, '位置不变');
+      eq(after[0].createdAt, before[0].createdAt);
+      eq(after[0].name, '整日甲改');
+      eq(after[1].id, d2.id, '其它套餐不受影响');
+      eq(after[1].name, '整日乙');
+      deep(after.find((t) => t.id === d1.id), updated, '落库读回应与返回值一致');
+
+      await store.deleteMealTemplate(d1.id);
+      await store.deleteMealTemplate(d2.id);
+      deep(await store.getMealTemplates(), []);
+    });
+  });
+
+  await checkAsync('store: saveDayTemplate 的 id 不存在时新建，不会顶掉别人', async () => {
+    if (!IDB_ABSENT) return;
+    await withFakeIdb(async () => {
+      const two = () => [
+        { slot: 'lunch', items: [{ name: '米饭', grams: 150, kcal: 174 }] },
+        { slot: 'dinner', items: [{ name: '青菜', grams: 200, kcal: 30 }] },
+      ];
+      const d1 = await store.saveDayTemplate({ name: '整日甲', meals: two() });
+      const fresh = await store.saveDayTemplate({ id: '早就删掉的 id', name: '整日丙', meals: two() });
+      const after = await store.getMealTemplates();
+      eq(after.length, 2, 'id 不存在 → 新建');
+      ok(after.some((t) => t.id === d1.id), '既有套餐不能被顶掉');
+      ok(fresh.id !== '早就删掉的 id', '不存在的 id 不该被当成真 id 写进去');
+      eq(new Set(after.map((t) => t.id)).size, 2, 'id 必须唯一');
+    });
+  });
 }
 
-// ---------- 设置页：作息偏移控件的取值契约 ----------
+// ---------- 设置页：作息偏移控件的取值契约 ---------
 
 async function testSlotOffsetUiContract() {
   await checkAsync('设置页作息偏移控件：档位都是 -180..240 的整数分钟且含「不偏移」', async () => {

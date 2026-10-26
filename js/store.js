@@ -356,11 +356,12 @@ export async function saveMealTemplate({ id, name, slot, items } = {}) {
 
 /**
  * 整日套餐（一键记一整天的多餐）。与单餐套餐共用 mealTemplates 这一个 meta 键、
- * 同一套同名覆盖语义；meals 归一化后不足 2 餐或空名抛中文错误。
+ * 同一套同名覆盖语义；带 id 且命中已有套餐时**原地更新那一条**（id/createdAt/位置都不变）。
+ * meals 归一化后不足 2 餐或空名抛中文错误；id 不存在时照旧新建，向后兼容。
  */
-export async function saveDayTemplate({ name, meals } = {}) {
+export async function saveDayTemplate({ id, name, meals } = {}) {
   const existing = await getMealTemplates();
-  const { templates, template } = planDayTemplateSave(existing, { name, meals });
+  const { templates, template } = planDayTemplateSave(existing, { id, name, meals });
   await db.setMeta(MEAL_TEMPLATES_KEY, templates);
   return template;
 }

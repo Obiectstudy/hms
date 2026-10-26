@@ -573,6 +573,26 @@ export function templateEditPayload(template, items) {
   };
 }
 
+/**
+ * 整日套餐的保存参数：与单餐套餐同一份契约 —— 带 id 交给数据层「原地更新原套餐」。
+ * 编辑层允许把某一餐删到 0 项，但落库的套餐不留空餐次（与 normalizeDayMeals 同一口径），
+ * 所以空餐在这里就被丢掉；全空时 meals 为空数组，由调用方当场拒绝保存。
+ * 套餐名沿用原套餐：编辑界面只改每一餐的条目，顺手改名会变成「改了名字的另一个套餐」。
+ */
+export function dayTemplateEditPayload(template, meals) {
+  const t = template && typeof template === 'object' ? template : {};
+  const out = [];
+  for (const meal of Array.isArray(meals) ? meals : []) {
+    if (!meal || typeof meal !== 'object') continue;
+    const items = (Array.isArray(meal.items) ? meal.items : [])
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => ({ ...item }));
+    if (!items.length) continue;
+    out.push({ slot: meal.slot, items });
+  }
+  return { id: t.id, name: t.name, meals: out };
+}
+
 /** 编辑层里的一行：条目名 + 营养（含纤维）+ 删。 */
 function renderTemplateEditRow(item, onRemove) {
   return el('div', { className: 'list__item item-row' },
@@ -591,7 +611,7 @@ function renderTemplateEditRow(item, onRemove) {
 /**
  * 编辑套餐：删条目 / 加食物，保存时按 id 原地覆盖原套餐。
  * 原地覆盖没有退路（数据层不留旧版本），所以标题、说明与保存前的二次确认三处都要说清这一点。
- * 整日套餐（kind === 'day'）不走这里：它没有 items，保存接口也是另一套。
+ * 整日套餐（kind === 'day'）不走这里：它没有 items，改的是每一餐（见 editDayTemplateFlow）。
  */
 async function editTemplateFlow(template, reload) {
   // 只留能渲染的对象条目：脏记录进不了编辑层，也就不会原样写回去。
@@ -668,6 +688,149 @@ async function editTemplateFlow(template, reload) {
 }
 
 /**
+ * 编辑整日套餐：删条目 / 每餐加食物 / 删整餐，保存时按 id 原地覆盖原套餐。
+ * 与单餐套餐同一套语义（见 editTemplateFlow）：弹层里不放 actions，空套餐在弹层内直接拒绝，
+ * 保存前二次确认说清「覆盖，不另存一份」。
+ * 某一餐被删到 0 项时餐块先留在层里（用户还能往这一餐加回来），保存时由 dayTemplateEditPayload
+ * 丢弃 —— 落库的套餐里不留空餐次，与全站「不留空餐次」一致。
+ */
+async function editDayTemplateFlow(template, reload) {
+  // 每餐一份可编辑副本：脏记录（非对象条目）进不了编辑层，也就不会原样写回去。
+  const meals = (Array.isArray(template.meals) ? template.meals : [])
+    .filter((meal) => meal && typeof meal === 'object')
+    .map((meal) => ({
+      slot: meal.slot,
+      items: (Array.isArray(meal.items) ? meal.items : [])
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => ({ ...item })),
+    }));
+
+  const action = await openSheet({
+    title: `编辑整日套餐 · ${template.name}`,
+    actions: [],
+    content: ({ close }) => {
+      const mealBox = el('div', { className: 'col' });
+      const totalNode = el('div', { className: 'muted' });
+
+      // 重画整层：每餐一个块（餐次标题 + 删整餐 / 条目行 + 删 / 加食物）。
+      // 用到的 removeItem / removeMeal / addFood 在下面定义，重画时一定已经就绪。
+      const repaint = () => {
+        clear(mealBox);
+        for (const meal of meals) {
+          const rows = el('div', { className: 'list' });
+          meal.items.forEach((item, index) => {
+            // index 始终是这一餐原始 items 数组里的位置 —— 与餐卡列表直删/「修改」面板同一套索引语义。
+            rows.appendChild(renderTemplateEditRow(item, () => {
+              removeItem(meal, index).catch((err) => toast(`删除失败：${err && err.message ? err.message : err}`, 'error'));
+            }));
+          });
+          mealBox.appendChild(el('div', { className: 'col day-meal' },
+            el('div', { className: 'row day-meal__head' },
+              el('span', { className: 'strong', text: slotLabel(meal.slot) }),
+              el('button', {
+                className: 'btn btn--ghost btn--sm btn--danger',
+                type: 'button',
+                text: '删整餐',
+                attr: { 'aria-label': `从套餐里删掉${slotLabel(meal.slot)}` },
+                onClick: () => { removeMeal(meal).catch((err) => toast(`删除失败：${err && err.message ? err.message : err}`, 'error')); },
+              }),
+            ),
+            rows,
+            el('button', {
+              className: 'btn btn--ghost btn--block',
+              type: 'button',
+              text: '加食物',
+              attr: { 'aria-label': `往${slotLabel(meal.slot)}加一样食物` },
+              onClick: () => { addFood(meal).catch((err) => toast(`添加失败：${err && err.message ? err.message : err}`, 'error')); },
+            }),
+            el('div', { className: 'divider' }),
+          ));
+        }
+        if (!meals.length) {
+          mealBox.appendChild(el('div', { className: 'empty', text: '所有餐次都被删掉了：整日套餐至少要留一餐才能保存。' }));
+        }
+        const items = [];
+        for (const meal of meals) for (const item of meal.items) items.push(item);
+        totalNode.textContent = `共 ${meals.length} 餐 · ${items.length} 项 · ${fmtKcal(sumItems(items).kcal)} kcal`;
+      };
+
+      // 删条目：确认框与提示文案沿用全站那一套（confirmRemoveItem），删除只改这一层，
+      // 落库发生在「保存到原套餐」之后。
+      const removeItem = async (meal, index) => {
+        const items = meal.items;
+        const item = items[index];
+        // 脏记录防御：非对象条目没有可删的内容，提示一句就退（索引仍是原始数组位置）。
+        if (!item || typeof item !== 'object') {
+          toast('这一项读不出来，刷新后再试', 'error');
+          return;
+        }
+        if (!(await confirmRemoveItem(item, index, items))) return;
+        items.splice(index, 1);
+        repaint();
+      };
+
+      // 删整餐：二次确认与餐卡列表同源；删到一餐不剩时保存会被拒绝（数据层也守着「至少要两餐」）。
+      const removeMeal = async (meal) => {
+        if (!(await confirmRemoveMeal(meal))) return;
+        const index = meals.indexOf(meal);
+        if (index >= 0) meals.splice(index, 1);
+        repaint();
+      };
+
+      // 加食物：复用既有的食物搜索弹层，选中的条目直接进这一餐，保存时才落库。
+      const addFood = async (meal) => {
+        const pick = await openPickFoodSheet({ title: `加进${slotLabel(meal.slot)}` });
+        if (!pick || !pick.item) return;
+        meal.items.push(pick.item);
+        repaint();
+      };
+
+      repaint();
+
+      // 保存按钮放在内容里而不是 openSheet 的 actions 上：空套餐时要在弹层内直接拒绝，
+      // 不能一点就把弹层关掉（actions 一旦被点就 resolve 收摊，没有挽回的余地）。
+      const saveBtn = el('button', { className: 'btn btn--primary btn--block', text: '保存到原套餐' });
+      saveBtn.addEventListener('click', async () => {
+        // 保存参数由唯一的纯函数产出：某一餐删到 0 项在这里被丢弃，全空则当场拒绝（不写库、不关层）。
+        const payload = dayTemplateEditPayload(template, meals);
+        if (!payload.meals.length) {
+          toast('整日套餐至少要留一餐，空套餐不能保存', 'error');
+          return;
+        }
+        const ok = await confirmDialog({
+          title: '更新原套餐？',
+          message: `「${template.name}」会被这 ${payload.meals.length} 餐覆盖，原套餐不会另存一份。`,
+          okText: '更新',
+        });
+        if (!ok) return;
+        saveBtn.disabled = true;
+        saveBtn.textContent = '保存中…';
+        try {
+          await saveDayTemplate(payload);
+          toast(`整日套餐已更新 · ${template.name}`, 'ok');
+          close('saved');
+          await reload();
+        } catch (err) {
+          toast(`保存整日套餐失败：${err && err.message ? err.message : err}`, 'error');
+          saveBtn.disabled = false;
+          saveBtn.textContent = '保存到原套餐';
+        }
+      });
+
+      return el('div', { className: 'col' },
+        el('div', { className: 'muted', text: '保存后原套餐会被更新（不会另存一份），先确认每一餐的条目再保存。' }),
+        el('div', { className: 'divider' }),
+        mealBox,
+        totalNode,
+        saveBtn,
+        el('button', { className: 'btn btn--ghost btn--block', text: '取消', onClick: () => close(null) }),
+      );
+    },
+  });
+  return action;
+}
+
+/**
  * 常吃套餐横条：单餐与整日两类共用一行。
  * 一个套餐都没有时不能整块消失：当天已有 ≥2 餐的话，「把今天存为整日套餐」正是新用户
  * 要做的第一个动作，藏起来等于没有入口——这时标题改成「整日套餐」并只留那个入口，
@@ -692,13 +855,19 @@ function renderTemplateCard(templates, date, reload, dayMealCount) {
         el('span', { className: 'tpl-chip__kcal', text: `${fmtKcal(templateKcal(template))} kcal` }),
         sub ? el('span', { className: 'tpl-chip__sub', text: sub }) : null,
       ),
-      // 只有单餐套餐能原地编辑：整日套餐没有 items，保存接口也是另一套。
-      isDay ? null : el('button', {
+      // 两类套餐都能原地编辑：单餐改 items，整日改每一餐的 meals（各自一套保存接口）。
+      el('button', {
         className: 'btn btn--ghost btn--sm',
         type: 'button',
         text: '编辑',
-        attr: { 'aria-label': `编辑套餐 ${template.name}` },
-        onClick: () => { editTemplateFlow(template, reload).catch((err) => toast(`编辑套餐失败：${err && err.message ? err.message : err}`, 'error')); },
+        attr: { 'aria-label': `${isDay ? '编辑整日套餐' : '编辑套餐'} ${template.name}` },
+        onClick: () => {
+          if (isDay) {
+            editDayTemplateFlow(template, reload).catch((err) => toast(`编辑整日套餐失败：${err && err.message ? err.message : err}`, 'error'));
+            return;
+          }
+          editTemplateFlow(template, reload).catch((err) => toast(`编辑套餐失败：${err && err.message ? err.message : err}`, 'error'));
+        },
       }),
       el('button', {
         className: 'tpl-chip__del',
@@ -1233,6 +1402,18 @@ function confirmRemoveItem(item, index, items) {
 }
 
 /**
+ * 删整餐的二次确认：餐卡列表与整日套餐编辑层共用这一份文案 ——
+ * 两处说同一句话，改文案只改这一个地方，不会只改到一边。
+ */
+function confirmRemoveMeal(meal) {
+  return confirmDialog({
+    title: '删除这一餐？',
+    message: `${slotLabel(meal && meal.slot)} · ${((meal && meal.items) || []).length} 项`,
+    okText: '删除',
+  });
+}
+
+/**
  * 餐卡列表上的直删：删一条不用先打开「修改」面板。
  * 二次确认与面板内删除同源，删除本身也走同一个 removeMealItem ——
  * 「删最后一项连整餐一起删」的提示因此不可能出现两种说法。
@@ -1372,11 +1553,8 @@ function renderMealCard(meal, reload) {
         el('button', {
           className: 'btn btn--ghost btn--sm btn--danger', text: '删整餐',
           onClick: async () => {
-            const ok = await confirmDialog({
-              title: '删除这一餐？',
-              message: `${slotLabel(meal.slot)} · ${(meal.items || []).length} 项`,
-              okText: '删除',
-            });
+            // 二次确认与整日套餐编辑层里的「删整餐」同源（confirmRemoveMeal），文案不会出现两种说法。
+            const ok = await confirmRemoveMeal(meal);
             if (!ok) return;
             try {
               await deleteMeal(meal.id);

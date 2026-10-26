@@ -2328,6 +2328,21 @@ await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不�
       assert.ok(sheet && sheet.textOf().includes('编辑套餐 · ' + name), '编辑层没打开：' + (sheet ? sheet.textOf().slice(0, 100) : '没有弹层'));
       return sheet;
     };
+    /** 打开某个整日套餐的编辑层：chip 上的「编辑」→ 弹层。返回弹层节点。 */
+    const openDayTemplateEditor = async (name) => {
+      const root = await renderView('food');
+      const chip = byClass(root, 'tpl-chip').find((n) => n.textOf().includes(name));
+      assert.ok(chip, '整日套餐 chip 里找不到「' + name + '」（chip 上限 6 个，或套餐没落库）');
+      const btn = findButton(chip, '编辑');
+      assert.ok(btn, '整日套餐「' + name + '」没有编辑入口');
+      fireClick(btn);
+      await tick(140);
+      const sheet = topSheet();
+      assert.ok(sheet && sheet.textOf().includes('编辑整日套餐 · ' + name), '整日套餐编辑层没打开：' + (sheet ? sheet.textOf().slice(0, 100) : '没有弹层'));
+      return sheet;
+    };
+    /** 编辑层里的某一餐块：每餐一个 day-meal，按餐次标题定位（找不到返回 null）。 */
+    const dayMealBlock = (sheet, label) => (sheet ? byClass(sheet, 'day-meal').find((n) => n.textOf().includes(label)) || null : null);
 
     await checkAsync('food 套餐 chip：单餐套餐有「编辑」入口，编辑层说明会更新原套餐', async () => {
       clearCaseOverlays();
@@ -2497,23 +2512,336 @@ await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不�
       }
     });
 
-    await checkAsync('food 套餐编辑：整日套餐不给「编辑」入口（保存接口不是同一套）', async () => {
+    await checkAsync('food 套餐编辑：整日套餐也有「编辑」入口，打开的是整日套餐编辑层（保存接口是 saveDayTemplate）', async () => {
       clearCaseOverlays();
-      const name = '整日套餐不可编辑';
+      const name = '整日套餐可编辑';
       await mealTemplateDrop(name);
       await store.saveDayTemplate({ name, meals: [
-        { slot: 'breakfast', items: [{ name: '整日早', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
-        { slot: 'lunch', items: [{ name: '整日午', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+        { slot: 'breakfast', items: [{ name: '整日早项', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '整日午项', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
       ] });
       try {
         const root = await renderView('food');
         const chip = byClass(root, 'tpl-chip').find((n) => n.textOf().includes(name));
         assert.ok(chip, '整日套餐 chip 没有渲染');
-        assert.equal(findButton(chip, '编辑'), undefined, '整日套餐出现了「编辑」入口');
+        assert.ok(findButton(chip, '编辑'), '整日套餐没有「编辑」入口');
         assert.ok(chip.walk().some((n) => String(n.className).split(/\s+/).includes('tpl-chip__del')), '整日套餐的删除入口不见了');
+        fireClick(findButton(chip, '编辑'));
+        await tick(140);
+        const sheet = topSheet();
+        assert.ok(sheet, '点「编辑」没有打开整日套餐编辑层');
+        assert.ok(sheet.textOf().includes('编辑整日套餐 · ' + name), '打开的编辑层标题不对：' + sheet.textOf().slice(0, 90));
+        assert.equal(byClass(sheet, 'day-meal').length, 2, '编辑层没有按模板里的餐次数渲染');
+        fireClick(findButton(sheet, '取消'));
+        await tick(80);
+        assert.ok(!topSheet(), '取消后编辑层没有关闭');
       } finally {
         await mealTemplateDrop(name);
       }
+    });
+
+    await checkAsync('food 整日套餐 chip：「编辑」入口 + 编辑层按餐次列出条目', async () => {
+      clearCaseOverlays();
+      const name = '整日编辑入口';
+      await mealTemplateDrop(name);
+      await store.saveDayTemplate({ name, meals: [
+        { slot: 'breakfast', items: [{ name: '早项', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '午项', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] });
+      try {
+        const root = await renderView('food');
+        const chip = byClass(root, 'tpl-chip').find((n) => n.textOf().includes(name));
+        assert.ok(chip, '整日套餐 chip 没有渲染');
+        const editBtn = findButton(chip, '编辑');
+        assert.ok(editBtn, '整日套餐 chip 上没有「编辑」入口');
+        assert.ok(editBtn.className.includes('btn--sm'), '编辑入口不是紧凑按钮：' + editBtn.className);
+        assert.ok(findButton(chip, '×'), '整日套餐 chip 上的删除入口被挤掉了');
+
+        fireClick(editBtn);
+        await tick(140);
+        const sheet = topSheet();
+        assert.ok(sheet, '点「编辑」没有打开整日套餐编辑层');
+        assert.ok(sheet.textOf().includes('编辑整日套餐 · ' + name), '编辑层标题不对：' + sheet.textOf().slice(0, 90));
+        assert.ok(sheet.textOf().includes('保存后原套餐会被更新（不会另存一份）'), '编辑层没有说明会更新原套餐：' + sheet.textOf().slice(0, 140));
+        const morning = dayMealBlock(sheet, '早餐');
+        const noon = dayMealBlock(sheet, '午餐');
+        assert.ok(morning && morning.textOf().includes('早项'), '编辑层没有按餐次列出条目（早餐）');
+        assert.ok(noon && noon.textOf().includes('午项'), '编辑层没有按餐次列出条目（午餐）');
+        assert.ok(findButton(morning, '加食物'), '早餐块缺少「加食物」入口');
+        assert.ok(findButton(noon, '加食物'), '午餐块缺少「加食物」入口');
+        assert.ok(findButton(morning, '删整餐'), '早餐块缺少「删整餐」入口');
+        assert.ok(findButton(noon, '删整餐'), '午餐块缺少「删整餐」入口');
+        const row = byClass(sheet, 'list__item').find((n) => n.textOf().includes('早项'));
+        assert.ok(row && findButton(row, '删'), '条目行缺少「删」入口');
+        fireClick(findButton(sheet, '取消'));
+        await tick(80);
+        assert.ok(!topSheet(), '取消后编辑层没有关闭');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐编辑：删条目要二次确认，保存后只更新那一餐的条目', async () => {
+      clearCaseOverlays();
+      const name = '整日删条目';
+      const A = { name: '整删A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '整删B', grams: 50, kcal: 60, carb: 6, protein: 3, fat: 2 };
+      const C = { name: '整留C', grams: 80, kcal: 88, carb: 8, protein: 4, fat: 2 };
+      await mealTemplateDrop(name);
+      const created = await store.saveDayTemplate({ name, meals: [
+        { slot: 'lunch', items: [A, B] },
+        { slot: 'dinner', items: [C] },
+      ] });
+      try {
+        const sheet = await openDayTemplateEditor(name);
+        const rowB = byClass(sheet, 'list__item').find((n) => n.textOf().includes(B.name));
+        assert.ok(rowB, '编辑层里没有条目 B');
+        fireClick(findButton(rowB, '删'));
+        await tick(80);
+        const dialog = topDialog();
+        assert.ok(dialog, '删条目没有二次确认');
+        assert.ok(dialog.textOf().includes('删除这一项？'), '删条目的确认框不是既有那套：' + dialog.textOf());
+        assert.ok(dialog.textOf().includes(B.name), '确认框没有说明删的是哪一项：' + dialog.textOf());
+        fireClick(findButton(dialog, '删除'));
+        await tick(100);
+        assert.equal(topSheet().textOf().includes(B.name), false, '确认后编辑层列表没刷新');
+
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        const saveDialog = topDialog();
+        assert.ok(saveDialog, '保存前没有二次确认');
+        assert.ok(saveDialog.textOf().includes('更新原套餐'), '确认框没有说清是更新原套餐：' + saveDialog.textOf());
+        assert.ok(saveDialog.textOf().includes('不会另存一份'), '确认框没有说清不会另存一份：' + saveDialog.textOf());
+        fireClick(findButton(saveDialog, '更新'));
+        const saved = await waitFor(async () => {
+          const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+          return hit && hit.meals.length === 2 && hit.meals[0].items.length === 1 ? hit : null;
+        });
+        assert.ok(saved, '保存后那一餐的条目没有更新');
+        assert.equal(saved.id, created.id, '保存后套餐 id 变了（不是原地更新，而是派生了一份）');
+        assert.equal((await mealTemplateByName(name)).length, 1, '保存后同名套餐出现了多份');
+        assert.deepEqual(saved.meals.map((m) => m.slot), ['lunch', 'dinner'], '另一餐不该消失');
+        assert.deepEqual(saved.meals[0].items.map((i) => i.name), [A.name], '删掉的那一项还在，或顺序不对');
+        assert.deepEqual(saved.meals[1].items.map((i) => i.name), [C.name], '别的一餐被连带改动');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐编辑：给某一餐加食物（复用食物搜索弹层），保存后追加到那一餐', async () => {
+      clearCaseOverlays();
+      const foodView = await import('../views/food.js');
+      const foodsMod = await import('../js/foods.js');
+      const target = foodsMod.FOODS.find((f) => f && f.name && f.per100g && foodView.unitsOf(f).length === 1);
+      assert.ok(target, '食物库里找不到单单位食物');
+      const name = '整日加食物';
+      await mealTemplateDrop(name);
+      await store.saveDayTemplate({ name, meals: [
+        { slot: 'breakfast', items: [{ name: '整加早项', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '整加午项', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] });
+      try {
+        const sheet = await openDayTemplateEditor(name);
+        const noon = dayMealBlock(sheet, '午餐');
+        assert.ok(noon, '编辑层里没有午餐块');
+        fireClick(findButton(noon, '加食物'));
+        await tick(180);
+        const pickSheet = topSheet();
+        assert.ok(pickSheet && pickSheet !== sheet, '点「加食物」没有调起既有的食物搜索弹层');
+        assert.ok(pickSheet.textOf().includes('加进午餐'), '搜索弹层标题没有指向那一餐：' + pickSheet.textOf().slice(0, 60));
+        await pickFoodInSheet(pickSheet, target.name);
+        const editor = topSheet();
+        assert.ok(editor && editor !== pickSheet, '选完食物后没有回到编辑层');
+        assert.ok(dayMealBlock(editor, '午餐').textOf().includes(target.name), '加完食物后那一餐没有出现新条目');
+        assert.equal(dayMealBlock(editor, '早餐').textOf().includes(target.name), false, '新食物被加到了别的餐次');
+
+        fireClick(findButton(editor, '保存到原套餐'));
+        await tick(120);
+        fireClick(findButton(topDialog(), '更新'));
+        const saved = await waitFor(async () => {
+          const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+          const lunch = hit && hit.meals.find((m) => m.slot === 'lunch');
+          return lunch && lunch.items.length === 2 ? hit : null;
+        });
+        assert.ok(saved, '加食物后没有落库');
+        assert.deepEqual(saved.meals.find((m) => m.slot === 'lunch').items.map((i) => i.name), ['整加午项', target.name], '加进去的条目顺序不对');
+        assert.equal(saved.meals.find((m) => m.slot === 'breakfast').items.length, 1, '早餐被连带改动');
+        assert.equal(saved.meals.length, 2, '餐次数不该变化');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐编辑：删整餐要二次确认，保存后那一餐从套餐里消失', async () => {
+      clearCaseOverlays();
+      const name = '整日删整餐';
+      await mealTemplateDrop(name);
+      const created = await store.saveDayTemplate({ name, meals: [
+        { slot: 'breakfast', items: [{ name: '整删早项', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '整删午项', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+        { slot: 'dinner', items: [{ name: '整删晚项', grams: 150, kcal: 180, carb: 20, protein: 12, fat: 6 }] },
+      ] });
+      try {
+        const sheet = await openDayTemplateEditor(name);
+        const dinner = dayMealBlock(sheet, '晚餐');
+        assert.ok(dinner, '编辑层里没有晚餐块');
+        fireClick(findButton(dinner, '删整餐'));
+        await tick(80);
+        const dialog = topDialog();
+        assert.ok(dialog, '删整餐没有二次确认');
+        assert.ok(dialog.textOf().includes('删除这一餐？'), '删整餐的确认框不是既有那套：' + dialog.textOf());
+        assert.ok(dialog.textOf().includes('晚餐'), '确认框没有说明删的是哪一餐：' + dialog.textOf());
+        fireClick(findButton(dialog, '删除'));
+        await tick(100);
+        assert.equal(dayMealBlock(topSheet(), '晚餐'), null, '确认后编辑层没有移除那一餐');
+        assert.ok(dayMealBlock(topSheet(), '午餐'), '别的餐次被连带删掉了');
+
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        fireClick(findButton(topDialog(), '更新'));
+        const saved = await waitFor(async () => {
+          const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+          return hit && hit.meals.length === 2 ? hit : null;
+        });
+        assert.ok(saved, '删整餐后没有落库');
+        assert.deepEqual(saved.meals.map((m) => m.slot), ['breakfast', 'lunch'], '删掉的餐次还在，或顺序不对');
+        assert.equal(saved.id, created.id, '保存后套餐 id 变了（不是原地更新）');
+        assert.equal((await mealTemplateByName(name)).length, 1, '保存后同名套餐出现了多份');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐编辑：所有餐都删光时拒绝保存（中文原因、不写库、弹层不关）', async () => {
+      clearCaseOverlays();
+      const name = '整日空套餐';
+      await mealTemplateDrop(name);
+      const created = await store.saveDayTemplate({ name, meals: [
+        { slot: 'breakfast', items: [{ name: '空早项', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '空午项', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] });
+      try {
+        await openDayTemplateEditor(name);
+        for (const label of ['早餐', '午餐']) {
+          fireClick(findButton(dayMealBlock(topSheet(), label), '删整餐'));
+          await tick(80);
+          fireClick(findButton(topDialog(), '删除'));
+          await tick(100);
+        }
+        assert.equal(byClass(topSheet(), 'day-meal').length, 0, '两餐都删完了还有餐块残留');
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(140);
+        assert.ok(!topDialog(), '空套餐不该走到二次确认');
+        assert.ok(caseToasts().some((t) => t.includes('至少要留一餐')), '空套餐没有给中文原因：' + caseToasts().join(' | '));
+        const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+        assert.ok(hit && hit.meals.length === 2, '空套餐被写库了');
+        assert.equal(hit.id, created.id, '被拒的保存不该改到原套餐');
+        assert.ok(topSheet(), '空套餐被拒后编辑层不该关掉（用户还要能加回来）');
+        fireClick(findButton(topSheet(), '取消'));
+        await tick(80);
+        assert.ok(!topSheet(), '取消后编辑层没有关闭');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐编辑：只剩一餐时保存被数据层拒（至少两餐），不写库、弹层不关', async () => {
+      clearCaseOverlays();
+      const name = '整日剩一餐';
+      await mealTemplateDrop(name);
+      const created = await store.saveDayTemplate({ name, meals: [
+        { slot: 'breakfast', items: [{ name: '剩早项', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '剩午项', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] });
+      try {
+        const sheet = await openDayTemplateEditor(name);
+        fireClick(findButton(dayMealBlock(sheet, '午餐'), '删整餐'));
+        await tick(80);
+        fireClick(findButton(topDialog(), '删除'));
+        await tick(100);
+        assert.equal(byClass(topSheet(), 'day-meal').length, 1, '前置条件不成立：应只剩一餐');
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        fireClick(findButton(topDialog(), '更新'));
+        await tick(220);
+        assert.ok(caseToasts().some((t) => t.includes('整日套餐至少要两餐')), '只剩一餐时没有给数据层的中文原因：' + caseToasts().join(' | '));
+        const hit = (await store.getMealTemplates()).find((t) => t.name === name);
+        assert.ok(hit && hit.meals.length === 2, '只剩一餐的套餐被写库了');
+        assert.equal(hit.id, created.id, '被拒的保存不该改到原套餐');
+        assert.ok(topSheet(), '被拒后编辑层不该关掉（用户还要能加回来）');
+        fireClick(findButton(topSheet(), '取消'));
+        await tick(80);
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐编辑：保存前二次确认，取消则原套餐一个字节不动', async () => {
+      clearCaseOverlays();
+      const name = '整日取消保存';
+      const A = { name: '取消整A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '取消整B', grams: 50, kcal: 60, carb: 6, protein: 3, fat: 2 };
+      await mealTemplateDrop(name);
+      const created = await store.saveDayTemplate({ name, meals: [
+        { slot: 'lunch', items: [A, B] },
+        { slot: 'dinner', items: [{ name: '取消整晚', grams: 80, kcal: 88, carb: 8, protein: 4, fat: 2 }] },
+      ] });
+      try {
+        const before = (await store.getMealTemplates()).find((t) => t.name === name);
+        const sheet = await openDayTemplateEditor(name);
+        fireClick(findButton(dayMealBlock(sheet, '晚餐'), '删整餐'));
+        await tick(80);
+        fireClick(findButton(topDialog(), '删除'));
+        await tick(100);
+        assert.equal(dayMealBlock(topSheet(), '晚餐'), null, '删整餐没有生效（前置条件不成立）');
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        const dialog = topDialog();
+        assert.ok(dialog, '保存前没有二次确认');
+        fireClick(findButton(dialog, '取消'));
+        await tick(140);
+        const after = (await store.getMealTemplates()).find((t) => t.name === name);
+        assert.ok(after, '原套餐不见了');
+        assert.equal(after.id, created.id, '取消后套餐 id 变了');
+        assert.deepEqual(after, before, '取消后原套餐被改动了');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐编辑参数：dayTemplateEditPayload 带原套餐 id，且丢掉空餐', async () => {
+      const foodView = await import('../views/food.js');
+      const template = { id: '4243', name: '参数整日', kind: 'day', meals: [
+        { slot: 'breakfast', items: [{ name: '旧早', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '旧午', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] };
+      const meals = [
+        { slot: 'breakfast', items: [{ name: '新早', grams: 60, kcal: 90, carb: 1, protein: 7, fat: 6 }] },
+        { slot: 'lunch', items: [] },
+        { slot: 'dinner', items: [{ name: '新晚', grams: 100, kcal: 133, carb: 2, protein: 20, fat: 3 }] },
+      ];
+      const payload = foodView.dayTemplateEditPayload(template, meals);
+      assert.deepEqual(Object.keys(payload).sort(), ['id', 'meals', 'name'], '保存参数字段不对：' + Object.keys(payload).join(','));
+      assert.equal(payload.id, '4243', '保存参数没带原套餐 id（编辑结果会变成另一个套餐）');
+      assert.equal(payload.name, '参数整日', '保存参数把套餐名弄丢了');
+      assert.deepEqual(payload.meals.map((m) => m.slot), ['breakfast', 'dinner'], '某一餐删到 0 项后没有被丢弃');
+      assert.deepEqual(payload.meals.map((m) => m.items.map((i) => i.name)), [['新早'], ['新晚']], '保存参数的条目不对');
+      assert.notEqual(payload.meals, meals, '保存参数应复制餐次数组');
+      assert.notEqual(payload.meals[0].items, meals[0].items, '保存参数应复制条目数组');
+      assert.notEqual(payload.meals[0].items[0], meals[0].items[0], '保存参数应复制条目对象');
+      const empty = foodView.dayTemplateEditPayload(template, [{ slot: 'lunch', items: [] }, { slot: 'dinner' }]);
+      assert.deepEqual(empty.meals, [], '全空的套餐应归一成空 meals（由调用方拒绝保存）');
+      assert.equal(empty.id, '4243', '空套餐的保存参数同样带 id（拒绝逻辑在调用方）');
+
+      // 复制条目只做浅拷贝、不挑字段：既有条目上的 fiber/sodium/foodId 等不能在这一步被丢掉
+      const keep = foodView.dayTemplateEditPayload(template, [{
+        slot: 'lunch',
+        items: [{ name: '带字段', grams: 100, kcal: 100, carb: 1, protein: 1, fat: 1, fiber: 3.2, sodium: 400, foodId: 'f-1', confidence: 'high' }],
+      }, { slot: 'dinner', items: [{ name: '凑两餐', grams: 80, kcal: 60, carb: 1, protein: 1, fat: 1 }] }]);
+      assert.equal(keep.meals[0].items[0].fiber, 3.2, '保存参数把纤维弄丢了');
+      assert.equal(keep.meals[0].items[0].sodium, 400, '保存参数把钠弄丢了');
+      assert.equal(keep.meals[0].items[0].foodId, 'f-1', '保存参数把食物 id 弄丢了');
+      assert.equal(keep.meals[0].items[0].confidence, 'high', '保存参数把置信度弄丢了');
     });
 
 

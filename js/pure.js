@@ -357,8 +357,26 @@ export function planMealTemplateSave(existing, input, now = Date.now()) {
 }
 
 /**
- * 保存整日套餐的纯逻辑：与单餐套餐同一套名称覆盖语义（同名保留原 id）。
- * meals 归一化后不足 2 餐（空数组、全非法、或只剩一餐）抛中文错。
+ * 原地替换 list[index] 那一条整日套餐：位置与 id 保留，原来带 createdAt 的照旧带过去。
+ * 显式重建而不是展开旧对象：被同名单餐套餐覆盖时不能把 slot/items 键留下来。
+ */
+function replaceDayTemplate(list, index, { name, meals }) {
+  const prev = list[index];
+  const template = { id: prev.id, name, kind: 'day', meals };
+  if (prev.createdAt != null) template.createdAt = prev.createdAt;
+  list[index] = template;
+  return { templates: list, template: { ...template } };
+}
+
+/**
+ * 保存整日套餐的纯逻辑：与单餐套餐同一套语义（名称覆盖 + 显式 id 原地更新）。
+ * meals 归一化后不足 2 餐（空数组、全非法、或只剩一餐）抛中文错 —— 视图层的编辑层
+ * 把某一餐删空时由它负责丢弃空餐，「至少要留一餐」之外仍有这条下限兜底。
+ * 三种走法：
+ *   1) 入参带 id 且命中已有套餐 -> **原地替换那一条**（保留原 id 与 createdAt，位置不变）；
+ *   2) 不带 id（或 id 不存在）但名称撞上已有套餐 -> 同名覆盖，保留原 id 与 createdAt；
+ *   3) 否则新建：id = String(now)，createdAt = 同一个时间戳。
+ * now 只在新建时用来生成 id / createdAt，测试可注入固定时间。
  */
 export function planDayTemplateSave(existing, input, now = Date.now()) {
   const list = normalizeMealTemplates(existing);
@@ -368,14 +386,13 @@ export function planDayTemplateSave(existing, input, now = Date.now()) {
   const meals = normalizeDayMeals(src.meals);
   if (meals.length < 2) throw new Error('整日套餐至少要两餐');
 
+  // 显式 id 优先：视图层的「编辑这条套餐」走的就是它，不能退化成同名覆盖（改名后就找不到旧记录了）
+  const wantId = src.id == null ? '' : String(src.id).trim();
+  const idIndex = wantId ? list.findIndex((t) => t.id === wantId) : -1;
+  if (idIndex >= 0) return replaceDayTemplate(list, idIndex, { name, meals });
+
   const index = list.findIndex((t) => t.name === name);
-  if (index >= 0) {
-    const prev = list[index];
-    const template = { id: prev.id, name, kind: 'day', meals };
-    if (prev.createdAt != null) template.createdAt = prev.createdAt;
-    list[index] = template;
-    return { templates: list, template: { ...template } };
-  }
+  if (index >= 0) return replaceDayTemplate(list, index, { name, meals });
 
   const stamp = nextTemplateStamp(list, now);
   const template = { id: String(stamp), name, kind: 'day', meals, createdAt: stamp };
