@@ -752,6 +752,48 @@ export const FOODS = [
   { id: 'chicken-rice-ball', kind: 'dish', name: '鸡胸肉饭团', aliases: ['鸡肉饭团', '饭团（鸡胸）'], part: '胸', state: 'cooked', per100g: { kcal: 150, carb: 26.0, protein: 7.0, fat: 2.0, fiber: 1.0, sodium: 380 }, units: [{ name: '1 个', grams: 130 }] },
   { id: 'shrimp-wonton', kind: 'dish', name: '虾仁馄饨', aliases: ['虾肉馄饨', '鲜虾馄饨'], per100g: { kcal: 150, carb: 20.0, protein: 8.0, fat: 4.0, fiber: 0.8, sodium: 500 }, units: [{ name: '1 个', grams: 20 }, { name: '1 碗', grams: 250 }] },
   { id: 'chicken-dumpling', kind: 'dish', name: '鸡肉饺子', aliases: ['鸡胸肉饺子', '鸡肉水饺'], per100g: { kcal: 180, carb: 24.0, protein: 9.0, fat: 5.0, fiber: 1.0, sodium: 480 }, units: [{ name: '1 个', grams: 20 }, { name: '1 盘', grams: 200 }] },
+  // —— v1.7 补全：菌菇 / 蔬菜 / 豆制品 / 豆类杂粮（数值取《中国食物成分表》口径）——
+  { id: 'king-oyster-mushroom', kind: 'ingredient', name: '杏鲍菇', aliases: ['刺芹侧耳', '鲍菇', '干贝菇'], state: 'raw', per100g: { kcal: 31, carb: 8.3, protein: 1.3, fat: 0.1, fiber: 2.1, sodium: 3.1 }, units: [{ name: '1 根', grams: 60 }, { name: '1 盘', grams: 150 }, { name: '1 盒', grams: 250 }] },
+  { id: 'straw-mushroom', kind: 'ingredient', name: '草菇', aliases: ['大黑头细花草', '兰花菇', '稻草菇'], state: 'raw', per100g: { kcal: 23, carb: 2.7, protein: 2.7, fat: 0.2, fiber: 1.6, sodium: 73 }, units: [{ name: '1 朵', grams: 12 }, { name: '1 盘', grams: 150 }] },
+  { id: 'button-mushroom', kind: 'ingredient', name: '蘑菇', aliases: ['鲜蘑', '双孢蘑菇', '洋蘑菇'], state: 'raw', per100g: { kcal: 20, carb: 2.0, protein: 2.7, fat: 0.1, fiber: 2.1, sodium: 8.3 }, units: [{ name: '1 朵', grams: 15 }, { name: '1 盘', grams: 150 }, { name: '1 盒', grams: 200 }] },
+  // —— v1.7 补全：蔬菜 ——
+  { id: 'asparagus-lettuce', kind: 'ingredient', name: '莴笋', aliases: ['莴苣', '青笋', '香莴笋'], state: 'raw', per100g: { kcal: 14, carb: 2.2, protein: 1.0, fat: 0.1, fiber: 0.6, sodium: 36.5 }, units: [{ name: '1 根', grams: 300 }, { name: '1 盘', grams: 150 }, { name: '1 段', grams: 50 }] },
+  { id: 'bamboo-shoot', kind: 'ingredient', name: '竹笋', aliases: ['鲜笋', '笋肉', '竹笋肉'], state: 'raw', per100g: { kcal: 19, carb: 1.8, protein: 2.6, fat: 0.2, fiber: 1.8, sodium: 0.4 }, units: [{ name: '1 根', grams: 100 }, { name: '1 盘', grams: 150 }] },
+  { id: 'taro', kind: 'ingredient', name: '芋头', aliases: ['芋艿', '毛芋', '芋头仔'], state: 'raw', per100g: { kcal: 79, carb: 17.1, protein: 2.2, fat: 0.2, fiber: 1.0, sodium: 33.1 }, units: [{ name: '1 个', grams: 100 }, { name: '1 碗', grams: 150 }, { name: '1 盘', grams: 200 }] },
+  { id: 'water-chestnut', kind: 'ingredient', name: '荸荠', aliases: ['马蹄', '地栗', '凫茈'], state: 'raw', per100g: { kcal: 59, carb: 13.1, protein: 1.2, fat: 0.2, fiber: 1.1, sodium: 15.7 }, units: [{ name: '1 个', grams: 12 }, { name: '1 把', grams: 100 }] },
+  { id: 'gai-lan', kind: 'ingredient', name: '芥蓝', aliases: ['芥兰', '甘蓝菜', '盖蓝菜'], state: 'raw', per100g: { kcal: 19, carb: 1.0, protein: 2.8, fat: 0.4, fiber: 1.6, sodium: 50.5 }, units: [{ name: '1 把', grams: 250 }, { name: '1 盘', grams: 150 }] },
+  { id: 'amaranth-green', kind: 'ingredient', name: '苋菜', aliases: ['绿苋菜', '青苋菜', '白苋菜'], state: 'raw', per100g: { kcal: 25, carb: 2.8, protein: 2.8, fat: 0.3, fiber: 2.2, sodium: 32.4 }, units: [{ name: '1 把', grams: 200 }, { name: '1 盘', grams: 150 }] },
+  { id: 'amaranth-red', kind: 'ingredient', name: '红苋菜', aliases: ['紫苋菜', '红苋', '紫苋'], state: 'raw', per100g: { kcal: 31, carb: 4.1, protein: 2.8, fat: 0.4, fiber: 1.8, sodium: 42.3 }, units: [{ name: '1 把', grams: 200 }, { name: '1 盘', grams: 150 }] },
+  { id: 'cowpea', kind: 'ingredient', name: '豇豆', aliases: ['长豆角', '角豆', '线豆'], state: 'raw', per100g: { kcal: 29, carb: 4.0, protein: 2.7, fat: 0.2, fiber: 1.8, sodium: 4.6 }, units: [{ name: '1 根', grams: 15 }, { name: '1 盘', grams: 150 }, { name: '1 把', grams: 200 }] },
+  { id: 'pea-shoot', kind: 'ingredient', name: '豌豆苗', aliases: ['豌豆尖', '豆苗', '豌豆藤尖'], state: 'raw', per100g: { kcal: 34, carb: 2.7, protein: 4.0, fat: 0.8, fiber: 1.9, sodium: 18.5 }, units: [{ name: '1 把', grams: 100 }, { name: '1 盘', grams: 150 }] },
+  { id: 'toon', kind: 'ingredient', name: '香椿', aliases: ['香椿芽', '椿芽', '春芽'], state: 'raw', per100g: { kcal: 50, carb: 10.9, protein: 1.7, fat: 0.4, fiber: 1.8, sodium: 4.6 }, units: [{ name: '1 把', grams: 50 }, { name: '1 小把', grams: 30 }] },
+  { id: 'choy-sum', kind: 'ingredient', name: '菜心', aliases: ['菜薹', '广东菜心', '白菜薹'], state: 'raw', per100g: { kcal: 25, carb: 2.3, protein: 2.8, fat: 0.5, fiber: 1.7, sodium: 26 }, units: [{ name: '1 把', grams: 200 }, { name: '1 盘', grams: 150 }] },
+  { id: 'scallion-large', kind: 'ingredient', name: '大葱', aliases: ['京葱', '青葱', '葱白'], state: 'raw', per100g: { kcal: 30, carb: 5.2, protein: 1.7, fat: 0.3, fiber: 1.3, sodium: 4.8 }, units: [{ name: '1 根', grams: 100 }, { name: '1 段', grams: 10 }] },
+  { id: 'chive', kind: 'ingredient', name: '韭菜', aliases: ['韭', '韭叶', '韭菜叶'], state: 'raw', per100g: { kcal: 26, carb: 3.2, protein: 2.4, fat: 0.4, fiber: 1.4, sodium: 8.1 }, units: [{ name: '1 把', grams: 200 }, { name: '1 小把', grams: 100 }] },
+  { id: 'hyacinth-bean', kind: 'ingredient', name: '扁豆', aliases: ['月亮菜', '峨眉豆', '藤豆'], state: 'raw', per100g: { kcal: 37, carb: 6.1, protein: 2.7, fat: 0.2, fiber: 2.1, sodium: 3.8 }, units: [{ name: '1 根', grams: 6 }, { name: '1 盘', grams: 150 }] },
+  { id: 'sword-bean', kind: 'ingredient', name: '刀豆', aliases: ['大刀豆', '挟剑豆'], state: 'raw', per100g: { kcal: 36, carb: 5.2, protein: 3.1, fat: 0.3, fiber: 1.8, sodium: 8.5 }, units: [{ name: '1 根', grams: 15 }, { name: '1 盘', grams: 150 }] },
+  { id: 'watercress', kind: 'ingredient', name: '豆瓣菜', aliases: ['西洋菜', '水田芥'], state: 'raw', per100g: { kcal: 17, carb: 0.3, protein: 2.9, fat: 0.5, fiber: 1.2, sodium: 61.2 }, units: [{ name: '1 把', grams: 150 }, { name: '1 扎', grams: 100 }] },
+  { id: 'garlic-scape', kind: 'ingredient', name: '蒜苔', aliases: ['蒜薹', '青蒜苔', '蒜苔段'], state: 'raw', per100g: { kcal: 61, carb: 12.9, protein: 2.0, fat: 0.1, fiber: 2.5, sodium: 3.8 }, units: [{ name: '1 根', grams: 10 }, { name: '1 把', grams: 200 }] },
+  { id: 'lettuce-leaf', kind: 'ingredient', name: '莴笋叶', aliases: ['莴苣叶', '莴笋尖'], state: 'raw', per100g: { kcal: 18, carb: 2.6, protein: 1.4, fat: 0.2, fiber: 1.0, sodium: 39.1 }, units: [{ name: '1 把', grams: 150 }, { name: '1 盘', grams: 120 }] },
+  // —— v1.7 补全：豆制品 ——
+  { id: 'tofu-shreds', kind: 'ingredient', name: '豆腐丝', aliases: ['干丝', '豆腐干丝', '千张丝'], state: 'raw', per100g: { kcal: 201, carb: 5.1, protein: 21.5, fat: 10.5, fiber: 1.1, sodium: 20.6 }, units: [{ name: '1 把', grams: 100 }, { name: '1 盘', grams: 150 }] },
+  { id: 'vegetarian-chicken', kind: 'ingredient', name: '素鸡', aliases: ['素鸡腿', '豆制素鸡'], state: 'raw', per100g: { kcal: 192, carb: 3.3, protein: 16.5, fat: 12.5, fiber: 0.9, sodium: 373.8 }, units: [{ name: '1 块', grams: 80 }, { name: '1 片', grams: 30 }] },
+  // —— v1.7 补全：豆类与杂粮 ——
+  { id: 'black-bean', kind: 'ingredient', name: '黑豆', aliases: ['黑大豆', '乌豆', '黑黄豆'], state: 'raw', per100g: { kcal: 381, carb: 23.4, protein: 36.0, fat: 15.9, fiber: 10.2, sodium: 3 }, units: [{ name: '1 勺', grams: 15 }, { name: '1 杯', grams: 150 }] },
+  { id: 'chickpea', kind: 'ingredient', name: '鹰嘴豆', aliases: ['桃尔豆', '鸡豆', '鹰嘴豆（干）'], state: 'raw', per100g: { kcal: 378, carb: 63.0, protein: 20.5, fat: 6.0, fiber: 12.2, sodium: 24 }, units: [{ name: '1 勺', grams: 15 }, { name: '1 杯', grams: 160 }] },
+  { id: 'job-tears', kind: 'ingredient', name: '薏米', aliases: ['薏仁', '薏仁米', '苡米'], state: 'raw', per100g: { kcal: 357, carb: 69.1, protein: 12.8, fat: 3.3, fiber: 2.0, sodium: 3.6 }, units: [{ name: '1 勺', grams: 15 }, { name: '1 小把', grams: 30 }, { name: '1 杯', grams: 150 }] },
+  { id: 'buckwheat', kind: 'ingredient', name: '荞麦', aliases: ['荞麦米', '甜荞', '乌麦'], state: 'raw', per100g: { kcal: 324, carb: 66.5, protein: 9.3, fat: 2.3, fiber: 6.5, sodium: 4.7 }, units: [{ name: '1 杯', grams: 150 }, { name: '1 把', grams: 80 }] },
+  { id: 'glutinous-rice', kind: 'ingredient', name: '糯米', aliases: ['江米', '糯米（生）', '酒米'], state: 'raw', per100g: { kcal: 348, carb: 77.5, protein: 7.3, fat: 1.0, fiber: 0.8, sodium: 1.5 }, units: [{ name: '1 杯', grams: 150 }, { name: '1 勺', grams: 15 }] },
+  { id: 'sorghum', kind: 'ingredient', name: '高粱米', aliases: ['蜀黍', '红粮', '高粱'], state: 'raw', per100g: { kcal: 351, carb: 70.4, protein: 10.4, fat: 3.1, fiber: 4.3, sodium: 6.3 }, units: [{ name: '1 杯', grams: 150 }, { name: '1 勺', grams: 15 }] },
+  { id: 'white-kidney-bean', kind: 'ingredient', name: '白芸豆', aliases: ['白豆', '大白芸豆', '芸豆（白）'], state: 'raw', per100g: { kcal: 296, carb: 47.4, protein: 23.4, fat: 1.4, fiber: 9.8, sodium: 0 }, units: [{ name: '1 勺', grams: 15 }, { name: '1 杯', grams: 150 }] },
+  // —— v1.7 补全：家常菜（按配料折算成品重量，见 tests 里的估算说明）——
+  { id: 'king-oyster-pork', kind: 'dish', name: '杏鲍菇炒肉', aliases: ['肉片炒杏鲍菇', '杏鲍菇炒肉片'], state: 'cooked', per100g: { kcal: 86, carb: 6.3, protein: 6.4, fat: 4.6, fiber: 1.4, sodium: 148 }, units: [{ name: '1 盘', grams: 250 }, { name: '1 小盘', grams: 180 }] },
+  { id: 'garlic-king-oyster', kind: 'dish', name: '蒜蓉杏鲍菇', aliases: ['蒜香杏鲍菇', '蒜蓉炒杏鲍菇'], state: 'cooked', per100g: { kcal: 60, carb: 8.1, protein: 1.4, fat: 3.4, fiber: 2.0, sodium: 139 }, units: [{ name: '1 盘', grams: 220 }, { name: '1 小盘', grams: 160 }] },
+  { id: 'stir-asparagus-lettuce', kind: 'dish', name: '清炒莴笋', aliases: ['炒莴笋', '清炒莴笋丝'], state: 'cooked', per100g: { kcal: 38, carb: 2.3, protein: 1.1, fat: 2.7, fiber: 0.6, sodium: 135 }, units: [{ name: '1 盘', grams: 230 }, { name: '1 小盘', grams: 160 }] },
+  { id: 'toon-egg', kind: 'dish', name: '香椿炒蛋', aliases: ['香椿炒鸡蛋', '椿芽炒蛋'], state: 'cooked', per100g: { kcal: 152, carb: 4.4, protein: 9.0, fat: 10.8, fiber: 0.6, sodium: 84 }, units: [{ name: '1 盘', grams: 160 }, { name: '1 小盘', grams: 110 }] },
+  { id: 'dry-fried-cowpea', kind: 'dish', name: '干煸豇豆', aliases: ['干煸长豆角', '干煸豇豆角'], state: 'cooked', per100g: { kcal: 86, carb: 3.6, protein: 4.8, fat: 5.8, fiber: 1.5, sodium: 128 }, units: [{ name: '1 盘', grams: 245 }, { name: '1 小盘', grams: 170 }] },
+  { id: 'stir-lotus-root', kind: 'dish', name: '清炒藕片', aliases: ['炒藕片', '清炒莲藕'], state: 'cooked', per100g: { kcal: 96, carb: 15.8, protein: 1.9, fat: 3.0, fiber: 1.1, sodium: 152 }, units: [{ name: '1 盘', grams: 210 }, { name: '1 小盘', grams: 150 }] },
+  { id: 'steamed-taro', kind: 'dish', name: '蒸芋头', aliases: ['芋头（蒸）', '清蒸芋头'], state: 'cooked', per100g: { kcal: 79, carb: 17.1, protein: 2.2, fat: 0.2, fiber: 1.0, sodium: 33 }, units: [{ name: '1 盘', grams: 200 }, { name: '1 个', grams: 100 }] },
 
 ];
 
@@ -942,13 +984,16 @@ export function findFood(name, options = {}) {
   let bestScore = -1;
   for (const food of FOODS) {
     const dish = isDish(food);
-    const names = [food.name, ...(food.aliases || [])].map(normalizeName).filter(Boolean);
+    // 名字与别名分开：同分时「条目本名」要压过「别的条目把这句话当别名」（豆腐丝 vs 凉拌豆腐丝）。
+    const names = [food.name, ...(food.aliases || [])]
+      .map((v, i) => [normalizeName(v), i === 0])
+      .filter(([n]) => Boolean(n));
     const noteMatch = noteKey ? [food.name, ...(food.aliases || [])].some((v) => normalizeKeepingNotes(v) === noteKey) : false;
-    for (const n of names) {
+    for (const [n, isOwnName] of names) {
       const nShort = normalizeName(stripQuantity(n)) || n;
       let score = -1;
       for (const k of keys) {
-        if (k === n || k === nShort) score = Math.max(score, 1000 + Math.min(n.length, nShort.length));
+        if (k === n || k === nShort) score = Math.max(score, 1000 + Math.min(n.length, nShort.length) + (isOwnName ? 1 : 0));
         else if (n.length >= 2 && k.includes(n)) score = Math.max(score, 400 + n.length);
         else if (n.length >= 2 && n.includes(k) && k.length >= 2) score = Math.max(score, 200 + k.length + (dish ? 250 : 0));
       }

@@ -145,6 +145,108 @@ async function run() {
   const withPart = FOODS.filter((f) => typeof f.part === 'string' && f.part.trim());
   check('至少 30 条标注部位', withPart.length >= 30, `实际 ${withPart.length}`);
 
+  // ---------- v1.7：食物库系统性补全 ----------
+  // 新增条目的 id 清单（改数据必须同步改这里，防止「悄悄删条目」也能过测试）
+  const V17_IDS = [
+    'king-oyster-mushroom', 'straw-mushroom', 'button-mushroom',
+    'asparagus-lettuce', 'bamboo-shoot', 'taro', 'water-chestnut', 'gai-lan',
+    'amaranth-green', 'amaranth-red', 'cowpea', 'pea-shoot', 'toon', 'choy-sum',
+    'scallion-large', 'chive', 'hyacinth-bean', 'sword-bean', 'watercress',
+    'garlic-scape', 'lettuce-leaf',
+    'tofu-shreds', 'vegetarian-chicken',
+    'black-bean', 'chickpea', 'job-tears', 'buckwheat', 'glutinous-rice', 'sorghum', 'white-kidney-bean',
+    'king-oyster-pork', 'garlic-king-oyster', 'stir-asparagus-lettuce', 'toon-egg',
+    'dry-fried-cowpea', 'stir-lotus-root', 'steamed-taro',
+  ];
+  const v17 = FOODS.filter((f) => V17_IDS.includes(f.id));
+  check('新增条目数 ≥ 30', v17.length >= 30, `实际 ${v17.length}`);
+  check('新增条目 id 全部在库', v17.length === V17_IDS.length,
+    `缺失 id: ${V17_IDS.filter((id) => !FOODS.some((f) => f.id === id)).join(',')}`);
+  check('新增条目 id 均为英文小写短横线', v17.every((f) => /^[a-z0-9]+(-[a-z0-9]+)*$/.test(f.id)),
+    v17.filter((f) => !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(f.id)).map((f) => f.id).join(','));
+  check('新增菜品 ≥ 5 条', v17.filter((f) => f.kind === 'dish').length >= 5, `实际 ${v17.filter((f) => f.kind === 'dish').length}`);
+
+  // 新增条目必须自带 fiber / sodium / aliases / 实用份量
+  const badNew = [];
+  for (const f of v17) {
+    const p = f.per100g || {};
+    if (typeof p.fiber !== 'number' || !Number.isFinite(p.fiber)) badNew.push(`${f.name}(缺 fiber)`);
+    if (typeof p.sodium !== 'number' || !Number.isFinite(p.sodium)) badNew.push(`${f.name}(缺 sodium)`);
+    if (!Array.isArray(f.aliases) || f.aliases.length < 2) badNew.push(`${f.name}(别名不足)`);
+    const units = Array.isArray(f.units) ? f.units : [];
+    if (units.length === 0) badNew.push(`${f.name}(无 units)`);
+    for (const u of units) {
+      if (!(Number(u.grams) > 0) || !String(u.name || '').trim()) badNew.push(`${f.name}(份量非法)`);
+    }
+  }
+  check('新增条目字段完整（fiber/sodium/aliases/units）', badNew.length === 0, badNew.slice(0, 6).join(', '));
+
+  // 用户点名的「杏鲍菇」
+  const kingOyster = FOODS.find((f) => f.name === '杏鲍菇');
+  check('库内有「杏鲍菇」', !!kingOyster, '未找到');
+  check('searchFoods("杏鲍菇") 首位命中', searchFoods('杏鲍菇')[0]?.name === '杏鲍菇', `实际 ${searchFoods('杏鲍菇')[0]?.name}`);
+  check('searchFoods("鲍菇") 命中杏鲍菇（部分词）', searchFoods('鲍菇').some((f) => f.name === '杏鲍菇'), '未命中');
+  check('findFood("杏鲍菇") 命中', findFood('杏鲍菇')?.name === '杏鲍菇', `实际 ${findFood('杏鲍菇')?.name}`);
+  check('杏鲍菇 别名覆盖「鲍菇」', (kingOyster?.aliases || []).includes('鲍菇'), JSON.stringify(kingOyster?.aliases));
+  if (kingOyster) {
+    const k = kingOyster.per100g;
+    check('杏鲍菇 热量落在 25–45 kcal/100g', k.kcal >= 25 && k.kcal <= 45, `实际 ${k.kcal}`);
+    check('杏鲍菇 带膳食纤维', typeof k.fiber === 'number' && k.fiber > 0 && k.fiber <= 4, `实际 ${k.fiber}`);
+    check('杏鲍菇 份量含「1 根 ≈ 60g」', (kingOyster.units || []).some((u) => u.name === '1 根' && u.grams === 60), JSON.stringify(kingOyster.units));
+  }
+
+  // 部分词检索：单字、双字片段都要能命中
+  check('searchFoods("莴") 命中莴笋', searchFoods('莴').some((f) => f.name === '莴笋'), '未命中');
+  check('searchFoods("豆干") 命中豆腐干', searchFoods('豆干')[0]?.name === '豆腐干', `实际 ${searchFoods('豆干')[0]?.name}`);
+  check('searchFoods("香椿") 命中香椿', searchFoods('香椿')[0]?.name === '香椿', `实际 ${searchFoods('香椿')[0]?.name}`);
+
+  // 缺口清单：这 10 条本轮已补齐（原来库内完全没有）
+  const FILLED_GAPS = ['杏鲍菇', '芋头', '莴笋', '竹笋', '黑豆', '鹰嘴豆'];
+  const stillMissing = FILLED_GAPS.filter((n) => !findFood(n));
+  check('本轮补齐的缺口全部可解析', stillMissing.length === 0, `仍未命中: ${stillMissing.join(',')}`);
+  // 这 3 条原本靠别名即可命中，不新增重复条目，只验证仍然可用
+  const aliasCovered = [['豆干', '豆腐干'], ['豆皮', '千张'], ['鸡腿肉', '鸡腿']];
+  const aliasLost = aliasCovered.filter(([q, expect]) => findFood(q)?.name !== expect);
+  check('豆干/豆皮/鸡腿肉 仍由既有别名命中', aliasLost.length === 0, aliasLost.map(([q]) => q).join(','));
+  // 成分表无条目、暂无权威来源：显式记录，不编数值；一旦补上就要删掉这里的名字
+  const PENDING_GAPS = ['茶树菇', '白玉菇', '蟹味菇', '海鲜菇'];
+  const filledPending = PENDING_GAPS.filter((n) => FOODS.some((f) => f.name === n || (f.aliases || []).includes(n)));
+  check('待补缺口尚未被无来源数据填充', filledPending.length === 0, `已出现: ${filledPending.join(',')}，请补来源并更新 PENDING_GAPS`);
+
+  // 全库自洽：4/4/9 与 kcal 的偏差（严格口径：±15% 或 ±20 kcal）
+  const whitelist = ['紫菜', '紫菜（干）', '木耳', '木耳（干）'];
+  const offStrict = [];
+  for (const f of FOODS) {
+    const p = f.per100g;
+    if (!p || ![p.kcal, p.carb, p.protein, p.fat].every((n) => typeof n === 'number' && Number.isFinite(n))) continue;
+    const calc = p.carb * 4 + p.protein * 4 + p.fat * 9;
+    const tol = Math.max(20, p.kcal * 0.15);
+    if (Math.abs(calc - p.kcal) > tol) offStrict.push(f.name);
+  }
+  const unexpected = offStrict.filter((n) => !whitelist.includes(n));
+  check('全库 4/4/9 自洽（严格 ±15% / ±20kcal）', unexpected.length === 0, `超阈值: ${unexpected.join(',')}`);
+
+  // 膳食纤维覆盖：基线为 0 条缺失，新增不许把它变差
+  const noFiber = FOODS.filter((f) => !f.per100g || typeof f.per100g.fiber !== 'number');
+  check('全库 fiber 缺失条目 = 0', noFiber.length === 0, `缺失: ${noFiber.map((f) => f.name).slice(0, 6).join(',')}`);
+
+  // 别名与其它条目 name 冲突：只允许已知的「菜品别名 → 原料名」
+  const KNOWN_ALIAS_CONFLICTS = ['五香素鸡->素鸡', '凉拌豆腐丝->豆腐丝', '原味酸奶（全脂）->酸奶', '燕麦片（熟，冲调）->燕麦粥'];
+  const nameSet = new Set(FOODS.map((f) => f.name));
+  const clashes = [];
+  for (const f of FOODS) for (const a of f.aliases || []) if (nameSet.has(a)) clashes.push(`${f.name}->${a}`);
+  const newClash = clashes.filter((c) => !KNOWN_ALIAS_CONFLICTS.includes(c));
+  check('别名不新增与其他条目 name 的冲突', newClash.length === 0, newClash.slice(0, 6).join(', '));
+
+  // 份量克数：全库每项 name 非空、grams > 0
+  const badAllUnits = [];
+  for (const f of FOODS) {
+    for (const u of f.units || []) {
+      if (!u || typeof u.name !== 'string' || !u.name.trim() || !(Number(u.grams) > 0)) badAllUnits.push(f.name);
+    }
+  }
+  check('全库份量单位 name 非空且 grams > 0', badAllUnits.length === 0, [...new Set(badAllUnits)].slice(0, 6).join(', '));
+
   return {
     passed,
     failed: failures.length,
