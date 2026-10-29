@@ -4,10 +4,19 @@
 
 import { el, toast } from './ui.js';
 
-/** 「稍后」记下的 versionCode 存这个键；换新版（code 更大）会再次提示。 */
+/**
+ * 旧版把「稍后」写进这个键，而且永久生效（同一版本从此再也不提示，重启也没用）。
+ * 现在它只剩迁移用途：读到就删掉，里面的值不参与任何判断。
+ */
 export const DISMISS_KEY = 'hms.update.dismissed';
 
 const INSTALL_TEXT = '立即更新';
+
+/**
+ * 「稍后」只对本次运行有效：存在模块内存里，清后台重开（js/update.js 重新加载）就归零。
+ * 不能写 localStorage —— 那等于把「稍后」变成「这个版本我永远不要了」，用户再也点不到更新。
+ */
+let dismissedThisRun = 0;
 
 function asPlainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -47,7 +56,7 @@ export function shouldPrompt(remote, dismissedCode) {
   return !(Number.isFinite(dismissed) && code <= dismissed);
 }
 
-function versionLabel(info) {
+export function versionLabel(info) {
   const name = String(info.versionName == null ? '' : info.versionName).trim();
   if (name) return name;
   const code = Number(info.versionCode);
@@ -91,7 +100,9 @@ export function createUpdateBanner({ remote, onInstall, onDismiss } = {}) {
     installBtn.disabled = true;
     setInstallText('准备中…');
     try {
-      if (typeof onInstall === 'function') onInstall(info);
+      // 没传 onInstall 时直接走共享安装入口（与设置页「下载并安装」是同一个函数）。
+      const result = typeof onInstall === 'function' ? onInstall(info) : installUpdate(info);
+      if (result && result.ok === false) fail(result.reason || '安装不可用');
     } catch (error) {
       fail(error);
     }
@@ -137,25 +148,47 @@ function storage() {
   }
 }
 
-function readDismissed() {
-  const box = storage();
-  if (!box) return 0;
+/** 当前环境的原生桥（模块顶层不碰 window，一律现取）。 */
+function currentBridge() {
   try {
-    const code = Number(box.getItem(DISMISS_KEY));
-    return Number.isFinite(code) ? code : 0;
+    return typeof window === 'undefined' || !window ? null : window.HmsBridge;
   } catch {
-    return 0;
+    return null;
   }
 }
 
-function writeDismissed(code) {
+/**
+ * 旧版的持久化「稍后」：读到就删，值直接丢弃 —— 它正是「点过稍后再也看不到更新」的根源。
+ * 脏数据（非数字 / 负数 / Infinity / 空白）同样只是被删掉，不进任何判断，也不抛异常。
+ */
+function dropLegacyDismissed() {
   const box = storage();
   if (!box) return;
   try {
-    box.setItem(DISMISS_KEY, String(code));
+    const legacy = typeof box.getItem === 'function' ? box.getItem(DISMISS_KEY) : null;
+    if (legacy != null && typeof box.removeItem === 'function') box.removeItem(DISMISS_KEY);
   } catch {
-    /* 隐私模式下写不进去：下次仍会提示，不是错误。 */
+    /* 隐私模式（Safari / 无痕）下 localStorage 会抛：删不掉就等于没有，下次仍会提示。 */
   }
+}
+
+/** 本次运行内被「稍后」掉的最高 versionCode（顺带把旧键清掉）。重启后归零。 */
+export function readDismissed() {
+  dropLegacyDismissed();
+  return dismissedThisRun;
+}
+
+/** 点「稍后」：只记到本次运行结束，不落盘。重启后同一版本会再次提示。 */
+export function dismissVersion(code) {
+  const n = Number(code);
+  if (!Number.isFinite(n) || n <= 0) return;
+  if (n > dismissedThisRun) dismissedThisRun = n;
+}
+
+/** 清掉抑制状态（设置页「检查更新」发现新版时调用：用户主动来要更新，就不能再替他压着）。 */
+export function clearDismissed() {
+  dismissedThisRun = 0;
+  dropLegacyDismissed();
 }
 
 function safeRead(readCode) {
@@ -167,14 +200,22 @@ function safeRead(readCode) {
   }
 }
 
-function installedVersionCode(bridge) {
+/** 本机版本（桥的 version()）；取不到就是 code 0 / name ''，绝不抛。 */
+export function localVersion(bridge) {
+  const b = bridge || currentBridge();
+  let info = null;
   try {
-    const info = parseBridgeJson(typeof bridge.version === 'function' ? bridge.version() : null);
-    const code = info ? Number(info.versionCode) : NaN;
-    return Number.isFinite(code) ? code : 0;
+    info = parseBridgeJson(b && typeof b.version === 'function' ? b.version() : null);
   } catch {
-    return 0;
+    info = null;
   }
+  const code = info ? Number(info.versionCode) : NaN;
+  const name = info && info.versionName != null ? String(info.versionName).trim() : '';
+  return { versionCode: Number.isFinite(code) ? code : 0, versionName: name };
+}
+
+function installedVersionCode(bridge) {
+  return localVersion(bridge).versionCode;
 }
 
 function placeBanner(mount, node) {
@@ -198,7 +239,7 @@ export async function initUpdateBanner({ mount, getDismissed, setDismissed } = {
   if (!mount) return null;
 
   const readCode = typeof getDismissed === 'function' ? getDismissed : readDismissed;
-  const saveCode = typeof setDismissed === 'function' ? setDismissed : writeDismissed;
+  const saveCode = typeof setDismissed === 'function' ? setDismissed : dismissVersion;
   const installedCode = installedVersionCode(bridge);
   const dismissedCode = safeRead(readCode);
 
@@ -222,8 +263,8 @@ export async function initUpdateBanner({ mount, getDismissed, setDismissed } = {
       try {
         banner = createUpdateBanner({
           remote,
-          // 原生侧自己会解析 JSON：传字符串比传对象更稳妥。
-          onInstall: (payload) => { bridge.installUpdate(JSON.stringify(payload)); },
+          // 走共享安装入口：与设置页「下载并安装」是同一个函数、同一份参数。
+          onInstall: (payload) => installUpdate(payload, bridge),
           onDismiss: () => { saveCode(Number(remote.versionCode)); },
         });
         placeBanner(mount, banner);
@@ -248,6 +289,86 @@ export async function initUpdateBanner({ mount, getDismissed, setDismissed } = {
     } catch (error) {
       if (typeof console !== 'undefined') console.warn('[HMS] 检查更新失败：', error);
       finish(null);
+    }
+  });
+}
+
+/* ---------- 设置页「检查更新」：查一次结果 + 唯一的安装入口 ---------- */
+
+/** iOS / iPadOS（含发桌面 UA 的 iPad）：网页版只能靠刷新页面拿新版本。口径与 app.js 的安装引导一致。 */
+export function isIosLike(nav) {
+  const n = nav || (typeof navigator === 'undefined' ? null : navigator);
+  if (!n) return false;
+  const ua = String(n.userAgent || '');
+  if (/iPad|iPhone|iPod/.test(ua)) return true;
+  return /Macintosh/.test(ua) && Number(n.maxTouchPoints) > 1;
+}
+
+/** 没有原生桥（PWA / 浏览器 / iOS）时该怎么说：告诉用户真能用的办法，而不是给一个点不动的按钮。 */
+export function webUpdateGuidance(nav) {
+  return isIosLike(nav)
+    ? '网页版没有安装按钮：用 Safari 打开本站并下拉刷新即可用上新版本（从主屏幕图标进入的，刷新后也是最新版）。'
+    : '网页版没有安装按钮：刷新本页即可用上新版本（下拉刷新或按 Ctrl+R / F5）。';
+}
+
+/** 能不能真的下载安装：只有带 installUpdate 的原生桥支持。 */
+export function isInstallAvailable(bridge) {
+  const b = bridge || currentBridge();
+  return Boolean(b && typeof b.installUpdate === 'function');
+}
+
+/**
+ * 唯一的安装入口：今日页「立即更新」与设置页「下载并安装」都走这里，不另写下载逻辑。
+ * 不抛异常，结果用返回值表达：{ ok: true } / { ok: false, reason }。
+ */
+export function installUpdate(info, bridge) {
+  const b = bridge || currentBridge();
+  if (!b || typeof b.installUpdate !== 'function') return { ok: false, reason: '当前环境不支持应用内安装' };
+  try {
+    // 原生侧自己会解析 JSON：传字符串比传对象更稳妥。
+    b.installUpdate(JSON.stringify(info || {}));
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: error && error.message ? error.message : String(error || '未知错误') };
+  }
+}
+
+/**
+ * 手动检查更新（设置页）：临时接管 window.__hmsUpdate 拿一次结果，用完立刻还原给今日页提示条。
+ * status: 'unavailable' | 'new' | 'latest' | 'error' | 'timeout'；永不 reject。
+ */
+export function checkForUpdate({ bridge, timeoutMs = 15000 } = {}) {
+  const b = bridge || currentBridge();
+  const local = localVersion(b);
+  if (!b || typeof b.checkUpdate !== 'function') return Promise.resolve({ status: 'unavailable', remote: null, local });
+  const hasWindow = typeof window !== 'undefined' && Boolean(window);
+  return new Promise((resolve) => {
+    const previous = hasWindow ? window.__hmsUpdate : undefined;
+    let done = false;
+    let timer = null;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      if (timer != null) clearTimeout(timer);
+      if (hasWindow) window.__hmsUpdate = previous;
+      resolve(result);
+    };
+    if (hasWindow) {
+      window.__hmsUpdate = (raw) => {
+        const remote = parseBridgeJson(raw);
+        if (!remote) { finish({ status: 'error', remote: null, local, error: '返回内容无法解析' }); return; }
+        if (remote.ok === false) { finish({ status: 'error', remote, local, error: String(remote.error || '检查失败') }); return; }
+        finish(isNewer(local.versionCode, remote.versionCode)
+          ? { status: 'new', remote, local }
+          : { status: 'latest', remote, local });
+      };
+    }
+    const wait = Number(timeoutMs);
+    timer = setTimeout(() => finish({ status: 'timeout', remote: null, local }), Number.isFinite(wait) && wait > 0 ? wait : 15000);
+    try {
+      b.checkUpdate();
+    } catch (error) {
+      finish({ status: 'error', remote: null, local, error: error && error.message ? error.message : '未知错误' });
     }
   });
 }

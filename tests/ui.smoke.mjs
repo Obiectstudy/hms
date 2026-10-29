@@ -151,6 +151,23 @@ function dropBridge() {
   delete win.__hmsUpdateProgress;
 }
 
+/** 假 localStorage（Map 支撑）：能观察「有没有被写」和「有没有被删」。 */
+function makeStorageBag(bag) {
+  return {
+    getItem: (key) => (bag.has(key) ? bag.get(key) : null),
+    setItem: (key, value) => { bag.set(key, String(value)); },
+    removeItem: (key) => { bag.delete(key); },
+  };
+}
+
+/**
+ * 「重启应用」的模拟：清后台重开 = js/update.js 重新加载，模块级的「稍后」内存随之清零。
+ * Node 的 ESM 缓存按 URL 走，换一个 query 就是一份全新的模块实例（模块级变量全部回到初值），
+ * 这比手工给某个 reset 函数更接近真机：重启后没有谁还记得上次那个 versionCode。
+ */
+let restartSeq = 0;
+const restartModule = () => import('../js/update.js?restart=' + (restartSeq += 1));
+
 /** 文本里不能漏出 undefined / NaN——这是模板拼接最常见的线上事故。 */
 function assertNoLeak(text, label) {
   assert.ok(text.length > 0, `${label} 渲染出空文本`);
@@ -895,7 +912,7 @@ export async function run() {
       }
     });
 
-    await checkAsync('dashboard 更新条：「稍后」记住 versionCode，同版本不再打扰，换新版再提示', async () => {
+    await checkAsync('dashboard 更新条：「稍后」只在本次运行内生效，同版本不再打扰，换新版再提示', async () => {
       const calls = [];
       const win = globalThis.window;
       const previousStorage = globalThis.localStorage;
@@ -915,7 +932,8 @@ export async function run() {
 
         fireClick(findButton(bar, '稍后'));
         await tick(20);
-        assert.equal(bag.get('hms.update.dismissed'), '5', '点「稍后」没有把 versionCode 写进 localStorage');
+        // 修死路：「稍后」只对本次运行有效，绝不能再落盘成「这个版本我永远不要了」。
+        assert.equal(bag.has('hms.update.dismissed'), false, '点「稍后」仍把 versionCode 写进 localStorage（会变成永久压制）');
         assert.equal(byClass(root, 'update-bar').length, 0, '点「稍后」后更新条没有消失');
 
         const again = await renderView('dashboard');
@@ -979,6 +997,252 @@ export async function run() {
       } finally {
         dropBridge();
         await store.markExported();
+      }
+    });
+
+    // ---- 1.11 「稍后」只对本次运行有效 + 设置页「检查更新」能就地更新（用户踩到的死路） ----
+    await checkAsync('更新条「稍后」：不写 localStorage、同一次运行不再弹、重启（模块内存清零）后同一版本会再次提示', async () => {
+      const update = await import('../js/update.js');
+      const win = globalThis.window;
+      const previousStorage = globalThis.localStorage;
+      const bag = new Map();
+      globalThis.localStorage = makeStorageBag(bag);
+      const remote = { ok: true, versionCode: 5, versionName: '1.4.0', url: 'https://example.com/a.apk', sha256: 'aaa' };
+      update.clearDismissed();
+      win.HmsBridge = fakeBridge(remote, []);
+      try {
+        // (a) 同一次运行内：点过「稍后」就不再打扰
+        const root = await renderView('dashboard');
+        await tick(80);
+        const bar = byClass(root, 'update-bar')[0];
+        assert.ok(bar, '前置：更新条没有出现');
+        fireClick(findButton(bar, '稍后'));
+        await tick(20);
+        assert.equal(byClass(root, 'update-bar').length, 0, '点「稍后」后更新条没有消失');
+        assert.equal(update.readDismissed(), 5, '「稍后」没有记住本次运行内被跳过的 versionCode');
+        assert.equal(bag.has(update.DISMISS_KEY), false, '「稍后」不应再写 localStorage');
+        const again = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(again, 'update-bar').length, 0, '同一次运行内同一版本不应再次弹出');
+
+        // (b) 重启（= js/update.js 重新加载，清后台重开就是这个效果）：同一版本必须再次提示
+        const restarted = await restartModule();
+        assert.equal(restarted.readDismissed(), 0, '重启后「稍后」状态没有归零');
+        const freshRoot = new dom.FakeNode('div');
+        win.HmsBridge = fakeBridge(remote, []);
+        const mounted = await restarted.initUpdateBanner({ mount: (node) => { freshRoot.appendChild(node); } });
+        await tick(80);
+        assert.ok(mounted, '重启后 initUpdateBanner 没有产出更新条');
+        assert.equal(byClass(freshRoot, 'update-bar').length, 1, '重启后同一版本的更新条没有再次出现（用户的核心诉求）');
+        assert.ok(
+          byClass(freshRoot, 'update-bar')[0].textOf().includes('发现新版本 1.4.0'),
+          `重启后更新条文案不对：${byClass(freshRoot, 'update-bar')[0].textOf()}`,
+        );
+      } finally {
+        update.clearDismissed();
+        dropBridge();
+        if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;
+      }
+    });
+
+    await checkAsync('旧的持久化「稍后」（localStorage）读到就清掉，且不再永久压制同一版本', async () => {
+      const update = await import('../js/update.js');
+      const win = globalThis.window;
+      const previousStorage = globalThis.localStorage;
+      const bag = new Map();
+      globalThis.localStorage = makeStorageBag(bag);
+      update.clearDismissed();
+      try {
+        // 老用户的现场：上一版点过「稍后」，localStorage 里躺着 5
+        bag.set(update.DISMISS_KEY, '5');
+        const restarted = await restartModule();
+        assert.equal(restarted.readDismissed(), 0, '旧 localStorage 的值仍在压制提示');
+        assert.equal(bag.has(update.DISMISS_KEY), false, '旧 localStorage 键没有被清掉');
+
+        bag.set(update.DISMISS_KEY, '5');
+        win.HmsBridge = fakeBridge({ ok: true, versionCode: 5, versionName: '1.4.0', url: 'https://example.com/a.apk', sha256: 'aaa' }, []);
+        const root = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(root, 'update-bar').length, 1, '旧 localStorage 残留把同一版本的提示永久压住了');
+        assert.equal(bag.has(update.DISMISS_KEY), false, '渲染后旧键仍留在 localStorage');
+      } finally {
+        update.clearDismissed();
+        dropBridge();
+        if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;
+      }
+    });
+
+    await checkAsync('旧的「稍后」脏数据：非数字/负数/Infinity/空白都不抛异常、不压制提示、并被清掉', async () => {
+      const update = await import('../js/update.js');
+      const previousStorage = globalThis.localStorage;
+      const bag = new Map();
+      globalThis.localStorage = makeStorageBag(bag);
+      update.clearDismissed();
+      try {
+        for (const dirty of ['abc', '-5', '1e309', '   ', '0x10', 'NaN', '999999999999999999999999']) {
+          bag.set(update.DISMISS_KEY, dirty);
+          assert.doesNotThrow(() => update.readDismissed(), `脏值 ${dirty} 让读取抛异常`);
+          assert.equal(update.readDismissed(), 0, `脏值 ${dirty} 变成了抑制状态`);
+          assert.equal(bag.has(update.DISMISS_KEY), false, `脏值 ${dirty} 没有被清掉`);
+          assert.equal(
+            update.shouldPrompt({ ok: true, versionCode: 5 }, update.readDismissed()),
+            true,
+            `脏值 ${dirty} 压住了新版本提示`,
+          );
+        }
+        // 隐私模式（Safari / 无痕）：localStorage 整个会抛，也不能把页面带崩
+        globalThis.localStorage = {
+          getItem() { throw new Error('SecurityError'); },
+          setItem() { throw new Error('SecurityError'); },
+          removeItem() { throw new Error('SecurityError'); },
+        };
+        assert.doesNotThrow(() => update.readDismissed(), 'localStorage 抛异常时读取不应炸');
+        assert.equal(update.readDismissed(), 0, 'localStorage 抛异常时不应产生抑制状态');
+      } finally {
+        update.clearDismissed();
+        if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;
+      }
+    });
+
+    await checkAsync('设置页「检查更新」：发现新版就地渲染可点动作，并走与今日页「立即更新」同一个安装入口', async () => {
+      const update = await import('../js/update.js');
+      const win = globalThis.window;
+      const previousStorage = globalThis.localStorage;
+      const bag = new Map();
+      globalThis.localStorage = makeStorageBag(bag);
+      update.clearDismissed();
+      const remote = {
+        ok: true,
+        versionCode: 5,
+        versionName: '1.4.0',
+        url: 'https://example.com/dist/HMS-latest.apk',
+        apkUrl: 'https://example.com/dist/HMS-latest.apk',
+        sha256: 'abc123',
+      };
+      try {
+        // 先在今日页拿到「立即更新」真实发出去的参数，作为「同一条安装路径」的基准
+        const dashCalls = [];
+        win.HmsBridge = fakeBridge(remote, dashCalls);
+        const dash = await renderView('dashboard');
+        await tick(80);
+        const dashBar = byClass(dash, 'update-bar')[0];
+        assert.ok(dashBar, '前置：今日页更新条没有出现');
+        fireClick(findButton(dashBar, '立即更新'));
+        const dashInstall = dashCalls.find((c) => c && typeof c === 'object' && c.install);
+        assert.ok(dashInstall, '前置：今日页「立即更新」没有调用 installUpdate');
+        const dashPayload = JSON.parse(dashInstall.install);
+
+        // 用户已经在今日页点过「稍后」——设置页必须能自己把这条路重新打开
+        update.dismissVersion(5);
+        const settingsCalls = [];
+        win.HmsBridge = fakeBridge(remote, settingsCalls);
+        const root = await renderView('settings');
+        const checkBtn = findButton(root, '检查更新');
+        assert.ok(checkBtn, '设置页没有「检查更新」按钮');
+        fireClick(checkBtn);
+        await tick(80);
+
+        const action = byClass(root, 'update-check')[0];
+        assert.ok(action, '设置页没有渲染更新结果区');
+        assert.ok(action.textOf().includes('发现新版本 1.4.0'), `设置页没有显示发现的版本号：${action.textOf()}`);
+        const installBtn = root.walk().find((n) => n.tagName === 'button' && n.textOf() === '下载并安装');
+        assert.ok(installBtn, '设置页只报了个版本号，没有给出可点的「下载并安装」');
+        assert.equal(update.readDismissed(), 0, '设置页发现新版后没有清掉「稍后」的抑制状态');
+
+        fireClick(installBtn);
+        const settingsInstall = settingsCalls.find((c) => c && typeof c === 'object' && c.install);
+        assert.ok(settingsInstall, '点「下载并安装」没有调用 installUpdate');
+        const settingsPayload = JSON.parse(settingsInstall.install);
+        assert.deepEqual(settingsPayload, dashPayload, '设置页的安装参数与今日页「立即更新」不一致（不是同一条路径）');
+        assert.equal(settingsPayload.url, 'https://example.com/dist/HMS-latest.apk', '设置页安装参数丢了 url');
+        assert.equal(settingsPayload.sha256, 'abc123', '设置页安装参数丢了 sha256');
+        assert.equal(installBtn.disabled, true, '点「下载并安装」后按钮应禁用（防连点重复下载）');
+        assert.equal(installBtn.textOf(), '准备中…', `安装中的按钮文案不对：${installBtn.textOf()}`);
+
+        // 抑制状态被清掉后，今日页应当重新弹出同一版本
+        win.HmsBridge = fakeBridge(remote, []);
+        const back = await renderView('dashboard');
+        await tick(80);
+        assert.equal(byClass(back, 'update-bar').length, 1, '设置页清掉抑制状态后，今日页仍不弹同一版本');
+      } finally {
+        update.clearDismissed();
+        dropBridge();
+        if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;
+      }
+    });
+
+    await checkAsync('设置页「检查更新」：没有原生桥时不给死按钮，而是说清怎么更新（iOS / 浏览器）', async () => {
+      const update = await import('../js/update.js');
+      dropBridge();
+      try {
+        const root = await renderView('settings');
+        fireClick(findButton(root, '检查更新'));
+        await tick(40);
+        const action = byClass(root, 'update-check')[0];
+        assert.ok(action, '设置页没有渲染更新结果区');
+        assert.equal(
+          root.walk().some((n) => n.tagName === 'button' && n.textOf() === '下载并安装'),
+          false,
+          '没有桥时不应渲染「下载并安装」按钮（点了没反应）',
+        );
+        assert.ok(action.textOf().includes('刷新'), `网页版的更新指引没有告诉用户刷新：${action.textOf()}`);
+        assert.equal(update.isInstallAvailable(), false, '没有桥时应判定安装不可用');
+        assert.ok(
+          update.webUpdateGuidance({ userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1' }).includes('Safari'),
+          'iOS 的更新指引没有指向 Safari',
+        );
+        assert.ok(
+          update.webUpdateGuidance({ userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) Safari/604.1' }).includes('刷新'),
+          'iOS 的更新指引没有说刷新',
+        );
+        assert.ok(update.webUpdateGuidance({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }).includes('刷新'), '浏览器指引没有说刷新');
+
+        // 有桥但没有 installUpdate（老原生壳）：照样报出新版本，但不给点不动的按钮
+        const win = globalThis.window;
+        win.HmsBridge = {
+          version: () => JSON.stringify({ versionCode: 4, versionName: '1.3.0' }),
+          checkUpdate() {
+            setTimeout(() => {
+              if (typeof win.__hmsUpdate === 'function') win.__hmsUpdate({ ok: true, versionCode: 5, versionName: '1.4.0' });
+            }, 0);
+          },
+        };
+        const root2 = await renderView('settings');
+        fireClick(findButton(root2, '检查更新'));
+        await tick(80);
+        const action2 = byClass(root2, 'update-check')[0];
+        assert.ok(action2.textOf().includes('发现新版本 1.4.0'), `没有 installUpdate 时仍应报出发现的版本：${action2.textOf()}`);
+        assert.equal(
+          root2.walk().some((n) => n.tagName === 'button' && n.textOf() === '下载并安装'),
+          false,
+          '安装入口不可用时不应渲染「下载并安装」',
+        );
+        assert.ok(action2.textOf().includes('刷新'), '安装入口不可用时没有给替代指引');
+      } finally {
+        dropBridge();
+      }
+    });
+
+    await checkAsync('设置页「检查更新」：已是最新版本时如实提示，且不给安装按钮', async () => {
+      const win = globalThis.window;
+      const calls = [];
+      win.HmsBridge = fakeBridge({ ok: true, versionCode: 4, versionName: '1.3.0' }, calls);
+      try {
+        const root = await renderView('settings');
+        fireClick(findButton(root, '检查更新'));
+        await tick(80);
+        const action = byClass(root, 'update-check')[0];
+        assert.ok(action.textOf().includes('已是最新版本'), `没有如实提示已是最新：${action.textOf()}`);
+        assert.ok(action.textOf().includes('1.3.0'), `「已是最新」没有带上当前版本号：${action.textOf()}`);
+        assert.equal(
+          root.walk().some((n) => n.tagName === 'button' && n.textOf() === '下载并安装'),
+          false,
+          '已是最新时不应出现安装按钮',
+        );
+        assert.equal(calls.filter((c) => c === 'checkUpdate').length, 1, '一次点击应只 checkUpdate 一次');
+        assertNoLeak(nodeText(root), 'settings(检查更新)');
+      } finally {
+        dropBridge();
       }
     });
 
