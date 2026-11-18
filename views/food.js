@@ -1,7 +1,7 @@
 // 饮食页（SPEC §7「饮食」+ §9 错误处理）：拍照识别 / 手动添加 / 当日餐次维护。
 import {
   el, clear, toast, openSheet, confirmDialog, emptyState, fmtKcal, fmt1, fmtDateCN, fmtTime, bar,
-  motionAllowed, staggerEnter, countUp,
+  armPageMotion, staggerEnter, countUp,
 } from '../js/ui.js';
 import { localDateStr, parseDateStr, round1, slotFromMinutes, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
 // mealTargetsOf 走命名空间导入：命名导入缺导出会在模块链接期直接抛 SyntaxError（整页连同套件一起崩），
@@ -1604,20 +1604,6 @@ async function replaceMealItemFlow(meal, index, item, rawGrams, reload) {
   } catch (err) {
     toast(`替换失败：${err && err.message ? err.message : err}`, 'error');
   }
-}
-
-/**
- * 打开本页的动效作用域，并在下一帧摘掉「进度起点」。
- * 起始态（进度条 scaleX(0)）由 styles.css 的 .hms-grow-pending 提供，摘掉它之后 transition
- * 把视觉拉回终值 —— DOM 里的 width 本来就是终值（bar() 直接写 xx%）。
- * 总闸关闭（无 rAF / 减弱动效 / .hms-motion-off）时一个类都不挂，页面直接是终态。
- */
-function armPageMotion(root) {
-  if (!root || !root.classList || !motionAllowed()) return;
-  root.classList.add('hms-motion', 'hms-grow-pending');
-  requestAnimationFrame(() => {
-    if (root.classList) root.classList.remove('hms-grow-pending');
-  });
 }
 
 function renderMealCard(meal, reload, mealTarget) {

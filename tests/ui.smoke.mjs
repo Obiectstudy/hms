@@ -5935,6 +5935,434 @@ await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不�
       });
     });
 
+    /* ------------------------------------------------------------------
+     * 动效第二批：达标反馈（toast 对勾）· 页面切换过渡 · 其余页面接入（armPageMotion 收口）
+     * ------------------------------------------------------------------ */
+
+    const readText = (await import('node:fs')).readFileSync;
+    const cssText = readText(new URL('../styles.css', import.meta.url), 'utf8');
+    const uiText = readText(new URL('../js/ui.js', import.meta.url), 'utf8');
+    const viewText = (name) => readText(new URL('../views/' + name + '.js', import.meta.url), 'utf8');
+    const classListOf = (node) => String(node && node.className ? node.className : '').split(/\s+/).filter(Boolean);
+    const ghostCount = () => dom.body.childNodes.filter((n) => classListOf(n).includes('page-ghost')).length;
+    const dropGhosts = () => {
+      dom.body.childNodes = dom.body.childNodes.filter((n) => !classListOf(n).includes('page-ghost'));
+    };
+
+    /** 临时把 #view 换成可检查的节点；收尾时还原 getElementById / hash / window.HMS 并摘掉淡出层。 */
+    const withRouteHost = async (hash, fn) => {
+      const win = globalThis.window;
+      const view = new dom.FakeNode('div');
+      const originalGetById = dom.doc.getElementById;
+      const previousHash = win.location.hash;
+      const previousHms = win.HMS;
+      dom.doc.getElementById = (id) => (id === 'view' ? view : originalGetById(id));
+      win.location.hash = hash;
+      try {
+        return await fn(view, win);
+      } finally {
+        dom.doc.getElementById = originalGetById;
+        win.location.hash = previousHash;
+        win.HMS = previousHms;
+        dropGhosts();
+      }
+    };
+
+    await checkAsync('动效第二批：记录成功的 toast 挂 .hms-toast-ok（文本与出现时机一字未改）', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          const node = uiMotion.toast('已记录 250ml', 'ok');
+          assert.deepEqual(
+            classListOf(node).sort(),
+            ['hms-toast-ok', 'toast', 'toast--ok'],
+            '成功提示的视觉类不对：' + classListOf(node).join(' '),
+          );
+          assert.equal(node.textContent, '已记录 250ml', 'toast 文本被改了（对勾必须是 CSS 伪元素，不能进文本）');
+          assert.equal(node.getAttribute('role'), 'status', 'toast 的无障碍角色变了');
+          assert.equal(node.style.opacity, '', '对勾不该靠内联透明度实现');
+          assert.equal(node.style.transform, '', '对勾不该靠内联位移实现');
+          assert.equal(classListOf(node).includes('toast--out'), false, '提示一出现就带退场类：出现时机被改了');
+          node.remove();
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效第二批降级：没有 rAF 时 toast 不带动效类、不留半透明残留', async () => {
+      assert.equal(typeof globalThis.requestAnimationFrame, 'undefined', '前置：本机假 DOM 没有 rAF');
+      const node = uiMotion.toast('已记录 250ml', 'ok');
+      assert.deepEqual(classListOf(node), ['toast', 'toast--ok'], '降级时仍挂了动效类：' + classListOf(node).join(' '));
+      assert.equal(node.textContent, '已记录 250ml', '降级时提示文本变了');
+      assert.equal(node.style.opacity, '', '降级时写了内联透明度：会留下一个永远半透明的提示');
+      assert.equal(node.style.transform, '', '降级时写了内联位移');
+      node.remove();
+    });
+
+    await checkAsync('动效第二批：只有 ok 类型的 toast 挂对勾（info / error 保持原样）', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          const info = uiMotion.toast('已删除', 'info');
+          const bad = uiMotion.toast('保存失败', 'error');
+          assert.equal(classListOf(info).includes('hms-toast-ok'), false, '普通提示也挂了达标反馈类');
+          assert.equal(classListOf(bad).includes('hms-toast-ok'), false, '错误提示也挂了达标反馈类');
+          assert.equal(info.textContent, '已删除', '普通提示文本变了');
+          assert.equal(bad.textContent, '保存失败', '错误提示文本变了');
+          info.remove();
+          bad.remove();
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效第二批：对勾由 CSS 伪元素承担（只在 .hms-toast-ok 下生效 + 减弱动效归零）', async () => {
+      assert.ok(/\.hms-toast-ok::before\s*\{/.test(cssText), 'styles.css 里没有 .hms-toast-ok::before 规则');
+      assert.ok(/@keyframes hms-check-pop\s*\{/.test(cssText), 'styles.css 里没有对勾弹入的 keyframes');
+      assert.ok(/content:\s*'✓'/.test(cssText), '对勾不是伪元素画的：toast 文本会多出一个字符');
+      assert.ok(/hms-toast-ok::before[^}]*animation:\s*hms-check-pop/.test(cssText), '伪元素没有挂弹入动画');
+      const reduced = cssText.slice(cssText.lastIndexOf('@media (prefers-reduced-motion: reduce)'));
+      assert.ok(reduced.includes('.hms-toast-ok::before'), '减弱动效的归零清单里漏了对勾');
+    });
+
+    await checkAsync('动效第二批：armPageMotion 收口到 js/ui.js —— 挂作用域 + 下一帧摘掉进度起点', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          const node = new dom.FakeNode('div');
+          assert.equal(uiMotion.armPageMotion(node), 1, '动效开启时 armPageMotion 应返回 1');
+          assert.deepEqual(
+            classListOf(node).sort(),
+            ['hms-grow-pending', 'hms-motion'],
+            '作用域类没有一次挂全：' + classListOf(node).join(' '),
+          );
+          assert.equal(frames.queue.length, 1, '没有排「摘掉进度起点」的帧回调');
+          frames.queue.shift()(16);
+          assert.deepEqual(classListOf(node), ['hms-motion'], '帧回调没有摘掉 .hms-grow-pending（进度条会永远停在 0）');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效第二批：armPageMotion 降级 —— 无 rAF 一个类都不挂，也不排帧', async () => {
+      const node = new dom.FakeNode('div');
+      assert.equal(uiMotion.armPageMotion(node), 0, '降级时 armPageMotion 应返回 0');
+      assert.equal(classListOf(node).length, 0, '降级时挂了作用域类：' + classListOf(node).join(' '));
+      assert.equal(uiMotion.armPageMotion(null), 0, '传 null 时应安全返回 0');
+    });
+
+    await checkAsync('动效第二批：dashboard / food 不再自带副本，全部走 ui.js 的同一份 armPageMotion', async () => {
+      assert.equal(typeof uiMotion.armPageMotion, 'function', 'js/ui.js 没有导出 armPageMotion');
+      assert.ok(/export function armPageMotion\s*\(/.test(uiText), 'js/ui.js 里没有 armPageMotion 的实现');
+      for (const name of ['dashboard', 'food']) {
+        const source = viewText(name);
+        assert.ok(/armPageMotion/.test(source), name + '.js 没有用 armPageMotion');
+        assert.equal(/function armPageMotion\s*\(/.test(source), false, name + '.js 里还留着一份本地 armPageMotion（副本没有收口）');
+        assert.ok(/from '\.\.\/js\/ui\.js'/.test(source), name + '.js 没有从 js/ui.js 引入辅助');
+      }
+    });
+
+    await checkAsync('动效第二批：点击手感仍由 .hms-motion 作用域提供（:active 缩放 + 页面挂类）', async () => {
+      assert.ok(/\.hms-motion \.btn:active\s*\{[^}]*var\(--motion-press\)/.test(cssText), 'styles.css 里没有 .hms-motion .btn:active 的按下缩放');
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          const node = new dom.FakeNode('div');
+          assert.equal(uiMotion.armPageMotion(node), 1);
+          assert.ok(classListOf(node).includes('hms-motion'), 'armPageMotion 没有挂 .hms-motion：点击手感与进度起点都不会生效');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效第二批：切页时旧页变淡出层、新页挂 .hms-page-enter（全 CSS，不 await 动画）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await withRouteHost('#/water', async (view) => {
+          const frames = installFrames();
+          try {
+            await withReducedMotion(false, async () => {
+              const app = await freshApp();
+              await tick(120); // boot() 的首屏
+              await app.refresh(); // 第一次切换（会留下一个淡出层）
+              await tick(420); // 等它按兜底定时器被摘掉
+              assert.equal(ghostCount(), 0, '前置：上一轮淡出层没有收尾');
+              const first = view.childNodes[0];
+              assert.ok(first, '切页后 #view 里没有页面容器');
+              assert.ok(classListOf(first).includes('hms-page-enter'), '动效开启时新页没有挂 .hms-page-enter');
+              await app.refresh();
+              assert.equal(view.childNodes.length, 1, '切页后 #view 里留下了旧页：内容只属于当前页，实际 ' + view.childNodes.length + ' 个');
+              assert.notEqual(view.childNodes[0], first, '切页后还是同一个页面容器');
+              const ghosts = dom.body.childNodes.filter((n) => classListOf(n).includes('page-ghost'));
+              assert.equal(ghosts.length, 1, '旧页没有被搬去做淡出层（ghost 数 ' + ghosts.length + '）');
+              assert.equal(ghosts[0], first, '淡出层不是上一页那个节点');
+              assert.equal(ghosts[0].getAttribute('aria-hidden'), 'true', '淡出层没有 aria-hidden：读屏会把旧页再念一遍');
+              await tick(420);
+              assert.equal(ghostCount(), 0, '淡出层没有被摘掉：body 上永久留了一个半透明的旧页');
+            });
+          } finally {
+            frames.restore();
+          }
+        });
+      });
+    });
+
+    await checkAsync('动效第二批降级：没有 rAF 时切页不挂过渡类、也不产生淡出层', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await withRouteHost('#/water', async (view) => {
+          assert.equal(typeof globalThis.requestAnimationFrame, 'undefined', '前置：假 DOM 没有 rAF');
+          const app = await freshApp();
+          await tick(120);
+          await app.refresh();
+          const page = view.childNodes[0];
+          assert.ok(page, '降级时没有渲染出页面');
+          assert.equal(classListOf(page).includes('hms-page-enter'), false, '降级时仍挂了 .hms-page-enter（会跑一段永远不结束的动画）');
+          assert.ok(classListOf(page).includes('fade-in'), '降级时基线里的 .fade-in 丢了');
+          await app.refresh();
+          assert.equal(view.childNodes.length, 1, '降级时 #view 里不只剩当前页');
+          assert.equal(ghostCount(), 0, '降级时不该产生淡出层（body 上多了旧页节点）');
+        });
+      });
+    });
+
+    await checkAsync('动效第二批：切页后内容立即可读 —— 不等动画，150ms 内读到的就是终值', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const today = nutrition.localDateStr();
+        const goals = await store.getGoals();
+        const target = Number(goals.waterMl) || 2000;
+        const summary = await store.daySummary(today);
+        const water = Number(summary.water) || 0;
+        const expectedPct = Math.min(100, Math.round((water / target) * 100)) + '%';
+        await withRouteHost('#/water', async (view) => {
+          const frames = installFrames();
+          try {
+            await withReducedMotion(false, async () => {
+              const app = await freshApp();
+              await tick(120);
+              await app.refresh(); // 预热：首屏与动态 import 都已完成
+              const started = Date.now();
+              const pending = app.refresh();
+              await Promise.race([pending, tick(150)]);
+              const cost = Date.now() - started;
+              const page = view.childNodes[0];
+              assert.ok(page, '切页后 #view 里没有页面容器');
+              const text = nodeText(page);
+              assert.ok(text.includes('今日饮水'), '切页 ' + cost + 'ms 后仍读不到内容：渲染被绑在动画结束上（异步过渡）：' + text.slice(0, 120));
+              assert.ok(text.includes(String(water)), '切页后读到的不是终值：' + text.slice(0, 160));
+              assert.ok(text.includes(expectedPct), '切页后百分比不是终值（期望 ' + expectedPct + '）：' + text.slice(0, 160));
+              await pending;
+              assert.ok(nodeText(view.childNodes[0]).includes(String(water)), '渲染完成后水量不再是终值');
+            });
+          } finally {
+            frames.restore();
+          }
+        });
+      });
+    });
+
+    await checkAsync('动效第二批：切换后 #view 里只有当前页内容（旧页不掺进来）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        await withRouteHost('#/water', async (view, win) => {
+          const frames = installFrames();
+          try {
+            await withReducedMotion(false, async () => {
+              const app = await freshApp();
+              await tick(120);
+              await app.refresh();
+              assert.ok(nodeText(view).includes('今日饮水'), '前置：先渲染的是饮水页');
+              win.location.hash = '#/weight';
+              await app.refresh();
+              const text = nodeText(view);
+              assert.ok(text.includes('每天同一时间称重'), '切到体重页后 #view 里读不到体重页内容：' + text.slice(0, 120));
+              assert.equal(text.includes('今日饮水'), false, '#view 里还掺着上一页（饮水页）的内容');
+            });
+          } finally {
+            frames.restore();
+          }
+        });
+      });
+    });
+
+    await checkAsync('动效第二批：体重页接入（卡片错峰 + 进度起点 + 当前体重终值）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const weights = await store.recentWeights(60);
+        const stats = nutrition.weightStats(weights);
+        const settings = await store.getSettings();
+        const unit = settings && settings.weightUnit === 'jin' ? 'jin' : 'kg';
+        const latestText = stats.latest == null ? null : nutrition.kgToUnit(stats.latest, unit).toFixed(1);
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = await renderView('weight');
+            assert.ok(classListOf(root).includes('hms-motion'), '体重页没有打开动效作用域');
+            assert.ok(classListOf(root).includes('hms-grow-pending'), '体重页没有进度起点（目标进度条不会生长）');
+            const entered = byClass(root, 'hms-enter');
+            assert.ok(entered.length >= 4, '体重页卡片没有错峰入场，实测 ' + entered.length + ' 张');
+            assert.deepEqual(entered.map(delayOf), entered.map((_, i) => i * 40), '入场延迟不是逐项递增：' + entered.map(delayOf).join(','));
+            const text = nodeText(root);
+            assert.ok(text.includes('记录') && text.includes('历史记录'), '前置：体重页没渲染出来');
+            if (latestText) {
+              assert.ok(text.includes(latestText), '体重页读到的不是终值 ' + latestText + '：' + text.slice(0, 160));
+              const counted = byClass(root, 'hms-count');
+              assert.ok(counted.some((n) => n.textOf() === latestText), '当前体重没有走数字滚动（或终值没同步落地）');
+            }
+          });
+        } finally {
+          frames.restore();
+        }
+      });
+    });
+
+    await checkAsync('动效第二批：体重页历史 >50 行时只把卡片交给错峰（行不参与，阈值不被行数带崩）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const rows = [];
+        for (let i = 1; i <= 60; i += 1) {
+          rows.push({
+            id: 9100 + i,
+            date: nutrition.daysAgo(i),
+            weightKg: 60 + (i % 40) * 0.1,
+            createdAt: Date.now() - i * 1000,
+          });
+        }
+        const raw = await injectRaw('weights', rows[0]);
+        for (const row of rows.slice(1)) raw.data.set(row.id, structuredClone(row));
+        try {
+          const frames = installFrames();
+          try {
+            await withReducedMotion(false, async () => {
+              const root = await renderView('weight');
+              const listRows = byClass(root, 'list__item');
+              assert.ok(listRows.length > 50, '前置：历史行数应 >50，实测 ' + listRows.length);
+              const entered = byClass(root, 'hms-enter');
+              assert.equal(entered.length, byClass(root, 'card').length, '错峰入场的对象必须正好是本页卡片（>50 的行被塞进去会整批关掉），实际 ' + entered.length + ' 个');
+              assert.ok(entered.length >= 4 && entered.length <= 50, '卡片错峰没有生效或数量不合理：' + entered.length);
+            });
+          } finally {
+            frames.restore();
+          }
+        } finally {
+          for (const row of rows) raw.data.delete(row.id);
+        }
+      });
+    });
+
+    await checkAsync('动效第二批：运动页接入（卡片错峰 + 今日合计终值）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const today = nutrition.localDateStr();
+        const summary = await store.daySummary(today);
+        const burned = Math.round(Number(summary.burned) || 0);
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = await renderView('exercise');
+            assert.ok(classListOf(root).includes('hms-motion'), '运动页没有打开动效作用域');
+            const entered = byClass(root, 'hms-enter');
+            assert.equal(entered.length, 3, '运动页三张卡片没有全部错峰入场，实测 ' + entered.length + ' 张');
+            const text = nodeText(root);
+            assert.ok(text.includes(String(burned)), '运动页读到的今日合计不是终值 ' + burned + '：' + text.slice(0, 160));
+            const counted = byClass(root, 'hms-count');
+            assert.ok(counted.some((n) => n.textOf() === String(burned)), '今日合计没有走数字滚动（或终值没同步落地）');
+          });
+        } finally {
+          frames.restore();
+        }
+      });
+    });
+
+    await checkAsync('动效第二批：饮水页接入（卡片错峰 + 进度环起点 + 百分比终值）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const today = nutrition.localDateStr();
+        const goals = await store.getGoals();
+        const target = Number(goals.waterMl) || 2000;
+        const summary = await store.daySummary(today);
+        const water = Number(summary.water) || 0;
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = await renderView('water');
+            assert.ok(classListOf(root).includes('hms-motion'), '饮水页没有打开动效作用域');
+            assert.ok(classListOf(root).includes('hms-grow-pending'), '饮水页没有进度起点（进度环不会生长）');
+            const entered = byClass(root, 'hms-enter');
+            assert.equal(entered.length, 2, '饮水页两张卡片没有全部错峰入场，实测 ' + entered.length + ' 张');
+            const circle = root.walk().find((n) => String(n.getAttribute('class') || '').split(/\s+/).includes('ring__value'));
+            if (circle) {
+              const expected = 2 * Math.PI * 52 * Math.min(1, Math.max(0, water / target));
+              const dash = String(circle.getAttribute('stroke-dasharray') || '').split(' ')[0];
+              assert.ok(Math.abs(Number(dash) - expected) < 0.01, '进度环的弧长不是同步终值：' + dash + ' vs ' + expected);
+            }
+            const pct = Math.min(100, Math.round((water / target) * 100)) + '%';
+            assert.ok(nodeText(root).includes(pct), '饮水页百分比不是终值 ' + pct + '：' + nodeText(root).slice(0, 160));
+          });
+        } finally {
+          frames.restore();
+        }
+      });
+    });
+
+    await checkAsync('动效第二批：设置页接入（卡片错峰 + 页面作用域）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = await renderView('settings');
+            assert.ok(classListOf(root).includes('hms-motion'), '设置页没有打开动效作用域（按钮就没有点击手感）');
+            const entered = byClass(root, 'hms-enter');
+            assert.ok(entered.length >= 5, '设置页卡片没有错峰入场，实测 ' + entered.length + ' 张');
+            const text = nodeText(root);
+            assert.ok(text.includes('个人档案') && text.includes('关于'), '前置：设置页没渲染出来');
+            assertNoLeak(text, 'settings(动效第二批)');
+          });
+        } finally {
+          frames.restore();
+        }
+      });
+    });
+
+    await checkAsync('动效第二批：账号页接入（卡片错峰 + 数据规模数字的终值）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = await renderView('account');
+            assert.ok(classListOf(root).includes('hms-motion'), '账号页没有打开动效作用域');
+            const entered = byClass(root, 'hms-enter');
+            assert.ok(entered.length >= 3, '账号页卡片没有错峰入场，实测 ' + entered.length + ' 张');
+            const text = nodeText(root);
+            assert.ok(text.includes('当前账号') && text.includes('账号列表'), '前置：账号页没渲染出来');
+            const counted = byClass(root, 'hms-count');
+            assert.ok(counted.every((n) => n.textOf() !== '—'), '未知条数也被当成可滚动数字了');
+            assertNoLeak(text, 'account(动效第二批)');
+          });
+        } finally {
+          frames.restore();
+        }
+      });
+    });
+
+
     await checkAsync('回归：切页丢下弹层时弹层要走完收尾（监听器/滚动锁/Promise 都回到基线）', async () => {
       const uiMod = await import('../js/ui.js');
       clearOverlays();

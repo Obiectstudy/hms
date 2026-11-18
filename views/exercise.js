@@ -1,5 +1,5 @@
 // 运动页（SPEC §7「运动」）：MET 估算净消耗（不含基础代谢），可手改。
-import { el, clear, toast, confirmDialog, emptyState, fmtKcal, fmtDateCN, fmtTime } from '../js/ui.js';
+import { el, clear, toast, confirmDialog, emptyState, fmtKcal, fmtDateCN, fmtTime, staggerEnter, armPageMotion, countUp } from '../js/ui.js';
 import { localDateStr, EXERCISE_TYPES, estimateBurn } from '../js/nutrition.js';
 import { daySummary, logExercise, deleteExercise, recentWeights } from '../js/store.js';
 
@@ -184,11 +184,14 @@ export async function render(root) {
   ));
 
   const exercises = Array.isArray(summary.exercises) ? summary.exercises : [];
+  // 今日合计：countUp 先把终值同步写进 DOM（滚动只是视觉层），降级时就是一个静态数字。
+  const burnedNode = el('span', { className: 'stat__value', text: fmtKcal(summary.burned) });
+  countUp(burnedNode, 0, summary.burned, fmtKcal);
   root.appendChild(el('div', { className: 'card col' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
       el('div', { className: 'card__title', text: '今日合计' }),
       el('div', { className: 'stat__line' },
-        el('span', { className: 'stat__value', text: fmtKcal(summary.burned) }),
+        burnedNode,
         el('span', { className: 'stat__unit', text: 'kcal' }),
       ),
     ),
@@ -237,4 +240,8 @@ export async function render(root) {
     listCard.appendChild(list);
   }
   root.appendChild(listCard);
+
+  // 动效接线（与今日页 / 饮食页同一套）：卡片错峰入场（>50 张整批关掉）+ 页面作用域（点击手感）。
+  staggerEnter(Array.from(root.childNodes || []).filter((node) => node.classList && node.classList.contains('card')), { stepMs: 40 });
+  armPageMotion(root);
 }

@@ -1,5 +1,5 @@
 // 今日总览（SPEC §7「今日」）。只读聚合 + 两个快捷写入（饮水）。
-import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1, markBusy, motionAllowed, staggerEnter, countUp } from '../js/ui.js';
+import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1, markBusy, armPageMotion, staggerEnter, countUp } from '../js/ui.js';
 import { localDateStr, targetMacros, weightStats, sumItems, round1, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
 import { daySummary, getGoals, recentWeights, addWater, getSettings, exportStatus } from '../js/store.js';
 // currentDailyTargets 走命名空间导入：命名导入缺导出会在模块链接期直接抛 SyntaxError（整页连同套件一起崩），
@@ -321,20 +321,6 @@ function statBlock(label, value, unit, motion) {
     ),
     el('div', { className: 'stat__label', text: label }),
   );
-}
-
-/**
- * 打开本页的动效作用域，并在下一帧摘掉「进度起点」。
- * 起始态（进度条 scaleX(0)、环缩小并半透明）由 styles.css 的 .hms-grow-pending 提供；
- * 摘掉它之后 transition 把视觉拉回终值 —— DOM 里的 width / stroke-dasharray 本来就是终值。
- * 总闸关闭（无 rAF / 减弱动效 / .hms-motion-off）时一个类都不挂，页面直接是终态。
- */
-function armPageMotion(root) {
-  if (!motionAllowed()) return;
-  root.classList.add('hms-motion', 'hms-grow-pending');
-  requestAnimationFrame(() => {
-    if (root.classList) root.classList.remove('hms-grow-pending');
-  });
 }
 
 /**

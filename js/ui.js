@@ -94,6 +94,10 @@ const MAX_LIVE_TOASTS = 5;
 
 export function toast(msg, type = 'info') {
   const node = el('div', { className: `toast toast--${type}`, attr: { role: 'status' }, text: String(msg) });
+  // 达标 / 打卡反馈的视觉层：记录成功的那条 toast 会多一个对勾。
+  // 只挂类，不动文本、不动出现时机（两个定时器一字未改）；类也只由 motionAllowed() 决定 ——
+  // 降级时这个类根本不存在，styles.css 里的 ::before 因此完全不参与渲染，不会留下半透明残留。
+  if (type === 'ok' && motionAllowed()) node.classList.add('hms-toast-ok');
   document.body.appendChild(node);
   // 超出的旧提示立刻退场（只删最老的，最新那条永远在）。
   const live = [...document.querySelectorAll('.toast')];
@@ -596,7 +600,7 @@ export function field({ label = '', type = 'text', value = '', placeholder = '',
 /**
  * 动效总闸：能力 + 用户意愿，两样都成立才允许动。
  *
- * 降级行为（一处判定，三个入口全部走它：countUp / staggerEnter / 视图挂作用域类）：
+ * 降级行为（一处判定，四个入口全部走它：armPageMotion / staggerEnter / countUp / toast 的达标反馈）：
  *  1. 没有 requestAnimationFrame（本机假 DOM、老 WebView）→ false：一条动效都不执行，直接呈现终值。
  *  2. 命中 prefers-reduced-motion: reduce（系统「减弱动态效果」）→ false：同上。
  *  3. 根节点带 .hms-motion-off（低端机 / 省电模式的顶层开关）→ false：同上。
@@ -625,6 +629,28 @@ export function motionAllowed() {
       && rootNode.classList.contains('hms-motion-off')) return false;
   }
   return true;
+}
+
+/**
+ * 打开本页的动效作用域（第一批里 views/dashboard.js 与 views/food.js 各抄了一份，这里收口成唯一实现）。
+ *
+ * 做两件事，都只挂类、不碰内容：
+ *  1. 给根节点挂 .hms-motion —— styles.css 里「点击手感 / 进度增长 / 卡片入场」的规则全部挂在它下面，
+ *     没挂 = 本页不动（降级时页面直接就是终态）。
+ *  2. 同一帧先挂 .hms-grow-pending（进度条 scaleX(0)、环缩小并半透明），下一帧摘掉它：
+ *     transition 把视觉拉回终值。DOM 里的 width / stroke-dasharray 本来就是终值，这里从没改过。
+ *
+ * 降级：总闸关闭（无 rAF / 减弱动效 / 根节点 .hms-motion-off）时一个类都不挂，也不会排帧回调。
+ * 返回值：1 = 已打开作用域，0 = 降级（视图不关心，测试用它核对「这一页到底动没动」）。
+ */
+export function armPageMotion(root) {
+  if (!root || !root.classList || typeof root.classList.add !== 'function') return 0;
+  if (!motionAllowed()) return 0;
+  root.classList.add('hms-motion', 'hms-grow-pending');
+  requestAnimationFrame(() => {
+    if (root.classList) root.classList.remove('hms-grow-pending');
+  });
+  return 1;
 }
 
 /**

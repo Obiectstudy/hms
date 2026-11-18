@@ -1,5 +1,5 @@
 // 饮水页（SPEC §7「饮水」）：大号进度 + 快捷加量 + 自定义 + 撤销。
-import { el, ring, toast, openSheet, confirmDialog, fmtKcal, markBusy } from '../js/ui.js';
+import { el, ring, toast, openSheet, confirmDialog, fmtKcal, markBusy, staggerEnter, armPageMotion } from '../js/ui.js';
 import { localDateStr } from '../js/nutrition.js';
 import { daySummary, getGoals, addWater } from '../js/store.js';
 
@@ -109,4 +109,10 @@ export async function render(root) {
       el('button', { className: 'btn btn--ghost btn--sm', text: '修改目标', onClick: () => go('#/settings') }),
     ),
   ));
+
+  // 动效接线（与今日页 / 饮食页同一套）：卡片错峰入场 + 页面作用域。
+  // 作用域负责点击手感，以及让进度环这一帧从起点（缩放 + 半透明）长到终值 ——
+  // DOM 里的 stroke-dasharray 一直是终值，读文本 / 读属性都不受动效影响。
+  staggerEnter(Array.from(root.childNodes || []).filter((node) => node.classList && node.classList.contains('card')), { stepMs: 40 });
+  armPageMotion(root);
 }

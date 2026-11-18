@@ -2,7 +2,7 @@
 // 隔离原则见 js/accounts.js：一个账号一个 IndexedDB 库，本机数据永远留在这台设备。
 // 云端只做「整库快照的备份与恢复」：登录后把本机数据推上去，换设备时再拉下来；
 // 冲突时先在本机留一份副本（meta.conflictBackup），绝不静默覆盖本机数据。
-import { el, toast, confirmDialog, openSheet, emptyState } from '../js/ui.js';
+import { el, toast, confirmDialog, openSheet, emptyState, staggerEnter, armPageMotion, countUp } from '../js/ui.js';
 import {
   listAccounts, getActiveAccount, createAccount, renameAccount, removeAccount,
   dbNameForAccount, LEGACY_DB_NAME, MAX_ACCOUNTS,
@@ -311,9 +311,12 @@ export async function render(root, deps = {}) {
       SCALE_ROWS.map(([key, label]) => {
         const count = scale ? scale[key] : null;
         const known = Number.isFinite(count);
+        // 数据规模：已知条数走 countUp（终值同步落地，滚动只是视觉层），未知就保持「—」。
+        const valueNode = el('span', { className: 'stat__value stat__value--sm', text: known ? String(count) : '—' });
+        if (known) countUp(valueNode, 0, count, (v) => String(Math.round(v)));
         return el('div', { className: 'stat' },
           el('div', { className: 'stat__line' },
-            el('span', { className: 'stat__value stat__value--sm', text: known ? String(count) : '—' }),
+            valueNode,
             known ? el('span', { className: 'stat__unit', text: '条' }) : null,
           ),
           el('div', { className: 'stat__label', text: label }),
@@ -709,4 +712,8 @@ export async function render(root, deps = {}) {
     await refresh();
     toast(next ? `已删除「${account.name}」，已切回「${next.name}」` : `已删除「${account.name}」`, 'ok');
   }
+
+  // 动效接线（与今日页 / 饮食页同一套）：卡片错峰入场 + 页面作用域（点击手感）。
+  staggerEnter(Array.from(root.childNodes || []).filter((node) => node.classList && node.classList.contains('card')), { stepMs: 40 });
+  armPageMotion(root);
 }

@@ -1,5 +1,5 @@
 // 设置页（SPEC §7「设置」）：档案 / 目标 / 视觉识别 / 数据 / 关于。
-import { el, toast, confirmDialog, fmt1 } from '../js/ui.js';
+import { el, toast, confirmDialog, fmt1, staggerEnter, armPageMotion } from '../js/ui.js';
 import { localDateStr, ageFromBirthday, GUIDE, dailyTargets, mealTargetsOf } from '../js/nutrition.js';
 import {
   getProfile, saveProfile, getGoals, saveGoals,
@@ -724,6 +724,11 @@ export async function render(root) {
     el('div', { className: 'muted', text: '隐私说明：所有健康数据只保存在本机浏览器的 IndexedDB，不上传任何服务器。只有使用拍照识别时，照片会直接发送到你配置的阿里百炼接口。' }),
     el('div', { className: 'muted', text: '建议定期在「数据」里导出 JSON 备份；清除浏览器数据会丢失记录。' }),
   ));
+
+  // 动效接线（与今日页 / 饮食页同一套）：卡片错峰入场 + 页面作用域（按钮点击手感）。
+  // 设置页没有进度条 / 大数字，所以这里只有入场与手感两项。
+  staggerEnter(Array.from(root.childNodes || []).filter((node) => node.classList && node.classList.contains('card')), { stepMs: 40 });
+  armPageMotion(root);
 }
 
 /**

@@ -1,6 +1,6 @@
 // 体重页（SPEC §7「体重」）：刻度尺录入 upsert + 30 天折线 + 目标进度 + 历史删除。
 // 存储永远是 kg；斤只是「显示与输入」单位，落库前一律过 unitToKg。
-import { el, clear, rulerPicker, lineChart, bar, toast, confirmDialog, emptyState, fmt1, fmtDateCN } from '../js/ui.js';
+import { el, clear, rulerPicker, lineChart, bar, toast, confirmDialog, emptyState, fmt1, fmtDateCN, staggerEnter, armPageMotion, countUp } from '../js/ui.js';
 import {
   localDateStr, bmi, bmiClass, bmiGaps, weightStats, movingAverage,
   WEIGHT_UNITS, kgToUnit, unitToKg, weightStep, weightRange, weightUnitLabel,
@@ -436,10 +436,13 @@ export async function render(root) {
     if (stats.latest == null) {
       latestCard.appendChild(emptyState('还没有体重数据', '先记录一次', focusEntry));
     } else {
+      // 当前体重：countUp 同步写终值（滚动只是视觉层），降级时就是 fmt1 的结果。
+      const latestValue = el('span', { className: 'stat__value', text: fmt1(show(stats.latest)) });
+      countUp(latestValue, 0, show(stats.latest), fmt1);
       latestCard.appendChild(el('div', { className: 'row row--between' },
         el('div', { className: 'stat' },
           el('div', { className: 'stat__line' },
-            el('span', { className: 'stat__value', text: fmt1(show(stats.latest)) }),
+            latestValue,
             el('span', { className: 'stat__unit', text: label }),
           ),
           el('div', { className: 'stat__label', text: '当前体重' }),
@@ -567,4 +570,17 @@ export async function render(root) {
 
   buildEntry();
   renderSummary();
+
+  // 动效接线（与今日页 / 饮食页同一套）：卡片错峰入场 + 页面作用域（点击手感 / 进度条起点）。
+  // 「最新 / 趋势 / 历史」三张卡在 summaryBox 里（切单位会整块重画），所以这里多展开一层。
+  const cards = [];
+  for (const node of Array.from(root.childNodes || [])) {
+    if (!node || !node.classList) continue;
+    if (node.classList.contains('card')) { cards.push(node); continue; }
+    for (const inner of Array.from(node.childNodes || [])) {
+      if (inner && inner.classList && inner.classList.contains('card')) cards.push(inner);
+    }
+  }
+  staggerEnter(cards, { stepMs: 40 });
+  armPageMotion(root);
 }

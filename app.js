@@ -48,22 +48,67 @@ export async function refresh() {
 }
 
 /**
+ * js/ui.js 的模块句柄：清场要用它，页面切换过渡的总闸（ui.motionAllowed()）也要用它。
+ * 加载一次就记住，避免每次切页都重新 import（ESM 本身有缓存，这里省的是 await 的微任务）。
+ */
+let uiModule = null;
+
+async function loadUi() {
+  if (uiModule) return uiModule;
+  try {
+    uiModule = await import('./js/ui.js');
+  } catch (error) {
+    uiModule = null;
+    if (typeof console !== 'undefined') console.warn('[HMS] ui.js 加载失败，动效按关闭处理：', error);
+  }
+  return uiModule;
+}
+
+/**
  * 切页清场：委托给 js/ui.js 里的唯一一份实现（每个弹层先走完自己的 finish()，
  * 再摘掉残留节点；.toast 不在清理范围内 —— 它 2.9s 自删，见 ui.clearOverlays 的注释）。
  * ui.js 是动态加载的，所以这里是 async：renderRoute 里 await 之后必须重新核对渲染令牌。
  */
 export async function clearOverlays() {
-  try {
-    const ui = await import('./js/ui.js');
-    if (typeof ui.clearOverlays === 'function') {
-      ui.clearOverlays();
-      return;
-    }
-  } catch (error) {
-    if (typeof console !== 'undefined') console.warn('[HMS] 清场失败，退化成只摘节点：', error);
+  const ui = await loadUi();
+  if (ui && typeof ui.clearOverlays === 'function') {
+    ui.clearOverlays();
+    return;
   }
   for (const node of document.querySelectorAll('.sheet-backdrop, .modal-backdrop')) node.remove();
   document.body.style.overflow = '';
+}
+
+/* ---------- 页面切换过渡（纯 CSS，同步完成，绝不 await 动画） ---------- */
+// 旧页淡出 + 新页淡入。关键点：这里没有任何 await / 定时等待 ——
+// 旧页只是被挪到 body 上做一层「ghost」，淡出交给 CSS keyframes，动画收尾再把它摘掉；
+// 新页的淡入也是 CSS。所以 mod.render() 返回时内容已经在 #view 里，读文本立刻是终值。
+
+/** 旧页淡出时长（与 styles.css 的 --motion-dur-route 一致，超时兜底再多给一点）。 */
+const PAGE_OUT_MS = 240;
+
+/**
+ * 把上一页挪到 body 上做淡出层。
+ * 为什么挪走而不是留在 #view 里：#view 的内容必须只有当前页 —— 读文本 / 数卡片 /
+ * 自动化断言都只看当前页，旧内容不许掺进来。
+ * 移除有两条路：animationend（动画真的跑完）与兜底定时器（动画被关掉 / 老 WebView 不派事件），
+ * 谁先到谁摘，绝不把 ghost 永久留在 body 上。
+ */
+function detachLeavingPage(host) {
+  const leaving = host && host.childNodes ? host.childNodes[0] : null;
+  if (!leaving || !leaving.classList || typeof document === 'undefined' || !document.body) return;
+  leaving.classList.add('page-ghost');
+  leaving.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(leaving);
+  let done = false;
+  const drop = () => {
+    if (done) return;
+    done = true;
+    if (typeof leaving.remove === 'function') leaving.remove();
+    else if (leaving.parentNode) leaving.parentNode.removeChild(leaving);
+  };
+  if (typeof leaving.addEventListener === 'function') leaving.addEventListener('animationend', drop);
+  setTimeout(drop, PAGE_OUT_MS + 80);
 }
 
 function errorCard(error) {
@@ -97,9 +142,16 @@ async function renderRoute() {
     return;
   }
 
+  // 页面切换过渡的总闸：ui.js 已经在（或刚）加载完，用它的 motionAllowed() 判定，
+  // 没有 rAF / 减弱动效 / .hms-motion-off 时整段过渡都不发生，页面就是静态的终态。
+  const motion = Boolean(uiModule && typeof uiModule.motionAllowed === 'function' && uiModule.motionAllowed());
+  // 旧页淡出：只在动效允许时做，而且只是「挪走 + CSS 淡出」，不等它结束。
+  if (motion) detachLeavingPage(host);
+
   // 每次渲染都换一个全新的 .page 容器：上一轮若还在 await 后追加节点，
   // 只会写进已被移除的旧容器，不会污染新页面。
-  const page = make('div', 'page fade-in');
+  // .hms-page-enter 只有动效允许时才挂（CSS 里它的 keyframes 比 .fade-in 更具体，会接管淡入）。
+  const page = make('div', motion ? 'page fade-in hms-page-enter' : 'page fade-in');
   host.replaceChildren(page);
 
   for (const tab of document.querySelectorAll('.tab')) {
