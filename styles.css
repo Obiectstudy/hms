@@ -1176,3 +1176,95 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   .bmi-figure__svg { width: 48px; height: 66px; }
   .bmi-gaps { gap: 2px 8px; }
 }
+
+
+/* ---------- 动效（第一批：进度增长 / 数字滚动 / 错峰入场 / 点击手感） ---------- */
+/*
+ * 参数全部集中在这里：改时长 / 改手感只动这一段。
+ * 强度「中等」= 200~350ms；Keep 的风格是短、轻、不弹跳（缓动不带 overshoot）。
+ * 只动画 transform / opacity：不碰 width / height / top，避免每帧触发布局。
+ */
+:root {
+  --motion-dur-fast: 200ms;                     /* 点击手感（按下 / 回弹） */
+  --motion-dur: 280ms;                          /* 进度增长（条 / 环） */
+  --motion-dur-slow: 340ms;                     /* 卡片入场（单张）、数字落位 */
+  --motion-ease: cubic-bezier(.2, .7, .3, 1);   /* 通用缓动：起步快、收尾稳 */
+  --motion-ease-out: cubic-bezier(.16, 1, .3, 1); /* 入场缓动：更长的尾巴，落位不弹 */
+  --motion-step-ms: 40ms;                       /* 错峰步长（js/ui.js 的 staggerEnter stepMs 默认 40） */
+  --motion-enter-y: 8px;                        /* 入场位移量 */
+  --motion-press: .97;                          /* 按下缩放 */
+  --motion-ring-from: .92;                      /* 环入场起始缩放 */
+}
+
+/* 顶层开关：任何祖先带 .hms-motion-off，整页动效关闭（低端机 / 省电 / 排障兜底）。 */
+.hms-motion-off,
+.hms-motion-off *,
+.hms-motion-off *::before,
+.hms-motion-off *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/*
+ * 页面级动效作用域：只有 js/ui.js 的 motionAllowed() 为真时，视图才给根节点挂 .hms-motion。
+ * 没挂 = 本机假 DOM、老 WebView、或用户开了「减弱动态效果」—— 此时下面每一条规则都不生效，
+ * 界面直接就是终态（宽度是终值、文字是终值、卡片不透明）。
+ */
+
+/* 点击手感：按下缩放 + 回弹。只动 transform，颜色变化仍由 .btn--primary:active 负责。 */
+.hms-motion .btn {
+  transition: transform var(--motion-dur-fast) var(--motion-ease), background var(--motion-dur-fast) linear, opacity var(--motion-dur-fast) linear;
+}
+.hms-motion .btn:active { transform: scale(var(--motion-press)); }
+
+/*
+ * 进度增长：宽度 / 圆弧长度在 DOM 里始终是终值（bar() 写的 width、ring() 写的 stroke-dasharray），
+ * 这里只让「视觉」从 0 长到终值 —— 起始态由 .hms-grow-pending 提供（transform: scaleX(0)），
+ * 视图在下一帧把它摘掉，transition 就把 transform 拉回 1。全程不碰布局属性。
+ */
+.hms-motion .bar__fill {
+  transform-origin: left center;
+  transform: scaleX(1);
+  transition: transform var(--motion-dur) var(--motion-ease-out);
+}
+.hms-motion .ring__svg {
+  transform-origin: center;
+  transform: scale(1);
+  opacity: 1;
+  transition: transform var(--motion-dur) var(--motion-ease-out), opacity var(--motion-dur) var(--motion-ease);
+}
+.hms-motion.hms-grow-pending .bar__fill { transform: scaleX(0); transition: none; }
+.hms-motion.hms-grow-pending .ring__svg { transform: scale(var(--motion-ring-from)); opacity: .45; transition: none; }
+
+/* 卡片错峰入场：keyframes 只有一条，逐项延迟由 js/ui.js 的 staggerEnter 写进内联 animation-delay。
+ * animation-fill-mode: both 保证延迟期间也停在 from（透明），不会先闪一下再入场。 */
+@keyframes hms-enter {
+  from { opacity: 0; transform: translate3d(0, var(--motion-enter-y), 0); }
+  to { opacity: 1; transform: none; }
+}
+.hms-motion .hms-enter { animation: hms-enter var(--motion-dur-slow) var(--motion-ease-out) both; }
+
+/* 数字滚动：文字已经是终值，动效只是「落位」—— 起始位移与透明度由 js/ui.js 的 countUp 写在行内，
+ * 下一帧清空后由这里的 transition 收回原位。 */
+.hms-count {
+  transition: transform var(--motion-dur-slow) var(--motion-ease-out), opacity var(--motion-dur-slow) linear;
+}
+
+/* 减弱动态效果：整批归零（与文件里既有的全局 reduced-motion 规则叠加，这里是动效节的显式兜底）。 */
+@media (prefers-reduced-motion: reduce) {
+  .hms-motion .btn,
+  .hms-motion .btn:active,
+  .hms-motion .bar__fill,
+  .hms-motion .ring__svg,
+  .hms-motion .hms-enter,
+  .hms-count,
+  .hms-motion.hms-grow-pending .bar__fill,
+  .hms-motion.hms-grow-pending .ring__svg {
+    animation: none !important;
+    transition: none !important;
+    transform: none !important;
+  }
+  .hms-motion.hms-grow-pending .ring__svg { opacity: 1 !important; }
+  .hms-count { opacity: 1 !important; }
+}
+

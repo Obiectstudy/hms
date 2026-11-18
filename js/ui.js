@@ -588,3 +588,99 @@ export function field({ label = '', type = 'text', value = '', placeholder = '',
     input,
   );
 }
+
+/* ---------- 动效（第一批：进度增长 / 数字滚动 / 错峰入场 / 点击手感） ---------- */
+// 约定：动效只是视觉层。DOM 里的文字、宽度、圆弧长度、aria 值永远是终值 ——
+// 任何时刻读文本 / 读属性都必须拿到终值，中间帧只允许改 transform / opacity（样式见 styles.css 的动效节）。
+
+/**
+ * 动效总闸：能力 + 用户意愿，两样都成立才允许动。
+ *
+ * 降级行为（一处判定，三个入口全部走它：countUp / staggerEnter / 视图挂作用域类）：
+ *  1. 没有 requestAnimationFrame（本机假 DOM、老 WebView）→ false：一条动效都不执行，直接呈现终值。
+ *  2. 命中 prefers-reduced-motion: reduce（系统「减弱动态效果」）→ false：同上。
+ *  3. 根节点带 .hms-motion-off（低端机 / 省电模式的顶层开关）→ false：同上。
+ * 每次调用现算，不缓存：媒体查询的取值与根节点上的开关都可能在运行期变化。
+ */
+export function motionAllowed() {
+  // 没有帧回调就没有动画 —— 先判能力，这决定了假 DOM / 老 WebView 里的行为。
+  if (typeof requestAnimationFrame !== 'function') return false;
+  // 再看用户意愿：系统开了减弱动态效果，一律按终值呈现。
+  if (typeof matchMedia === 'function') {
+    let reduced = false;
+    try {
+      const query = matchMedia('(prefers-reduced-motion: reduce)');
+      reduced = Boolean(query && query.matches);
+    } catch {
+      reduced = false; // matchMedia 抛错 = 没表态，按「未开启减弱动效」处理
+    }
+    if (reduced) return false;
+  }
+  // 最后看页面级硬开关（styles.css 里 .hms-motion-off 会连 animation/transition 一起关掉）。
+  // <html> 与 <body> 都看：开关挂在哪一层都算数。
+  const doc = typeof document === 'undefined' ? null : document;
+  const roots = doc ? [doc.documentElement, doc.body] : [];
+  for (const rootNode of roots) {
+    if (rootNode && rootNode.classList && typeof rootNode.classList.contains === 'function'
+      && rootNode.classList.contains('hms-motion-off')) return false;
+  }
+  return true;
+}
+
+/**
+ * 卡片错峰入场：给一批节点挂 .hms-enter，并逐项递增 animation-delay（CSS 只有一条 keyframes）。
+ *
+ * 降级与预算：
+ *  - 动效总闸关闭 → 一个类都不挂、返回 0：卡片就是终态，静态可见。
+ *  - 条目数 > maxItems → 整批不做错峰，返回 0。500 张卡片各带一个 animation-delay 会把
+ *    主线程和合成器一起压住，而且错峰到第 30 张时用户早就滚过去了 —— 这种规模下「不动」才是对的。
+ * 返回值 = 实际挂上的节点数，方便视图 / 测试核对「这一页到底动没动」。
+ */
+export function staggerEnter(nodes, { stepMs = 40, maxItems = 50 } = {}) {
+  const list = [];
+  const source = Array.isArray(nodes) ? nodes : (isNode(nodes) ? [nodes] : (nodes ? Array.from(nodes) : []));
+  for (const node of source) if (node) list.push(node);
+  if (!list.length) return 0;
+  if (!motionAllowed()) return 0;       // 降级：不做错峰
+  if (list.length > maxItems) return 0; // 超过阈值：整批关掉（> 才关，正好 maxItems 仍然开）
+  const step = Number.isFinite(Number(stepMs)) && Number(stepMs) >= 0 ? Number(stepMs) : 40;
+  let applied = 0;
+  list.forEach((node, index) => {
+    if (!node.classList || typeof node.classList.add !== 'function') return;
+    node.classList.add('hms-enter');
+    node.style.animationDelay = `${index * step}ms`;
+    applied += 1;
+  });
+  return applied;
+}
+
+/**
+ * 数字滚动：把 to 的格式化结果写进 target，滚动只是叠加在它上面的视觉过渡。
+ *
+ * 红线：先写终值，而且永不写中间值 —— 任何时刻（同步调用之后、逐帧回调里）读 textContent
+ * 都只能是终值。所谓「滚动」是 transform / opacity 的落位过渡，不是把数字从 from 一路数到 to。
+ *
+ * 降级：总闸关闭（无 rAF / 减弱动效 / 根节点 .hms-motion-off）时，写完终值立刻返回，
+ * 连 .hms-count 类与内联样式都不碰 —— 呈现的就是终态。
+ * from 只用来决定起步位移（变化越大起步稍远，最多 10px），不参与任何数值计算。
+ */
+export function countUp(target, from, to, formatFn) {
+  if (!target) return;
+  const fmt = typeof formatFn === 'function' ? formatFn : (value) => String(value);
+  target.textContent = fmt(to); // 终值先落地（同步，且在挂任何动效之前）
+  if (!motionAllowed()) return; // 降级：到此为止
+  const start = Number(from);
+  const end = Number(to);
+  const delta = Number.isFinite(end) && Number.isFinite(start) ? Math.abs(end - start) : 0;
+  const lift = Math.min(10, 4 + Math.log10(1 + delta) * 3);
+  if (target.classList && typeof target.classList.add === 'function') target.classList.add('hms-count');
+  target.style.transform = `translate3d(0, ${lift.toFixed(1)}px, 0)`;
+  target.style.opacity = '0.35';
+  // 下一帧摘掉起始态 → styles.css 里 .hms-count 的 transition 把它平滑送回原位。
+  // 帧回调里只碰 transform / opacity，绝不碰文字。
+  requestAnimationFrame(() => {
+    target.style.transform = '';
+    target.style.opacity = '';
+  });
+}
+

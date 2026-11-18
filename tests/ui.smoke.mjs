@@ -5632,6 +5632,309 @@ await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不�
       }
     });
 
+    // ---- 9. 动效第一批（进度增长 / 数字滚动 / 错峰入场 / 点击手感） ----
+    // 本机假 DOM 没有 requestAnimationFrame —— 这正是红线 2 的降级环境，默认就只能测「不动」。
+    // 需要「动效开启」的用例统一用 installFrames() 临时注入可控 rAF，用完无条件还原。
+
+    const uiMotion = await import('../js/ui.js');
+
+    /** 可控 rAF：只入队不执行，由测试逐帧推进（时序完全确定，不受机器快慢影响）。 */
+    const installFrames = () => {
+      const queue = [];
+      const prev = globalThis.requestAnimationFrame;
+      globalThis.requestAnimationFrame = (fn) => { queue.push(fn); return queue.length; };
+      return {
+        queue,
+        restore() {
+          if (prev === undefined) delete globalThis.requestAnimationFrame;
+          else globalThis.requestAnimationFrame = prev;
+        },
+      };
+    };
+
+    /** 临时假 matchMedia：matches=true 模拟系统「减弱动态效果」。 */
+    const withReducedMotion = async (matches, fn) => {
+      const prev = globalThis.matchMedia;
+      globalThis.matchMedia = (query) => ({ matches, media: String(query), addEventListener() {}, removeEventListener() {} });
+      try {
+        return await fn();
+      } finally {
+        if (prev === undefined) delete globalThis.matchMedia;
+        else globalThis.matchMedia = prev;
+      }
+    };
+
+    const delayOf = (node) => Number(String(node.style.animationDelay).replace('ms', '')) || 0;
+
+    await checkAsync('动效降级：没有 requestAnimationFrame 时 motionAllowed() 恒为 false', async () => {
+      assert.equal(typeof globalThis.requestAnimationFrame, 'undefined', '前置：本机假 DOM 不该有 requestAnimationFrame');
+      assert.equal(uiMotion.motionAllowed(), false, '没有 rAF 时总闸必须是 false（否则视图会挂上永远不会走的动画类）');
+    });
+
+    await checkAsync('动效降级：无 rAF 时 countUp / staggerEnter 全部直接呈现终值', async () => {
+      const number = dom.doc.createElement('div');
+      uiMotion.countUp(number, 0, 1234, (v) => String(Math.round(v)));
+      assert.equal(number.textContent, '1234', '降级时 countUp 没有立刻把终值写进 DOM');
+      assert.equal(String(number.className).includes('hms-count'), false, '降级时不该挂 .hms-count');
+      assert.equal(number.style.transform, '', '降级时不该写内联 transform（否则元素会停在半路上）');
+      assert.equal(number.style.opacity, '', '降级时不该动透明度');
+
+      const cards = [dom.doc.createElement('div'), dom.doc.createElement('div')];
+      assert.equal(uiMotion.staggerEnter(cards), 0, '降级时 staggerEnter 必须返回 0');
+      assert.equal(cards.some((n) => String(n.className).includes('hms-enter')), false, '降级时不该给卡片挂入场类');
+      assert.equal(cards.some((n) => n.style.animationDelay), false, '降级时不该写 animation-delay');
+    });
+
+    await checkAsync('动效降级：命中 prefers-reduced-motion: reduce（即使有 rAF）也一律不动', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(true, async () => {
+          assert.equal(uiMotion.motionAllowed(), false, '系统开启减弱动效时总闸必须是 false');
+          const number = dom.doc.createElement('div');
+          uiMotion.countUp(number, 0, 987, (v) => String(Math.round(v)));
+          assert.equal(number.textContent, '987', '减弱动效时 countUp 没有立刻呈现终值');
+          assert.equal(frames.queue.length, 0, '减弱动效时不该排任何帧回调');
+          assert.equal(String(number.className).includes('hms-count'), false, '减弱动效时不该挂 .hms-count');
+          const card = dom.doc.createElement('div');
+          assert.equal(uiMotion.staggerEnter([card]), 0, '减弱动效时错峰入场必须关掉');
+          assert.equal(String(card.className).includes('hms-enter'), false, '减弱动效时不该给卡片挂入场类');
+        });
+        // 同一个环境把开关拨回来：证明上面挡住的是「用户意愿」，不是「能力」
+        await withReducedMotion(false, async () => {
+          assert.equal(uiMotion.motionAllowed(), true, '有 rAF 且未开启减弱动效时总闸应打开（对照组）');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效红线：countUp 之后立即读文本 = 终值（同步，任何中间值都不许进 DOM）', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          assert.equal(uiMotion.motionAllowed(), true, '前置：这个用例要动效开启');
+          const number = dom.doc.createElement('div');
+          number.textContent = '0';
+          uiMotion.countUp(number, 0, 1234, (v) => String(Math.round(v)));
+          assert.equal(number.textContent, '1234', 'countUp 后立即读到的不是终值：数字滚动把中间值写进了 DOM');
+          const money = dom.doc.createElement('div');
+          uiMotion.countUp(money, 1000, 87.5, (v) => Number(v).toFixed(1));
+          assert.equal(money.textContent, '87.5', '小数终值没有同步写入');
+          // 视觉层确实挂上了（否则「滚动」就成了空话），但它不参与文字
+          assert.ok(String(number.className).split(/\s+/).includes('hms-count'), '动效开启时应挂视觉层 .hms-count');
+          assert.ok(String(number.style.transform).includes('translate3d'), '起始位移应只写在 transform 上');
+          assert.equal(number.style.opacity, '0.35', '起始透明度应只写在 opacity 上');
+        });
+      } finally {
+        frames.restore();
+      }
+      // 红线的另一半：降级路径同样必须「同步读 = 终值」，不能因为不动就卡在中间值上。
+      const degraded = dom.doc.createElement('div');
+      uiMotion.countUp(degraded, 0, 456, (v) => String(Math.round(v)));
+      assert.equal(degraded.textContent, '456', '降级时 countUp 也必须立即呈现终值');
+    });
+
+    await checkAsync('动效红线：逐帧推进也永远读到终值（帧回调只碰 transform/opacity）', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          const number = dom.doc.createElement('div');
+          uiMotion.countUp(number, 0, 1234, (v) => String(Math.round(v)));
+          const seen = [number.textContent];
+          let guard = 0;
+          while (frames.queue.length && guard < 20) {
+            guard += 1;
+            frames.queue.shift()(16 * guard);
+            seen.push(number.textContent);
+          }
+          assert.ok(guard >= 1, '动效开启时应至少排了一个帧回调');
+          assert.deepEqual([...new Set(seen)], ['1234'], '逐帧读到了非终值：' + seen.join(' / '));
+          assert.equal(number.style.transform, '', '帧推进后应摘掉起始位移');
+          assert.equal(number.style.opacity, '', '帧推进后应摘掉起始透明度');
+          assert.equal(number.textContent, '1234', '帧推进后文字被改动了');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效预算：staggerEnter 条目数 > maxItems(50) 时整批不加动画类', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          assert.equal(uiMotion.motionAllowed(), true, '前置：这个用例要动效开启（否则「不加类」测不出是阈值挡的还是降级挡的）');
+          const many = Array.from({ length: 60 }, () => dom.doc.createElement('div'));
+          assert.equal(uiMotion.staggerEnter(many), 0, '60 条 > 50 时应整批关掉，实际挂了 ' + many.filter((n) => String(n.className).includes('hms-enter')).length + ' 个');
+          assert.equal(many.some((n) => String(n.className).includes('hms-enter')), false, '超过 maxItems 仍挂了入场类');
+          assert.equal(many.some((n) => n.style.animationDelay), false, '超过 maxItems 仍写了 animation-delay');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效预算：阈值语义是「> maxItems 才关」（正好 50 条仍然动，自定义阈值同样生效）', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          const exact = Array.from({ length: 50 }, () => dom.doc.createElement('div'));
+          assert.equal(uiMotion.staggerEnter(exact), 50, '正好 50 条时应全部挂上（阈值是 > 不是 >=）');
+          const custom = Array.from({ length: 4 }, () => dom.doc.createElement('div'));
+          assert.equal(uiMotion.staggerEnter(custom, { maxItems: 3 }), 0, '自定义 maxItems=3 时 4 条应整批关掉');
+          assert.equal(custom.some((n) => String(n.className).includes('hms-enter')), false);
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效错峰：正常时逐项 animation-delay 递增（默认 40ms，可覆盖）', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          const cards = Array.from({ length: 6 }, () => dom.doc.createElement('div'));
+          assert.equal(uiMotion.staggerEnter(cards), 6);
+          assert.deepEqual(cards.map((n) => n.style.animationDelay), ['0ms', '40ms', '80ms', '120ms', '160ms', '200ms'], '延迟不是逐项递增');
+          assert.equal(cards.every((n) => String(n.className).split(/\s+/).includes('hms-enter')), true, '每一项都要挂 .hms-enter');
+          const fast = Array.from({ length: 3 }, () => dom.doc.createElement('div'));
+          uiMotion.staggerEnter(fast, { stepMs: 25 });
+          assert.deepEqual(fast.map((n) => n.style.animationDelay), ['0ms', '25ms', '50ms'], 'stepMs 覆盖没生效');
+          const single = dom.doc.createElement('div');
+          assert.equal(uiMotion.staggerEnter([single], { stepMs: 0 }), 1, '单张卡片也要正常处理');
+          assert.equal(single.style.animationDelay, '0ms', 'stepMs=0 时不该出现 NaN 延迟');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效红线：进度条的目标值同步写入（aria-valuenow 与填充宽度读到的都是终值）', async () => {
+      const check = (barNode, label) => {
+        assert.equal(barNode.getAttribute('aria-valuenow'), '25', label + '：aria-valuenow 不是同步的百分比终值');
+        assert.equal(byClass(barNode, 'bar__fill')[0].style.width, '25%', label + '：进度条宽度不是同步的终值');
+      };
+      check(uiMotion.bar({ value: 250, max: 1000 }), '降级态');
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          check(uiMotion.bar({ value: 250, max: 1000 }), '动效态');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效红线：进度环的圆弧长度同步写入（stroke-dasharray 读到的就是终值）', async () => {
+      const dashOf = (ringNode) => {
+        const circle = ringNode.walk().find((n) => String(n.getAttribute('class') || '').split(/\s+/).includes('ring__value'));
+        return circle ? String(circle.getAttribute('stroke-dasharray') || '') : '';
+      };
+      const expected = 2 * Math.PI * 52 * 0.25;
+      const dash = dashOf(uiMotion.ring({ value: 300, max: 1200 }));
+      assert.ok(dash, '环的圆弧没有 stroke-dasharray');
+      assert.ok(Math.abs(Number(dash.split(' ')[0]) - expected) < 0.01, '环的圆弧长度不是同步终值：' + dash);
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          assert.equal(dashOf(uiMotion.ring({ value: 300, max: 1200 })), dash, '动效开启后圆弧长度变了（动效只许影响视觉）');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    await checkAsync('动效接线：今日页在动效开启下渲染，既有文本读数仍是终值 + 卡片错峰生效', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const today = nutrition.localDateStr();
+        // 降级态先测：这一步不能有任何 rAF 注入（否则测的就不是降级路径了）
+        const plain = await renderView('dashboard');
+        const summary = await store.daySummary(today);
+        const intake = Math.round(summary.intake.kcal);
+        assert.equal(String(plain.className).split(/\s+/).includes('hms-motion'), false, '降级态不该挂 .hms-motion');
+        assert.ok(nodeText(plain).includes(String(intake)), '降级态今日页读不到摄入终值 ' + intake);
+
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = new dom.FakeNode('div');
+            const dashboardView = await loadView('dashboard');
+            await dashboardView.render(root);
+            const text = nodeText(root);
+            assert.ok(String(root.className).split(/\s+/).includes('hms-motion'), '动效开启时今日页没有打开动效作用域');
+            assert.ok(text.includes(String(intake)), '动效开启后今日页读到的不是终值：' + text.slice(0, 200));
+            const entered = byClass(root, 'hms-enter');
+            assert.ok(entered.length >= 5, '今日页卡片没有错峰入场，实测 ' + entered.length + ' 张');
+            const delays = entered.map(delayOf);
+            assert.deepEqual(delays, entered.map((_, i) => i * 40), '入场延迟不是逐项递增：' + delays.join(','));
+          });
+        } finally {
+          frames.restore();
+        }
+      });
+    });
+
+    await checkAsync('动效接线：饮食页在动效开启下渲染，当日合计仍读到终值', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const today = nutrition.localDateStr();
+        const mealId = await store.logMeal({
+          date: today, slot: 'dinner', source: 'manual',
+          items: [{ name: '动效读数餐', grams: 100, kcal: 432, carb: 10, protein: 5, fat: 3 }],
+        });
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = new dom.FakeNode('div');
+            const foodView = await loadView('food');
+            await foodView.render(root);
+            const summary = await store.daySummary(today);
+            const intake = Math.round(summary.intake.kcal);
+            const text = nodeText(root);
+            assert.ok(String(root.className).split(/\s+/).includes('hms-motion'), '动效开启时饮食页没有打开动效作用域');
+            assert.ok(text.includes('当日合计'), '前置：饮食页没渲染出来');
+            assert.ok(text.includes(String(intake)), '动效开启后饮食页读到的不是终值 ' + intake + '：' + text.slice(0, 240));
+            assert.ok(text.includes('动效读数餐'), '前置：这一餐没有上屏');
+          });
+        } finally {
+          frames.restore();
+          await store.deleteMeal(mealId);
+        }
+      });
+    });
+
+    await checkAsync('动效预算：饮食页卡片 >50 张时实测整批不做错峰（页面级）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const today = nutrition.localDateStr();
+        const made = [];
+        for (let i = 0; i < 55; i += 1) {
+          made.push(await store.logMeal({
+            date: today, slot: 'snack', source: 'manual',
+            items: [{ name: '错峰实测 ' + i, grams: 100, kcal: 10, carb: 1, protein: 1, fat: 1 }],
+          }));
+        }
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = new dom.FakeNode('div');
+            const foodView = await loadView('food');
+            await foodView.render(root);
+            const mealCards = byClass(root, 'card').filter((c) => c.textOf().includes('删整餐'));
+            assert.ok(mealCards.length > 50, '前置：饮食页卡片数应 >50，实测 ' + mealCards.length);
+            assert.equal(byClass(root, 'hms-enter').length, 0, '超过 50 张卡片仍做了错峰入场（餐卡 ' + mealCards.length + ' 张，整页 ' + byClass(root, 'hms-enter').length + ' 张挂了动画类）');
+            assert.ok(nodeText(root).includes('当日合计'), '前置：饮食页没渲染出来');
+          });
+        } finally {
+          frames.restore();
+          for (const id of made) await store.deleteMeal(id);
+        }
+      });
+    });
+
     await checkAsync('回归：切页丢下弹层时弹层要走完收尾（监听器/滚动锁/Promise 都回到基线）', async () => {
       const uiMod = await import('../js/ui.js');
       clearOverlays();

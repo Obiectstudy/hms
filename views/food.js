@@ -1,6 +1,7 @@
 // 饮食页（SPEC §7「饮食」+ §9 错误处理）：拍照识别 / 手动添加 / 当日餐次维护。
 import {
   el, clear, toast, openSheet, confirmDialog, emptyState, fmtKcal, fmt1, fmtDateCN, fmtTime, bar,
+  motionAllowed, staggerEnter, countUp,
 } from '../js/ui.js';
 import { localDateStr, parseDateStr, round1, slotFromMinutes, sumItems, scaleFood as scalePer100g } from '../js/nutrition.js';
 // mealTargetsOf 走命名空间导入：命名导入缺导出会在模块链接期直接抛 SyntaxError（整页连同套件一起崩），
@@ -1605,6 +1606,20 @@ async function replaceMealItemFlow(meal, index, item, rawGrams, reload) {
   }
 }
 
+/**
+ * 打开本页的动效作用域，并在下一帧摘掉「进度起点」。
+ * 起始态（进度条 scaleX(0)）由 styles.css 的 .hms-grow-pending 提供，摘掉它之后 transition
+ * 把视觉拉回终值 —— DOM 里的 width 本来就是终值（bar() 直接写 xx%）。
+ * 总闸关闭（无 rAF / 减弱动效 / .hms-motion-off）时一个类都不挂，页面直接是终态。
+ */
+function armPageMotion(root) {
+  if (!root || !root.classList || !motionAllowed()) return;
+  root.classList.add('hms-motion', 'hms-grow-pending');
+  requestAnimationFrame(() => {
+    if (root.classList) root.classList.remove('hms-grow-pending');
+  });
+}
+
 function renderMealCard(meal, reload, mealTarget) {
   const card = el('div', { className: 'card' },
     el('div', { className: 'card__head' },
@@ -1686,6 +1701,11 @@ async function paint(root, date, reload, targets) {
     el('div', { className: 'muted', text: `${fmtDateCN(date)}${date === today ? '（今天）' : ''}` }),
   ));
 
+  // 错峰入场的对象：本页所有卡片。条目数 > 50 时 staggerEnter 整批关掉
+  // （500 餐的极端场景下既不挂类也不写 animation-delay，见 tests/fuzz.ui.mjs 的计时用例）。
+  const cards = [];
+  const mountCard = (card) => { cards.push(card); root.appendChild(card); return card; };
+
   const nav = el('div', { className: 'card row row--between' },
     el('button', { className: 'btn btn--ghost btn--sm', text: '‹ 前一天', onClick: async () => reload(shiftDate(date, -1)) }),
     el('div', { className: 'row' },
@@ -1698,11 +1718,11 @@ async function paint(root, date, reload, targets) {
       onClick: async () => { if (date < today) await reload(shiftDate(date, 1)); },
     }),
   );
-  root.appendChild(nav);
+  mountCard(nav);
 
   // 日期条下方：常吃套餐。没有套餐且当天不足 2 餐时整块不渲染，不留空白。
   const templateCard = renderTemplateCard(templates, date, reload, groupDayMeals(summary.meals).length);
-  if (templateCard) root.appendChild(templateCard);
+  if (templateCard) mountCard(templateCard);
 
   // 相机/相册各一个 label 包 input：label 点击即原生打开选择器，没有额外的用户手势损耗。
   const cameraInput = el('input', { className: 'hidden-file', type: 'file', accept: 'image/*', attr: { capture: 'environment' } });
@@ -1733,11 +1753,11 @@ async function paint(root, date, reload, targets) {
     albumLabel,
     el('button', { className: 'btn btn--ghost btn--block', text: '手动添加', onClick: () => manualFlow(date, reload) }),
   );
-  root.appendChild(actionCard);
+  mountCard(actionCard);
 
   const meals = Array.isArray(summary.meals) ? summary.meals : [];
   if (!meals.length) {
-    root.appendChild(el('div', { className: 'card' },
+    mountCard(el('div', { className: 'card' },
       emptyState('这一天还没有饮食记录', '拍照识别第一餐', () => {
         if (hasKey) cameraInput.click();
         else offerApiKeyHelp(date, reload);
@@ -1754,7 +1774,7 @@ async function paint(root, date, reload, targets) {
       root.appendChild(el('div', { className: 'h2', text: `${slot.label} · ${group.reduce((s, m) => s + sumItems(m.items || []).kcal, 0)} kcal${fiberSubtotalSuffix(slotItems)}` }));
       // 目标按餐次算一次（同一餐次的多条记录共用同一份目标），snack 拿到的是 null。
       const slotTarget = mealTargetOf(targets, slot.value);
-      for (const meal of group) root.appendChild(renderMealCard(meal, reload, slotTarget));
+      for (const meal of group) mountCard(renderMealCard(meal, reload, slotTarget));
     }
   }
 
@@ -1765,7 +1785,10 @@ async function paint(root, date, reload, targets) {
     for (const item of (Array.isArray(dayMeal.items) ? dayMeal.items : [])) dayItems.push(item);
   }
   const fiberText = fiberSummaryText(fiberTotals(dayItems));
-  root.appendChild(el('div', { className: 'card col' },
+  // 总摄入：文字由 countUp 同步写成终值（滚动只是视觉层）；动效关闭时就是 fmtKcal 的结果。
+  const totalIntakeNode = el('span', { className: 'stat__value', text: fmtKcal(intake.kcal) });
+  countUp(totalIntakeNode, 0, intake.kcal, fmtKcal);
+  mountCard(el('div', { className: 'card col' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
       el('div', { className: 'card__title', text: '当日合计' }),
       el('div', { className: 'muted', text: `运动消耗 ${fmtKcal(summary.burned)} kcal` }),
@@ -1773,7 +1796,7 @@ async function paint(root, date, reload, targets) {
     el('div', { className: 'row row--between' },
       el('div', { className: 'stat' },
         el('div', { className: 'stat__line' },
-          el('span', { className: 'stat__value', text: fmtKcal(intake.kcal) }),
+          totalIntakeNode,
           el('span', { className: 'stat__unit', text: 'kcal' }),
         ),
         el('div', { className: 'stat__label', text: '总摄入' }),
@@ -1789,6 +1812,9 @@ async function paint(root, date, reload, targets) {
     bar({ value: intake.kcal, max: Math.max(1, Number(goals.calorieTarget) || 1), color: 'var(--brand)' }),
     el('div', { className: 'muted', text: `目标的 ${Math.round((intake.kcal / Math.max(1, Number(goals.calorieTarget) || 1)) * 100)}%` }),
   ));
+
+  // 卡片错峰入场：> 50 张（极端库）时整批关掉，避免 500 个 animation-delay 一起排队。
+  staggerEnter(cards, { stepMs: 40 });
 }
 
 /**
@@ -1813,6 +1839,8 @@ export async function render(root, options = {}) {
     const kids = Array.from(staging.childNodes);
     clear(root);
     for (const child of kids) root.appendChild(child);
+    // 内容真正挂到 root 之后才打开作用域：进度条 / 环要在同一帧里从起点长到终值。
+    armPageMotion(root);
   };
   await reload();
 }

@@ -1,5 +1,5 @@
 // 今日总览（SPEC §7「今日」）。只读聚合 + 两个快捷写入（饮水）。
-import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1, markBusy } from '../js/ui.js';
+import { el, ring, bar, toast, emptyState, fmtKcal, fmtDateCN, fmtTime, fmt1, markBusy, motionAllowed, staggerEnter, countUp } from '../js/ui.js';
 import { localDateStr, targetMacros, weightStats, sumItems, round1, kgToUnit, weightUnitLabel } from '../js/nutrition.js';
 import { daySummary, getGoals, recentWeights, addWater, getSettings, exportStatus } from '../js/store.js';
 // currentDailyTargets 走命名空间导入：命名导入缺导出会在模块链接期直接抛 SyntaxError（整页连同套件一起崩），
@@ -307,14 +307,34 @@ function fiberRow(items) {
   );
 }
 
-function statBlock(label, value, unit) {
+/**
+ * 一格数字。motion 传 { from, to, format } 时走 countUp —— 它先把终值同步写进 DOM，
+ * 「滚动」只是叠在上面的视觉层；不传就保持原来的静态写法（两条路径的文字完全一样）。
+ */
+function statBlock(label, value, unit, motion) {
+  const valueNode = el('span', { className: 'stat__value', text: value });
+  if (motion) countUp(valueNode, motion.from == null ? 0 : motion.from, motion.to, motion.format || fmtKcal);
   return el('div', { className: 'stat' },
     el('div', { className: 'stat__line' },
-      el('span', { className: 'stat__value', text: value }),
+      valueNode,
       unit ? el('span', { className: 'stat__unit', text: unit }) : null,
     ),
     el('div', { className: 'stat__label', text: label }),
   );
+}
+
+/**
+ * 打开本页的动效作用域，并在下一帧摘掉「进度起点」。
+ * 起始态（进度条 scaleX(0)、环缩小并半透明）由 styles.css 的 .hms-grow-pending 提供；
+ * 摘掉它之后 transition 把视觉拉回终值 —— DOM 里的 width / stroke-dasharray 本来就是终值。
+ * 总闸关闭（无 rAF / 减弱动效 / .hms-motion-off）时一个类都不挂，页面直接是终态。
+ */
+function armPageMotion(root) {
+  if (!motionAllowed()) return;
+  root.classList.add('hms-motion', 'hms-grow-pending');
+  requestAnimationFrame(() => {
+    if (root.classList) root.classList.remove('hms-grow-pending');
+  });
 }
 
 /**
@@ -377,21 +397,26 @@ export async function render(root, options = {}) {
     if (typeof console !== 'undefined') console.warn('[HMS] 更新提示不可用：', error);
   }
 
-  root.appendChild(el('div', { className: 'card' },
+  // 卡片错峰入场的对象：本页所有顶层卡片，最后一次性交给 staggerEnter（>50 张自动关）。
+  const cards = [];
+  const mountCard = (card) => { cards.push(card); root.appendChild(card); };
+
+  const remaining = Math.max(0, calorieTarget - net);
+  mountCard(el('div', { className: 'card' },
     el('div', { className: 'card__head' },
       el('div', { className: 'card__title', text: '热量' }),
       el('div', { className: 'pill', text: `目标 ${fmtKcal(calorieTarget)} kcal` }),
     ),
     el('div', { className: 'ring-wrap' }, ring({ value: net, max: calorieTarget, label: '净热量', unit: 'kcal', color: 'var(--brand)' })),
     el('div', { className: 'grid-3' },
-      statBlock('摄入', fmtKcal(intake.kcal), 'kcal'),
-      statBlock('运动消耗', fmtKcal(burned), 'kcal'),
-      statBlock('剩余可吃', fmtKcal(Math.max(0, calorieTarget - net)), 'kcal'),
+      statBlock('摄入', fmtKcal(intake.kcal), 'kcal', { from: 0, to: intake.kcal }),
+      statBlock('运动消耗', fmtKcal(burned), 'kcal', { from: 0, to: burned }),
+      statBlock('剩余可吃', fmtKcal(remaining), 'kcal', { from: 0, to: remaining }),
     ),
   ));
 
   const macroTargets = targetMacroGrams(targets, goals);
-  root.appendChild(el('div', { className: 'card col' },
+  mountCard(el('div', { className: 'card col' },
     el('div', { className: 'card__head', style: { marginBottom: '0' } },
       el('div', { className: 'card__title', text: '宏量营养素' }),
     ),
@@ -403,7 +428,7 @@ export async function render(root, options = {}) {
 
   // 每日目标（比例 + 克数 + 纤维 / 钠进度 + 推算依据）：口径与克数一律取自 currentDailyTargets()，
   // 这里不重算 BM / TDEE，也不再存第二套目标。
-  root.appendChild(targetCard(targets, dayItems));
+  mountCard(targetCard(targets, dayItems));
 
   // 体重卡：没有数据时给下一步按钮，避免用户看死胡同。
   const stats = weightStats(Array.isArray(weights) ? weights : []);
@@ -418,7 +443,7 @@ export async function render(root, options = {}) {
   } else {
     const delta = stats.delta7;
     weightCard.appendChild(el('div', { className: 'row row--between' },
-      statBlock('最近一次', fmt1(showWeight(stats.latest)), weightLabel),
+      statBlock('最近一次', fmt1(showWeight(stats.latest)), weightLabel, { from: 0, to: showWeight(stats.latest), format: fmt1 }),
       el('div', { className: 'col align-end' },
         el('div', { className: 'label', text: '较 7 天前' }),
         el('div', {
@@ -429,7 +454,7 @@ export async function render(root, options = {}) {
       ),
     ));
   }
-  root.appendChild(weightCard);
+  mountCard(weightCard);
 
   const waterTarget = Number(goals.waterMl) || 2000;
   const water = Number(summary.water) || 0;
@@ -453,7 +478,7 @@ export async function render(root, options = {}) {
     return button;
   };
 
-  root.appendChild(el('div', { className: 'card' },
+  mountCard(el('div', { className: 'card' },
     el('div', { className: 'card__head' },
       el('div', { className: 'card__title', text: '饮水' }),
       el('div', { className: `pill ${water >= waterTarget ? 'pill--ok' : ''}`, text: `${water} / ${waterTarget} ml` }),
@@ -465,7 +490,7 @@ export async function render(root, options = {}) {
     ),
   ));
 
-  root.appendChild(el('div', { className: 'card' },
+  mountCard(el('div', { className: 'card' },
     el('div', { className: 'card__head' },
       el('div', { className: 'card__title', text: '运动' }),
       el('button', { className: 'btn btn--ghost btn--sm', text: '记录', onClick: () => go('#/exercise') }),
@@ -524,5 +549,11 @@ export async function render(root, options = {}) {
     );
     mealCard.appendChild(el('div', { className: 'card__head meal-fold__head' }, toggle, recordBtn));
   }
-  root.appendChild(mealCard);
+  mountCard(mealCard);
+
+  // 动效接线（只在这一处收口）：先按顺序挂卡片的错峰入场，再打开页面作用域并排一次
+  // 「摘掉进度起点」的帧回调 —— 本页所有进度条 / 环因此同一帧从 0 长到终值。
+  // 两个入口都在总闸关闭时什么都不做（>50 张卡片时 staggerEnter 也会整批关掉）。
+  staggerEnter(cards, { stepMs: 40 });
+  armPageMotion(root);
 }
