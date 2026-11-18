@@ -1,0 +1,706 @@
+/**
+ * 业务编排层：视图层唯一入口。
+ * 这里只做「按契约把参数变成记录、按契约把记录拼成视图需要的形状」，
+ * 真正碰 IDB 的活全在 db.js，真正算数的活全在 nutrition.js / pure.js。
+ */
+
+import * as db from './db.js';
+import * as accounts from './accounts.js';
+import {
+  localDateStr,
+  daysAgo,
+  ageFromBirthday,
+  weightStats,
+  round1,
+  WEIGHT_UNITS,
+  dailyTargets,
+  inferGoalKind,
+  GUIDE,
+} from './nutrition.js';
+import {
+  normalizeItems,
+  normalizeMealRecord,
+  normalizeWeightRecord,
+  normalizeExerciseRecord,
+  normalizeRecord,
+  normalizeMealTemplates,
+  planMealTemplateSave,
+  planDayTemplateSave,
+  removeMealTemplate,
+  collectRecentFoodItems,
+  daysSinceExport,
+  buildDaySummary,
+  buildRangeRows,
+  buildCSV,
+  stripSyncSecrets,
+} from './pure.js';
+
+// 与 js/vision.js 的 DEFAULT_* 保持一致；这里写字面量是为了不跨边界 import 别人的文件
+// qwen-vl-max 在部分百炼账号上返回 404 model_not_found，实测可用的默认是 qwen3-vl-plus
+const DEFAULT_SETTINGS = {
+  apiKey: '',
+  model: 'qwen3-vl-plus',
+  baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  // 只影响显示与输入：落库的体重永远是 kg
+  weightUnit: 'kg',
+  // 作息偏移（分钟）：只影响「现在几点算哪一餐」的默认槽位，不改任何记录的日期
+  slotOffsetMinutes: 0,
+};
+
+// 作息偏移的允许区间：-3 小时（作息偏早）～ +4 小时（新疆 +2 小时留足余量）
+const SLOT_OFFSET_MIN = -180;
+const SLOT_OFFSET_MAX = 240;
+
+// 无档案 / 档案不全时的保底目标（与 nutrition.js 的 SAFE_TARGET_INPUT 同口径：
+// 男 60kg / 170cm / 30 岁 / 久坐 + 维持档 → 1800 kcal、蛋白 60kg×1.1≈65g、水 max(1700, 2100)=2100ml）。
+const SAFE_GOALS = {
+  calorieTarget: 1800,
+  carbPct: 50,
+  proteinPct: 20,
+  fatPct: 30,
+  waterMl: 2100,
+  weightTargetKg: null,
+  goalKind: 'maintain',
+  proteinGPerKg: null,
+  fiberG: GUIDE.fiberDefaultG,
+  sodiumMg: GUIDE.sodiumMaxMg,
+};
+
+// 目标方向的档位值（可手改目标体重的推断结果）
+const GOAL_KINDS = ['cut', 'maintain', 'bulk'];
+
+// 蛋白质 g/kg 的可存区间：覆盖三档（1.0~2.0）并留出手改余量；越界一律回到「按档位默认」
+const PROTEIN_G_PER_KG_MIN = 0.5;
+const PROTEIN_G_PER_KG_MAX = 3;
+
+
+
+const ACTIVITIES = ['sedentary', 'light', 'moderate', 'active', 'very_active'];
+
+// 套餐与导出时间都放 meta：不新增 object store，就不需要抬 IDB 版本号
+const MEAL_TEMPLATES_KEY = 'mealTemplates';
+const LAST_EXPORTED_KEY = 'lastExportedAt';
+// 与 js/sync.js 的 SYNC_STATE_KEY 必须一致（logic.test.mjs 有用例钉死）。
+// 这里写字面量而不是 import：不给 store.js 添一条新的跨模块依赖。
+const SYNC_STATE_KEY = 'syncState';
+// 每次导出/同步都会变的 meta 字段：留在同步数据体里会让内容校验和永远算成「有改动」
+const SYNC_VOLATILE_META_KEYS = [SYNC_STATE_KEY, LAST_EXPORTED_KEY];
+
+function num(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
+function text(v) {
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+function todayOf(date) {
+  const s = text(date);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : localDateStr();
+}
+
+// ---------- 账号（本地多账号隔离：一个账号一个库） ----------
+
+/** 视图层取「当前是谁」的唯一入口：一次都没建过账号时先认领老库。 */
+export async function currentAccount() {
+  const active = accounts.getActiveAccount();
+  if (active) return active;
+  return accounts.ensureDefaultAccount();
+}
+
+/**
+ * 切账号：目录先改（db 层收到通知就放掉旧连接），再按新账号的库名重新打开。
+ * 库名只来自账号目录，所以切换后任何读写都不可能触到上一个账号的数据。
+ */
+export async function switchAccount(id) {
+  const account = accounts.setActiveAccount(id);
+  if (!account) throw new Error('账号不存在');
+  await db.setDbName(accounts.dbNameForAccount(account));
+  return account;
+}
+
+// ---------- 档案 / 目标 / 设置 ----------
+
+export async function getProfile() {
+  const p = await db.getMeta('profile', null);
+  return p && typeof p === 'object' ? p : null;
+}
+
+export async function saveProfile(p) {
+  const src = p && typeof p === 'object' ? p : {};
+  const profile = {
+    nickname: text(src.nickname),
+    sex: src.sex === 'female' ? 'female' : 'male',
+    birthday: text(src.birthday),
+    heightCm: clamp(round1(num(src.heightCm)), 0, 250),
+    activity: ACTIVITIES.includes(src.activity) ? src.activity : 'sedentary',
+  };
+  if (src.weightTargetKg != null && num(src.weightTargetKg) > 0) {
+    profile.weightTargetKg = round1(num(src.weightTargetKg));
+  }
+  await db.setMeta('profile', profile);
+}
+
+/**
+ * 最新体重（kg）。override 给了正数就直接用（currentDailyTargets 用 profile 里刚记的体重，
+ * 免得它比 IDB 里的 weights 慢一拍）；否则读 weights。
+ */
+async function latestWeightKg(override) {
+  const forced = num(override);
+  if (forced > 0) return forced;
+  try {
+    const rows = await db.getAll('weights');
+    const stats = weightStats(rows);
+    return stats.latest;
+  } catch {
+    // 目标估算不该因为 IDB 不可用就整页崩掉，退化成按安全默认体重估
+    return null;
+  }
+}
+
+async function safeGetProfile() {
+  try {
+    return await getProfile();
+  } catch {
+    return null;
+  }
+}
+
+// 目标体重：只有正数才算设置了（0 / 负 / 脏值一律 null）
+function targetWeightOf(v) {
+  return num(v) > 0 ? round1(num(v)) : null;
+}
+
+/**
+ * 归一化「存下来的目标」：比例 / 克数 / 饮水仍是老字段，另加目标方向与纤维、钠。
+ * 目标方向（goalKind）：显式设置优先；老数据没这个键时按（当前体重 vs 目标体重）推断。
+ * 全部字段都保证有限数：脏值回落 SAFE_GOALS，不产生 NaN。
+ */
+export function normalizeGoals(g, ctx = {}) {
+  const src = g && typeof g === 'object' ? g : {};
+  const weightTargetKg = targetWeightOf(src.weightTargetKg);
+  const weightKg = num(ctx.weightKg);
+  const explicit = typeof src.goalKind === 'string' && GOAL_KINDS.includes(src.goalKind)
+    ? src.goalKind
+    : null;
+  const gPerKg = num(src.proteinGPerKg);
+  return {
+    calorieTarget: clamp(Math.round(num(src.calorieTarget, SAFE_GOALS.calorieTarget)), 800, 6000),
+    carbPct: clamp(Math.round(num(src.carbPct, SAFE_GOALS.carbPct)), 0, 100),
+    proteinPct: clamp(Math.round(num(src.proteinPct, SAFE_GOALS.proteinPct)), 0, 100),
+    fatPct: clamp(Math.round(num(src.fatPct, SAFE_GOALS.fatPct)), 0, 100),
+    waterMl: clamp(Math.round(num(src.waterMl, SAFE_GOALS.waterMl)), 200, 8000),
+    weightTargetKg,
+    goalKind: explicit || inferGoalKind(weightKg, weightTargetKg),
+    // null = 「按档位默认 g/kg」，而不是「0 g/kg」
+    proteinGPerKg: gPerKg > 0 ? round1(clamp(gPerKg, PROTEIN_G_PER_KG_MIN, PROTEIN_G_PER_KG_MAX)) : null,
+    fiberG: round1(clamp(num(src.fiberG, SAFE_GOALS.fiberG), GUIDE.fiberMinG, GUIDE.fiberMaxG)),
+    sodiumMg: Math.round(clamp(num(src.sodiumMg, SAFE_GOALS.sodiumMg), 500, GUIDE.sodiumMaxMg)),
+  };
+}
+
+/**
+ * 依据档案估算目标（《中国居民膳食指南(2022)》口径）。不落库；调用方要保存才调 saveGoals。
+ * 热量 / 比例 / 克数 / 纤维 / 钠 / 饮水全部出自 nutrition.js 的 dailyTargets()，
+ * 这里只负责把档案、最新体重、目标体重拼成它的入参，并把结果摊平成 goals 的形状。
+ */
+export async function computeDefaultGoals(profile) {
+  const p = profile === undefined ? await safeGetProfile() : profile;
+  if (!p || typeof p !== 'object') return { ...SAFE_GOALS };
+
+  const weightKg = await latestWeightKg(p.weightKg);
+  const weightTargetKg = targetWeightOf(p.weightTargetKg);
+  const t = dailyTargets({
+    sex: p.sex,
+    // 体重缺失：交给 dailyTargets 走安全默认（与「按 60kg 估水」的旧行为同值）
+    weightKg: weightKg || 0,
+    heightCm: num(p.heightCm),
+    age: ageFromBirthday(p.birthday),
+    activity: p.activity,
+    weightTargetKg,
+    goalKind: p.goalKind,
+  });
+
+  return {
+    calorieTarget: t.calorieTarget,
+    carbPct: t.carb.pct,
+    proteinPct: t.protein.pct,
+    fatPct: t.fat.pct,
+    waterMl: t.water.ml,
+    weightTargetKg,
+    goalKind: t.basis.goalKind,
+    // 实际生效的档位系数（未显式设置时就是该档中值）：界面据此显示「按 1.4 g/kg（减脂）」
+    proteinGPerKg: t.protein.gPerKg,
+    fiberG: t.fiber.g,
+    sodiumMg: t.sodium.mg,
+  };
+}
+
+// 档案 + 目标一起算：goalKind / 蛋白 g/kg 由档案与目标体重定，比例与克数再由 dailyTargets 出。
+async function dailyTargetsFrom(profile, goals, weightOverride) {
+  const p = profile && typeof profile === 'object' ? profile : {};
+  const g = goals && typeof goals === 'object' ? goals : {};
+  const weightKg = await latestWeightKg(weightOverride || p.weightKg);
+  const weightTargetKg = targetWeightOf(g.weightTargetKg != null ? g.weightTargetKg : p.weightTargetKg);
+  const goalKind = GOAL_KINDS.includes(g.goalKind)
+    ? g.goalKind
+    : inferGoalKind(weightKg, weightTargetKg);
+  return dailyTargets({
+    sex: p.sex,
+    weightKg: weightKg || 0,
+    heightCm: num(p.heightCm),
+    age: ageFromBirthday(p.birthday),
+    activity: p.activity,
+    calorieTarget: num(g.calorieTarget) > 0 ? num(g.calorieTarget) : undefined,
+
+    weightTargetKg,
+    goalKind,
+    proteinGPerKg: num(g.proteinGPerKg) > 0 ? num(g.proteinGPerKg) : undefined,
+    fiberG: num(g.fiberG) > 0 ? num(g.fiberG) : undefined,
+    sodiumMg: num(g.sodiumMg) > 0 ? num(g.sodiumMg) : undefined,
+  });
+}
+
+/**
+ * 当前生效的每日目标（比例 + 克数 + 依据 + 三餐分配直接可算）。
+ * 只读：不落库、不写 meta。档案 / 目标都读不到时返回安全默认，绝不抛。
+ */
+export async function currentDailyTargets() {
+  const [profile, goals] = await Promise.all([safeGetProfile(), getGoals()]);
+  return dailyTargetsFrom(profile, goals);
+}
+
+/**
+ * 目标方向变更后的「按新方向重算」（设置页切减脂/维持/增肌时用）。
+ * 显式传入的 calorieTarget / fiberG / sodiumMg / 体重目标会保留，其余按指南重算；不落库。
+ */
+export async function targetsForGoalKind(goalKind, overrides = {}) {
+  const [profile, saved] = await Promise.all([safeGetProfile(), getGoals()]);
+  const o = overrides && typeof overrides === 'object' ? overrides : {};
+  const merged = {
+    ...saved,
+    goalKind: GOAL_KINDS.includes(goalKind) ? goalKind : saved.goalKind,
+    ...o,
+  };
+  // 这是「切档预览」：必须按新档位重新推算热量，否则会把存下来的热量目标冻住、
+  // 三种档位显示同一个热量。故显式清掉 calorieTarget 覆盖。
+  return dailyTargetsFrom(profile, { ...merged, calorieTarget: 0 }, merged.weightKg);
+}
+
+export async function getGoals() {
+  const saved = await db.getMeta('goals', null);
+  if (saved && typeof saved === 'object') return normalizeGoals(saved);
+  return computeDefaultGoals(await getProfile());
+}
+
+export async function saveGoals(g) {
+  await db.setMeta('goals', normalizeGoals(g));
+}
+
+function normalizeWeightUnit(unit, fallback = DEFAULT_SETTINGS.weightUnit) {
+  return WEIGHT_UNITS.includes(unit) ? unit : fallback;
+}
+
+/**
+ * 作息偏移归一化：整数分钟，clamp 到 -180..240；缺省、空串、数组、NaN、Symbol 一律 0。
+ * 溢出成 ±Infinity 的脏数（1e999）按「越界」处理掉到边界上 —— 结果恒为有限整数，绝不出现 NaN。
+ */
+function normalizeSlotOffset(v) {
+  if (typeof v === 'symbol') return 0;
+  const n = Number(v);
+  if (Number.isNaN(n)) return 0;
+  return clamp(Math.round(n), SLOT_OFFSET_MIN, SLOT_OFFSET_MAX);
+}
+
+export async function getSettings() {
+  const saved = await db.getMeta('settings', null);
+  const src = saved && typeof saved === 'object' ? saved : {};
+  return {
+    apiKey: text(src.apiKey),
+    model: text(src.model) || DEFAULT_SETTINGS.model,
+    baseUrl: text(src.baseUrl) || DEFAULT_SETTINGS.baseUrl,
+    // 旧数据没有这个键 -> 'kg'，视图层拿到的永远不是 undefined
+    weightUnit: normalizeWeightUnit(src.weightUnit),
+    // 同样：旧数据没有这个键 -> 0，视图层拿到的永远是 -180..240 的整数
+    slotOffsetMinutes: normalizeSlotOffset(src.slotOffsetMinutes),
+  };
+}
+
+/** 部分更新：只传 apiKey 时不能把 weightUnit / model / baseUrl / slotOffsetMinutes 冲掉。 */
+export async function saveSettings(s) {
+  const cur = await getSettings();
+  const src = s && typeof s === 'object' ? s : {};
+  const next = {
+    apiKey: src.apiKey === undefined ? cur.apiKey : text(src.apiKey),
+    model: text(src.model) || cur.model || DEFAULT_SETTINGS.model,
+    baseUrl: text(src.baseUrl) || cur.baseUrl || DEFAULT_SETTINGS.baseUrl,
+    weightUnit: src.weightUnit === undefined ? cur.weightUnit : normalizeWeightUnit(src.weightUnit),
+  };
+  // 作息偏移：显式传了就归一后写入；0 = 「不偏移」= 等同于没设置，不为 0 时不必往 meta 里加键
+  // （既有断言钉死了旧数据 / 云端快照里 meta.settings 的形状，缺键时读出仍是 0，行为等价）。
+  const slotOffset = src.slotOffsetMinutes === undefined
+    ? cur.slotOffsetMinutes
+    : normalizeSlotOffset(src.slotOffsetMinutes);
+  // 显式传了就落库（哪怕 0 = 不偏移）；没传且从没设过 -> 不凭空加键。
+  // 理由：旧数据 / 云端快照里的 meta.settings 形状被既有断言钉死，缺键读出来同样是 0，行为等价。
+  if (src.slotOffsetMinutes !== undefined || slotOffset !== 0) next.slotOffsetMinutes = slotOffset;
+  await db.setMeta('settings', next);
+}
+
+// ---------- 体重 ----------
+
+/**
+ * weights / waters 的 by_date 是唯一索引：先查再写。
+ * 手机端双击保存会让两条写并发跑同一段「查不到 -> add」，第二条撞 ConstraintError；
+ * 这里重读一次把 id 带上再覆盖，用户看到的只是「保存成功」。
+ */
+async function upsertByDate(storeName, date, build) {
+  const existing = await db.getOneByIndex(storeName, 'by_date', date);
+  const record = build(existing);
+  try {
+    await db.put(storeName, record);
+  } catch (err) {
+    const again = await db.getOneByIndex(storeName, 'by_date', date);
+    if (!again) throw err;
+    await db.put(storeName, build(again));
+  }
+}
+
+/** 按 date upsert：weights 的 by_date 是唯一索引，同日写两次必须是一条记录。 */
+export async function logWeight({ date, weightKg, bodyFatPct, note } = {}) {
+  const targetDate = todayOf(date);
+  await upsertByDate('weights', targetDate, (existing) => {
+    const record = normalizeWeightRecord({
+      date: targetDate,
+      weightKg,
+      bodyFatPct,
+      note,
+      // createdAt 记首次录入时间，编辑不改它（列表按 date 排序，不靠它）
+      createdAt: existing?.createdAt ?? Date.now(),
+    });
+    if (!record) throw new Error('体重数据无效：请填写大于 0 的数值');
+    if (existing) record.id = existing.id;
+    return record;
+  });
+}
+
+export async function deleteWeight(date) {
+  const existing = await db.getOneByIndex('weights', 'by_date', todayOf(date));
+  if (existing) await db.del('weights', existing.id);
+}
+
+export async function recentWeights(days = 30) {
+  const span = Math.max(1, Math.round(num(days, 30)));
+  const cutoff = daysAgo(span - 1);
+  const rows = await db.getAll('weights');
+  return rows
+    .filter((w) => typeof w?.date === 'string' && w.date >= cutoff)
+    .sort((a, b) => (a.date === b.date ? 0 : a.date < b.date ? -1 : 1))
+    .map((w) => ({ ...w }));
+}
+
+// ---------- 饮食 ----------
+
+export async function logMeal({ date, slot, items, photoId, source, rawAiText } = {}) {
+  const record = normalizeMealRecord({
+    date: todayOf(date),
+    slot,
+    items: normalizeItems(items),
+    photoId,
+    source,
+    rawAiText,
+    createdAt: Date.now(),
+  });
+  if (!record) throw new Error('饮食记录日期无效');
+  return db.put('meals', record);
+}
+
+export async function updateMeal(id, patch = {}) {
+  const key = Number(id);
+  const existing = await db.get('meals', key);
+  if (!existing) throw new Error('这条饮食记录已不存在，请刷新后重试');
+  const record = normalizeMealRecord({
+    ...existing,
+    ...patch,
+    id: existing.id,
+    date: patch.date ?? existing.date,
+    createdAt: existing.createdAt,
+  });
+  if (!record) throw new Error('饮食记录更新失败：参数无效');
+  await db.put('meals', record);
+}
+
+export async function deleteMeal(id) {
+  await db.del('meals', Number(id));
+}
+
+// ---------- 套餐模板 / 最近吃过 ----------
+
+/** 脏数据（非数组、缺 id/name）由 pure 层过滤，这里只负责取 meta。 */
+export async function getMealTemplates() {
+  return normalizeMealTemplates(await db.getMeta(MEAL_TEMPLATES_KEY, []));
+}
+
+/**
+ * 同名视为覆盖并保留原 id；带 id 且命中已有套餐时**原地更新那一条**（id/createdAt/位置都不变）。
+ * name 为空抛中文错误；id 不存在时照旧新建，向后兼容。
+ */
+export async function saveMealTemplate({ id, name, slot, items } = {}) {
+  const existing = await getMealTemplates();
+  const { templates, template } = planMealTemplateSave(existing, { id, name, slot, items });
+  await db.setMeta(MEAL_TEMPLATES_KEY, templates);
+  return template;
+}
+
+/**
+ * 整日套餐（一键记一整天的多餐）。与单餐套餐共用 mealTemplates 这一个 meta 键、
+ * 同一套同名覆盖语义；带 id 且命中已有套餐时**原地更新那一条**（id/createdAt/位置都不变）。
+ * meals 归一化后不足 2 餐或空名抛中文错误；id 不存在时照旧新建，向后兼容。
+ */
+export async function saveDayTemplate({ id, name, meals } = {}) {
+  const existing = await getMealTemplates();
+  const { templates, template } = planDayTemplateSave(existing, { id, name, meals });
+  await db.setMeta(MEAL_TEMPLATES_KEY, templates);
+  return template;
+}
+
+export async function deleteMealTemplate(id) {
+  const existing = await getMealTemplates();
+  await db.setMeta(MEAL_TEMPLATES_KEY, removeMealTemplate(existing, id));
+}
+
+/** 只吃最近 200 条 meals；排序/去重/limit 全在 pure.js 里可测。 */
+export async function recentFoodItems(limit = 12) {
+  return collectRecentFoodItems(await db.getAll('meals'), limit);
+}
+
+// ---------- 运动 ----------
+
+export async function logExercise({ date, type, minutes, kcalBurned, note, intensity } = {}) {
+  const record = normalizeExerciseRecord({
+    date: todayOf(date),
+    type,
+    minutes,
+    kcalBurned,
+    note,
+    intensity,
+    createdAt: Date.now(),
+  });
+  if (!record) throw new Error('运动记录日期无效');
+  return db.put('exercises', record);
+}
+
+export async function deleteExercise(id) {
+  await db.del('exercises', Number(id));
+}
+
+// ---------- 饮水 ----------
+
+export async function getWater(date) {
+  const row = await db.getOneByIndex('waters', 'by_date', todayOf(date));
+  return row ? Math.max(0, Math.round(num(row.ml))) : 0;
+}
+
+/**
+ * 同一日期的饮水写入串成一条链：addWater 是「读当前值 + 增量 + 写回」，
+ * 两次并发调用会读到同一个旧值，后写覆盖先写 —— 手机端连点就是静默少记一次。
+ * 链上的任务全部执行（前一个失败不能把后面的卡死），所以用 then(task, task)；
+ * 链尾自己清理，不留下无界的 Map。
+ */
+const waterChains = new Map();
+
+function withWaterLock(date, task) {
+  const previous = waterChains.get(date) || Promise.resolve();
+  const run = previous.then(task, task);
+  const tail = run.then(() => {}, () => {});
+  waterChains.set(date, tail);
+  tail.then(() => { if (waterChains.get(date) === tail) waterChains.delete(date); });
+  return run;
+}
+
+/** 真正的写：归零即删除该日记录，保证「撤销到 0」不会留下一条 0ml 的脏记录。 */
+async function writeWater(targetDate, value) {
+  if (value <= 0) {
+    const existing = await db.getOneByIndex('waters', 'by_date', targetDate);
+    if (existing) await db.del('waters', existing.id);
+    return;
+  }
+  await upsertByDate('waters', targetDate, (existing) =>
+    normalizeRecord('waters', { date: targetDate, ml: value, id: existing?.id }),
+  );
+}
+
+/** 归零即删除该日记录（走同一条链：与并发的 addWater 之间也不会互相覆盖）。 */
+export function setWater(date, ml) {
+  const targetDate = todayOf(date);
+  return withWaterLock(targetDate, () => writeWater(targetDate, Math.max(0, Math.round(num(ml)))));
+}
+
+/**
+ * 加/减水量：读当前值、加增量、写回是一个原子操作（同一日期上的调用串行执行），
+ * 所以同一帧里的两次连点会依次落地成 500，而不是互相覆盖成 250。
+ * 返回这次操作之后的当日总量。
+ */
+export function addWater(date, deltaMl) {
+  const targetDate = todayOf(date);
+  return withWaterLock(targetDate, async () => {
+    const current = await getWater(targetDate);
+    const value = Math.max(0, Math.round(current + num(deltaMl)));
+    await writeWater(targetDate, value);
+    return value;
+  });
+}
+
+// ---------- 照片 ----------
+
+let photoSeq = 0;
+
+function newPhotoId() {
+  const rand = globalThis.crypto?.randomUUID?.();
+  if (rand) return `p_${rand}`;
+  photoSeq += 1;
+  return `p_${Date.now().toString(36)}_${photoSeq}`;
+}
+
+export async function savePhoto(blob, mime) {
+  const id = newPhotoId();
+  await db.put('photos', { id, blob, mime: text(mime) || 'image/jpeg', createdAt: Date.now() });
+  return id;
+}
+
+export async function getPhoto(id) {
+  if (!id) return null;
+  const rec = await db.get('photos', id);
+  return rec && rec.blob ? rec.blob : null;
+}
+
+// ---------- 汇总 ----------
+
+/** 视图核心：当日摄入四项+纤维+钠、消耗、饮水、体重、净值，一次取全。 */
+export async function daySummary(date) {
+  const targetDate = todayOf(date);
+  const [meals, exercises, waterRow, weight] = await Promise.all([
+    db.getAllByIndex('meals', 'by_date', targetDate),
+    db.getAllByIndex('exercises', 'by_date', targetDate),
+    db.getOneByIndex('waters', 'by_date', targetDate),
+    db.getOneByIndex('weights', 'by_date', targetDate),
+  ]);
+  return buildDaySummary({
+    date: targetDate,
+    meals,
+    exercises,
+    water: waterRow,
+    weight,
+  });
+}
+
+export async function rangeSummary(fromDate, toDate) {
+  const from = todayOf(fromDate);
+  const to = todayOf(toDate);
+  const [weights, meals, exercises, waters] = await Promise.all([
+    db.getAll('weights'),
+    db.getAll('meals'),
+    db.getAll('exercises'),
+    db.getAll('waters'),
+  ]);
+  return buildRangeRows({ fromDate: from, toDate: to, weights, meals, exercises, waters });
+}
+
+// ---------- 导入导出 ----------
+
+export async function markExported() {
+  await db.setMeta(LAST_EXPORTED_KEY, Date.now());
+}
+
+/** days 用 localDateStr 算整天差（跨时区/夏令时都不会像 toISOString 那样串日）。 */
+export async function exportStatus() {
+  const [last, weights, meals] = await Promise.all([
+    db.getMeta(LAST_EXPORTED_KEY, null),
+    db.getAll('weights'),
+    db.getAll('meals'),
+  ]);
+  const ts = Number(last);
+  const lastExportedAt = Number.isFinite(ts) && ts > 0 ? ts : null;
+  return {
+    lastExportedAt,
+    days: daysSinceExport(lastExportedAt),
+    hasData: weights.length > 0 || meals.length > 0,
+  };
+}
+
+/** 导出全量 JSON：schemaVersion / exportedAt 由 db.dumpAll 提供。成功返回前记一笔导出时间。 */
+export async function exportJSON() {
+  const payload = await db.dumpAll();
+  const result = { app: 'hms', ...payload };
+  await markExported();
+  return result;
+}
+
+export async function importJSON(obj, mode = 'merge') {
+  if (!obj || typeof obj !== 'object') throw new Error('导入失败：文件内容不是合法的 JSON 对象');
+  return db.loadAll(obj, mode === 'replace' ? 'replace' : 'merge');
+}
+
+export async function exportCSV() {
+  const [weights, meals, exercises, waters] = await Promise.all([
+    db.getAll('weights'),
+    db.getAll('meals'),
+    db.getAll('exercises'),
+    db.getAll('waters'),
+  ]);
+  return buildCSV({ weights, meals, exercises, waters });
+}
+
+/** 业务数据 + photos 清空，保留 profile / goals / settings。 */
+export async function clearAllData() {
+  await db.clearBusinessData();
+}
+
+// ---------- 云同步（阶段 2 的纯数据面；网络在阶段 3 的适配器里） ----------
+
+const DEFAULT_SYNC_STATE = { rev: 0, savedAt: null, checksum: null };
+
+/** 脏数据/旧数据一律归一化：rev 非负整数、savedAt 正数或 null、checksum 非空字符串或 null。 */
+function normalizeSyncState(raw) {
+  const src = raw && typeof raw === 'object' ? raw : DEFAULT_SYNC_STATE;
+  const rev = Number.isInteger(src.rev) && src.rev >= 0 ? src.rev : 0;
+  const at = Number(src.savedAt);
+  const savedAt = Number.isFinite(at) && at > 0 ? at : null;
+  const checksum = typeof src.checksum === 'string' && src.checksum ? src.checksum : null;
+  return { rev, savedAt, checksum };
+}
+
+/** 上次成功推/拉时的锚点。从未同步过 = { rev: 0, savedAt: null, checksum: null }。 */
+export async function getSyncState() {
+  return normalizeSyncState(await db.getMeta(SYNC_STATE_KEY, null));
+}
+
+/** 记录一次成功同步的锚点。字段缺失/非法一律回落默认值，不抛。 */
+export async function setSyncState({ rev, savedAt, checksum } = {}) {
+  await db.setMeta(SYNC_STATE_KEY, normalizeSyncState({ rev, savedAt, checksum }));
+}
+
+/** 清掉锚点（切账号后由调用方决定是否清）：下一次同步按「从没同步过」处理。 */
+export async function clearSyncState() {
+  await db.del('meta', SYNC_STATE_KEY);
+}
+
+/**
+ * 同步用的数据体：复用 exportJSON（全量 dump + 记导出时间），只抹掉三个每次都变的字段——
+ * 顶层 exportedAt、meta.syncState、meta.lastExportedAt。
+ * 不抹的话 checksum() 每次都不同，「本地有没有改动」就永远是「有」，同步退化成每次全量对推。
+ * 最后再 stripSyncSecrets：这条链路产出的东西就是要上云的那份，密钥一个字节都不出去。
+ */
+export async function getSyncPayload() {
+  const payload = await exportJSON();
+  const meta = { ...payload.meta };
+  for (const key of SYNC_VOLATILE_META_KEYS) delete meta[key];
+  const out = { ...payload, meta };
+  delete out.exportedAt;
+  return stripSyncSecrets(out);
+}

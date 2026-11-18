@@ -1,0 +1,532 @@
+/**
+ * IndexedDB 薄封装：只做存储，不含任何业务规则。
+ * 每个导出函数≈一个 IDB 请求，聚合/去重/整形一律交给 pure.js，这样 Node 里能测到的部分尽量大。
+ */
+
+import { normalizeRecord, planImport, BUSINESS_STORES, mergeRemoteIntoLocal } from './pure.js';
+import { getActiveAccount, dbNameForAccount, connectDb, LEGACY_DB_NAME } from './accounts.js';
+
+const DB_VERSION = 1;
+const ALL_STORES = ['meta', ...BUSINESS_STORES, 'photos'];
+// 导入备份 / 拉取云端快照时恢复哪些 meta：档案、目标、套餐模板、设置都要跟着账号走。
+// 照片本体不进快照（二进制太大），API Key 属于设备本地凭据（见 pure.js 的密钥边界），两者都不在这里。
+const IMPORTABLE_META = ['profile', 'goals', 'mealTemplates', 'settings'];
+// 每次同步都会变、内容上不算「本机改动」的 meta 键（与 store.js / sync.js 的 SYNC_VOLATILE_META_KEYS 一致）。
+// 写同步锚点 / 导出时间不通知：否则「同步写锚点 → 通知 → 再同步」会自我循环。
+const QUIET_META_KEYS = ['syncState', 'lastExportedAt'];
+// 只有进得了快照的表才算「本机改动」：photos 不进快照，单独存一张照片不该触发一次同步。
+const NOTIFY_STORES = [...BUSINESS_STORES, 'meta'];
+
+export const IDB_UNAVAILABLE_MESSAGE = '当前浏览器禁用了本地存储，数据无法保存';
+
+let dbPromise = null;
+// connName：dbPromise 对应的库名（打开中或已打开）；pinnedName：setDbName 显式钉住的库名
+let connName = null;
+let pinnedName = null;
+let hooked = false;
+
+/** 当前该连的库名：显式钉住的优先，否则跟随当前账号（拿不到就回落老库名）。 */
+function desiredDbName() {
+  return pinnedName || dbNameForAccount(getActiveAccount());
+}
+
+function normalizeDbName(name) {
+  const value = typeof name === 'string' ? name.trim() : '';
+  return value || LEGACY_DB_NAME;
+}
+
+/** 丢掉旧连接：已经打开的关掉，正在打开的等它回来再关。 */
+function dropConnection() {
+  const pending = dbPromise;
+  dbPromise = null;
+  connName = null;
+  if (!pending) return;
+  pending.then(
+    (db) => {
+      try {
+        db?.close?.();
+      } catch {
+        /* 关不掉也无所谓 */
+      }
+    },
+    () => {
+      /* 打开失败本来就没有连接 */
+    },
+  );
+}
+
+/** 每次取连接前核对库名：账号一换就丢掉旧连接，绝不让 A 的写入落到 B 上。 */
+function syncDbName() {
+  const want = desiredDbName();
+  if (dbPromise && connName === want) return want;
+  if (dbPromise) dropConnection();
+  return want;
+}
+
+/**
+ * 惰性注册账号切换通知（第一次打开数据库时注册，模块顶层因此没有副作用）：
+ * 账号目录一变就放掉钉住的库名与旧连接。
+ */
+function ensureSwitchHook() {
+  if (hooked) return;
+  hooked = true;
+  try {
+    connectDb({
+      onSwitch: () => {
+        pinnedName = null;
+        if (desiredDbName() !== connName) dropConnection();
+      },
+    });
+  } catch {
+    /* 通知失败也不影响正确性：每次 openDb 都会重新核对库名 */
+  }
+}
+
+function unavailable() {
+  return new Error(IDB_UNAVAILABLE_MESSAGE);
+}
+
+// ---------- 写入通知（自动同步的接线点） ----------
+// db.js 是所有写操作的唯一通道：put / del / setMeta / deleteAll / loadAll / clearBusinessData 全部落在 writeOp 上。
+// 通知只在事务真的 oncomplete 之后发出，「有改动」因此永远不会是假的；
+// handler 的异常只吞掉它自己，绝不影响已经落库的写入结果。
+
+const mutationHandlers = new Set();
+let muteDepth = 0;
+
+/** 注册「本机有改动」通知，返回注销函数。handler 抛错 / 返回 rejected promise 都不影响写入。 */
+export function onMutation(handler) {
+  if (typeof handler !== 'function') return () => {};
+  mutationHandlers.add(handler);
+  return () => {
+    mutationHandlers.delete(handler);
+  };
+}
+
+/**
+ * 期间不触发任何 handler（支持嵌套）。应用云端快照 / 导入备份 / 清空数据都必须包在这里面跑，
+ * 否则「刚拉下来就立刻推回去」会变成回环。异常路径也在 finally 里把计数放回去。
+ */
+export async function withMutedMutations(fn) {
+  muteDepth += 1;
+  try {
+    return await (typeof fn === 'function' ? fn() : undefined);
+  } finally {
+    muteDepth -= 1;
+  }
+}
+
+function notifyMutation(stores) {
+  const touched = stores.filter((name) => NOTIFY_STORES.includes(name));
+  if (muteDepth > 0 || !touched.length || !mutationHandlers.size) return;
+  for (const handler of [...mutationHandlers]) {
+    try {
+      const result = handler({ stores: touched });
+      if (result && typeof result.then === 'function') result.catch(() => {});
+    } catch {
+      /* 通知失败不能把已落库的写入连累成失败 */
+    }
+  }
+}
+
+/** 写同步锚点 / 导出时间不算本机改动（见 QUIET_META_KEYS）。 */
+function isQuietMetaKey(key) {
+  return QUIET_META_KEYS.includes(typeof key === 'string' ? key : '');
+}
+
+function toDbError(err) {
+  if (err && err.name === 'QuotaExceededError') return new Error('本地存储空间不足，请先导出备份并清理旧数据');
+  if (err && err.name === 'ConstraintError') return new Error('数据冲突：同一日期已存在记录');
+  return err instanceof Error ? err : new Error(`本地数据库操作失败：${err?.message ?? '未知错误'}`);
+}
+
+function assertStore(store) {
+  if (!ALL_STORES.includes(store)) throw new Error(`未知的数据表：${store}`);
+}
+
+function buildSchema(db) {
+  if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+  if (!db.objectStoreNames.contains('weights')) {
+    const s = db.createObjectStore('weights', { keyPath: 'id', autoIncrement: true });
+    s.createIndex('by_date', 'date', { unique: true });
+  }
+  if (!db.objectStoreNames.contains('meals')) {
+    const s = db.createObjectStore('meals', { keyPath: 'id', autoIncrement: true });
+    s.createIndex('by_date', 'date', { unique: false });
+  }
+  if (!db.objectStoreNames.contains('exercises')) {
+    const s = db.createObjectStore('exercises', { keyPath: 'id', autoIncrement: true });
+    s.createIndex('by_date', 'date', { unique: false });
+  }
+  if (!db.objectStoreNames.contains('waters')) {
+    const s = db.createObjectStore('waters', { keyPath: 'id', autoIncrement: true });
+    s.createIndex('by_date', 'date', { unique: true });
+  }
+  if (!db.objectStoreNames.contains('photos')) db.createObjectStore('photos', { keyPath: 'id' });
+}
+
+/**
+ * 幂等单例，按当前账号对应的库名打开。失败后不缓存，下一次调用可以重试
+ * （隐私模式切换、用户重开标签页等）。
+ *
+ * 每次取连接前先核对库名：账号一换就丢掉旧连接，所以任何一次读写都不可能落到别的账号的库上。
+ */
+export function openDb() {
+  ensureSwitchHook();
+  const name = syncDbName();
+  if (dbPromise) return dbPromise;
+
+  const promise = new Promise((resolve, reject) => {
+    const idb = globalThis.indexedDB;
+    if (!idb) {
+      reject(unavailable());
+      return;
+    }
+    let req;
+    try {
+      req = idb.open(name, DB_VERSION);
+    } catch {
+      reject(unavailable());
+      return;
+    }
+    req.onupgradeneeded = () => {
+      try {
+        buildSchema(req.result);
+      } catch (err) {
+        reject(toDbError(err));
+      }
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      // 迟到的连接：这条请求已经被下一次切换丢掉了，用完就关，不许顶替新单例
+      if (dbPromise !== promise) {
+        try {
+          db.close();
+        } catch {
+          /* 忽略 */
+        }
+        return;
+      }
+      db.onversionchange = () => {
+        try {
+          db.close();
+        } catch {
+          /* 关不掉也无所谓，下一次 openDb 会重开 */
+        }
+        if (dbPromise === promise) {
+          dbPromise = null;
+          connName = null;
+        }
+      };
+      resolve(db);
+    };
+    req.onerror = () => reject(toDbError(req.error));
+    req.onblocked = () => reject(new Error('数据库被其他标签页占用，请关闭其他 HMS 页面后重试'));
+  });
+
+  dbPromise = promise;
+  connName = name;
+  promise.catch(() => {
+    if (dbPromise === promise) {
+      dbPromise = null;
+      connName = null;
+    }
+  });
+  return promise;
+}
+
+/** 当前连接的库名（也就是下一次读写会落到哪个库）。 */
+export function getDbName() {
+  return desiredDbName();
+}
+
+/**
+ * 切库：关旧连接 → 清 dbPromise 单例 → 按新名字打开。
+ * 账号切换走 store.switchAccount（先 setActiveAccount 再调这里）；单独调用也成立，
+ * 钉住的库名只在账号目录变化时才让位。
+ */
+export async function setDbName(name) {
+  ensureSwitchHook();
+  pinnedName = normalizeDbName(name);
+  dropConnection();
+  await openDb();
+}
+
+/** 只清单例（导入等场景）：下一次读写重新打开当前账号的库。 */
+export function resetDbConnection() {
+  dropConnection();
+}
+
+/**
+ * 按 dbName 把库建全（全部 object store 与索引），但不占用当前连接。
+ * 供 js/accounts.js 新建账号时调用：schema 只有 buildSchema 一份，不复制。
+ */
+export async function prepareDatabase(name) {
+  const target = normalizeDbName(name);
+  if (target === desiredDbName()) {
+    await openDb();
+    return;
+  }
+  const idb = globalThis.indexedDB;
+  if (!idb) throw unavailable();
+  await new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = idb.open(target, DB_VERSION);
+    } catch {
+      reject(unavailable());
+      return;
+    }
+    req.onupgradeneeded = () => {
+      try {
+        buildSchema(req.result);
+      } catch (err) {
+        reject(toDbError(err));
+      }
+    };
+    req.onsuccess = () => {
+      try {
+        req.result?.close?.();
+      } catch {
+        /* 忽略 */
+      }
+      resolve();
+    };
+    req.onerror = () => reject(toDbError(req.error));
+    req.onblocked = () => reject(new Error('数据库被其他标签页占用，请关闭其他 HMS 页面后重试'));
+  });
+}
+
+function reqP(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(toDbError(request.error));
+  });
+}
+
+/** 只读操作：在当前微任务里同步建事务并发请求，避免事务因 await 空转而失活。 */
+async function readOp(store, fn) {
+  assertStore(store);
+  const db = await openDb();
+  const os = db.transaction(store, 'readonly').objectStore(store);
+  return fn(os);
+}
+
+/**
+ * 写操作：等事务 oncomplete 才 resolve，保证调用方拿到的是「真的落库了」。
+ * quiet = 这次写入在内容上不算「本机改动」（同步锚点等），不触发写入通知。
+ */
+async function writeOp(stores, fn, quiet = false) {
+  const list = Array.isArray(stores) ? stores : [stores];
+  for (const name of list) assertStore(name);
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    let t;
+    try {
+      t = db.transaction(list, 'readwrite');
+    } catch (err) {
+      reject(toDbError(err));
+      return;
+    }
+    const box = { value: undefined };
+    t.oncomplete = () => {
+      // 事务真的落库之后才通知：失败 / 中止的写入不会被误报成「有改动」
+      if (!quiet) notifyMutation(list);
+      resolve(box.value);
+    };
+    t.onerror = () => reject(toDbError(t.error));
+    t.onabort = () => reject(toDbError(t.error));
+    try {
+      fn((name) => t.objectStore(name), box);
+    } catch (err) {
+      try {
+        t.abort();
+      } catch {
+        /* 事务可能已结束，忽略 */
+      }
+      reject(toDbError(err));
+    }
+  });
+}
+
+/** 供首屏红条判定：IDB 是否可用。 */
+export async function isAvailable() {
+  try {
+    await openDb();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function getAll(store) {
+  return readOp(store, (os) => reqP(os.getAll()));
+}
+
+export async function get(store, key) {
+  const value = await readOp(store, (os) => reqP(os.get(key)));
+  return value ?? null;
+}
+
+export async function put(store, obj) {
+  const quiet = store === 'meta' && isQuietMetaKey(obj && obj.key);
+  return writeOp(store, (s, box) => {
+    const req = s(store).put(obj);
+    req.onsuccess = () => {
+      box.value = req.result;
+    };
+  }, quiet);
+}
+
+export async function del(store, key) {
+  const quiet = store === 'meta' && isQuietMetaKey(key);
+  await writeOp(store, (s) => {
+    s(store).delete(key);
+  }, quiet);
+}
+
+export async function getOneByIndex(store, index, value) {
+  const row = await readOp(store, (os) => reqP(os.index(index).get(value)));
+  return row ?? null;
+}
+
+export async function getAllByIndex(store, index, value) {
+  return readOp(store, (os) => reqP(os.index(index).getAll(value)));
+}
+
+export async function deleteAll(store) {
+  await writeOp(store, (s) => {
+    s(store).clear();
+  });
+}
+
+export async function getMeta(key, fallback = null) {
+  const rec = await get('meta', key);
+  return rec && 'value' in rec ? rec.value : fallback;
+}
+
+export async function setMeta(key, value) {
+  await put('meta', { key, value });
+}
+
+function byDateThenId(a, b) {
+  const da = String(a?.date ?? '');
+  const db2 = String(b?.date ?? '');
+  if (da !== db2) return da < db2 ? -1 : 1;
+  return Number(a?.id ?? 0) - Number(b?.id ?? 0);
+}
+
+export async function dumpAll() {
+  const [metaRows, weights, meals, exercises, waters, photoCount] = await Promise.all([
+    getAll('meta'),
+    getAll('weights'),
+    getAll('meals'),
+    getAll('exercises'),
+    getAll('waters'),
+    readOp('photos', (os) => reqP(os.count())),
+  ]);
+
+  const meta = {};
+  for (const rec of metaRows) meta[rec.key] = rec.value;
+
+  return {
+    schemaVersion: Number(meta.schemaVersion) || DB_VERSION,
+    exportedAt: new Date().toISOString(),
+    meta,
+    weights: [...weights].sort(byDateThenId),
+    meals: [...meals].sort(byDateThenId),
+    exercises: [...exercises].sort(byDateThenId),
+    waters: [...waters].sort(byDateThenId),
+    // 二进制照片不进 JSON（手机上几 MB 的 base64 会把浏览器拖死），只留计数
+    photoCount,
+  };
+}
+
+function metaToMap(meta) {
+  if (Array.isArray(meta)) {
+    const map = {};
+    for (const rec of meta) if (rec && rec.key) map[rec.key] = rec.value;
+    return map;
+  }
+  return meta && typeof meta === 'object' ? meta : {};
+}
+
+/**
+ * settings 的恢复也要过一遍密钥边界：备份 / 云端带来的 settings 覆盖本机，
+ * 但排除键（apiKey）永远只认本机现有的那份——绝不让空值或别人的密钥把本机密钥冲掉。
+ */
+async function settingsForRestore(incoming) {
+  const current = await getMeta('settings', null);
+  const merged = mergeRemoteIntoLocal({ remote: { settings: incoming }, local: { settings: current } });
+  const value = merged && merged.settings;
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+
+async function restoreMeta(src, replace) {
+  const meta = metaToMap(src.meta);
+  for (const key of IMPORTABLE_META) {
+    if (!(key in meta) || meta[key] == null) continue;
+    if (!replace && (await getMeta(key, null)) != null) continue;
+    const value = key === 'settings' ? await settingsForRestore(meta[key]) : meta[key];
+    if (value == null) continue;
+    await setMeta(key, value);
+  }
+}
+
+/**
+ * 导入。replace 先清空业务表；merge 只补缺失（已有键一律不覆盖），因此同一份备份
+ * 重复导入不会让数据翻倍。返回实际写入条数。meta 按 IMPORTABLE_META 恢复（settings 走密钥边界）。
+ * 内部实现：对外入口在下面，整段包在 withMutedMutations 里。
+ */
+async function loadAllInner(payload, mode = 'merge') {
+  const src = payload && typeof payload === 'object' ? payload : {};
+  const replace = mode === 'replace';
+  const incoming = {};
+  const existing = {};
+
+  for (const name of BUSINESS_STORES) {
+    incoming[name] = Array.isArray(src[name]) ? src[name] : [];
+    existing[name] = replace ? [] : await getAll(name);
+  }
+
+  // 只清 4 张明细表：photos 不在 JSON 里，误删等于永久丢照片，宁可留孤儿
+  if (replace) await clearStores(BUSINESS_STORES);
+
+  const plans = {};
+  const counts = { weights: 0, meals: 0, exercises: 0, waters: 0 };
+  for (const name of BUSINESS_STORES) {
+    plans[name] = planImport(name, existing[name], incoming[name]);
+    counts[name] = plans[name].length;
+  }
+
+  await writeOp(BUSINESS_STORES, (s) => {
+    for (const name of BUSINESS_STORES) {
+      const os = s(name);
+      for (const row of plans[name]) os.put(row);
+    }
+  });
+
+  await restoreMeta(src, replace);
+  return counts;
+}
+
+/**
+ * 对外的导入入口：导入备份与应用云端快照都走这里，整段静默 ——
+ * 这些写入是「本机数据被外部来源替换」，通知出去就会变成「刚拉下来就立刻推回去」的回环。
+ */
+export async function loadAll(payload, mode = 'merge') {
+  return withMutedMutations(() => loadAllInner(payload, mode));
+}
+
+async function clearStores(names) {
+  await writeOp(names, (s) => {
+    for (const name of names) s(name).clear();
+  });
+}
+
+/** 清空 5 个业务 store（4 张明细 + photos），保留 meta。清空期间静默（不触发写入通知）。 */
+export async function clearBusinessData() {
+  return withMutedMutations(() => clearStores([...BUSINESS_STORES, 'photos']));
+}
+
+export { BUSINESS_STORES, normalizeRecord };

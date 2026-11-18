@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BMI 视觉方案预览</title>
+<style>
+  :root{
+    --bg:#F2F7F4; --bg-top:#E4F4EC; --surface:#fff; --surface-2:#EAF2EE;
+    --text:#14201C; --text-2:#6A7A74; --line:#DFE9E4;
+    --brand:#10A37F; --brand-2:#0A8065; --brand-3:#2FC08E; --brand-soft:#E4F5EF;
+    --card-line:rgba(16,163,127,.10); --shadow:0 6px 20px rgba(13,52,42,.07);
+    --warn:#E0A106; --danger:#D9534F; --low:#5B9BD5;
+    --radius:20px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;padding:16px;font:15px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    color:var(--text);
+    background:radial-gradient(1200px 420px at 50% -160px,var(--bg-top) 0%,rgba(228,244,236,0) 62%),var(--bg);
+  }
+  .wrap{max-width:390px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+  .card{background:var(--surface);border:1px solid var(--card-line);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px}
+  .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  .title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:15px}
+  .title::before{content:"";width:3px;height:13px;border-radius:2px;background:linear-gradient(180deg,var(--brand-3),var(--brand-2))}
+  .pill{background:var(--brand-soft);color:var(--brand-2);border-radius:999px;padding:4px 10px;font-size:12px;font-weight:600}
+
+  /* 大号数值 */
+  .value-row{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
+  .value{font-size:40px;font-weight:700;letter-spacing:-1px;font-variant-numeric:tabular-nums;line-height:1.05}
+  .value small{font-size:14px;font-weight:500;color:var(--text-2);margin-left:2px;letter-spacing:0}
+  .cat{font-size:13px;color:var(--text-2)}
+  .cat b{color:var(--brand-2)}
+
+  /* 分段区间条 */
+  .scale{position:relative;margin:26px 0 6px;height:10px}
+  .scale__track{position:absolute;inset:0;border-radius:999px;overflow:hidden;display:flex}
+  .seg{height:100%}
+  .seg--low{background:color-mix(in srgb,var(--low) 55%,#fff)}
+  .seg--normal{background:var(--brand)}
+  .seg--over{background:color-mix(in srgb,var(--warn) 70%,#fff)}
+  .seg--obese{background:color-mix(in srgb,var(--danger) 70%,#fff)}
+  .scale__marker{position:absolute;top:-22px;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;transition:left .45s cubic-bezier(.4,0,.2,1)}
+  .scale__bubble{background:var(--text);color:#fff;font-size:11px;font-weight:600;border-radius:8px;padding:2px 7px;white-space:nowrap}
+  .scale__pointer{width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--text);margin-top:1px}
+  .scale__ticks{display:flex;justify-content:space-between;font-size:11px;color:var(--text-2);font-variant-numeric:tabular-nums;margin-top:6px}
+  .scale__bands{display:flex;font-size:11px;color:var(--text-2);margin-top:4px}
+  .scale__band{text-align:center}
+
+  /* 体态小人 */
+  .figures{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:14px}
+  .figure{display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 0;border-radius:14px;border:1px solid transparent}
+  .figure.is-active{background:var(--brand-soft);border-color:var(--brand);}
+  .figure svg{width:56px;height:76px;overflow:visible}
+  .figure span{font-size:11px;color:var(--text-2)}
+  .figure.is-active span{color:var(--brand-2);font-weight:600}
+  .body-line{fill:none;stroke:var(--text-2);stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;opacity:.55}
+  .figure.is-active .body-line{stroke:var(--brand-2);opacity:1;stroke-width:2.6}
+  /* 线条描画动画：只在当前档位播一次 */
+  .figure.is-active .body-line{stroke-dasharray:260;stroke-dashoffset:260;animation:draw 1.1s ease forwards}
+  @keyframes draw{to{stroke-dashoffset:0}}
+  .hint{margin-top:12px;font-size:12px;color:var(--text-2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="head">
+      <div class="title">体重</div>
+      <div class="pill">正常 18.5–24</div>
+    </div>
+
+    <div class="value-row">
+      <div class="value">23.3<small>BMI</small></div>
+      <div class="cat">处于 <b>正常</b> 区间中段</div>
+    </div>
+
+    <div class="scale" id="scale">
+      <div class="scale__track" id="track"></div>
+      <div class="scale__marker" id="marker">
+        <div class="scale__bubble" id="bubble">23.3</div>
+        <div class="scale__pointer"></div>
+      </div>
+      <div style="height:26px"></div>
+    </div>
+    <div class="scale__ticks"><span>14</span><span>18.5</span><span>24</span><span>28</span><span>34</span></div>
+    <div class="scale__bands" id="bands"></div>
+
+    <div class="figures" id="figures"></div>
+    <div class="hint">小人对应你的 BMI 区间：线条越宽表示体重越高。切到别的区间时重新描一遍线。</div>
+  </div>
+</div>
+
+<script>
+// --- 分段区间条 ---
+const MIN = 14, MAX = 34;
+const BANDS = [
+  { key: 'low',    from: MIN,  to: 18.5, label: '偏瘦' },
+  { key: 'normal', from: 18.5, to: 24,   label: '正常' },
+  { key: 'over',   from: 24,   to: 28,   label: '超重' },
+  { key: 'obese',  from: 28,   to: MAX,  label: '肥胖' },
+];
+const bmi = 23.3;
+
+const track = document.getElementById('track');
+for (const b of BANDS) {
+  const seg = document.createElement('div');
+  seg.className = 'seg seg--' + b.key;
+  seg.style.width = ((b.to - b.from) / (MAX - MIN) * 100) + '%';
+  track.appendChild(seg);
+}
+const pos = (bmi - MIN) / (MAX - MIN) * 100;
+const marker = document.getElementById('marker');
+marker.style.left = pos + '%';
+document.getElementById('bubble').textContent = bmi.toFixed(1);
+
+const bands = document.getElementById('bands');
+for (const b of BANDS) {
+  const el = document.createElement('div');
+  el.className = 'scale__band';
+  el.style.flex = String(b.to - b.from);
+  el.textContent = b.label;
+  bands.appendChild(el);
+}
+
+// --- 体态小人：同一套骨架，按区间改宽度，画成线条 ---
+function figure({ shoulder, waist, hip, armOut, legGap }) {
+  const y0 = 6;          // 头顶
+  const headR = 7.6;
+  const neck = y0 + headR * 2 + 3;   // 肩线
+  const waistY = neck + 26;
+  const hipY = waistY + 12;
+  const kneeY = hipY + 20;
+
+  const s = shoulder / 2, w = waist / 2, h = hip / 2;
+  const torso = `M ${-s} ${neck}
+    Q ${-w - 2} ${neck + 14} ${-w} ${waistY}
+    Q ${-h - 1} ${waistY + 6} ${-h} ${hipY}
+    L ${h} ${hipY}
+    Q ${h + 1} ${waistY + 6} ${w} ${waistY}
+    Q ${w + 2} ${neck + 14} ${s} ${neck}
+    Q 0 ${neck - 4} ${-s} ${neck} Z`;
+  const arms = `M ${-s + 1} ${neck + 1} Q ${-s - armOut} ${neck + 12} ${-s - armOut + 1} ${waistY + 6}
+                M ${s - 1} ${neck + 1} Q ${s + armOut} ${neck + 12} ${s + armOut - 1} ${waistY + 6}`;
+  const legs = `M ${-h + 3} ${hipY} L ${-legGap} ${kneeY}
+                M ${h - 3} ${hipY} L ${legGap} ${kneeY}`;
+  return `<svg viewBox="-46 -2 92 92" aria-hidden="true">
+    <circle class="body-line" cx="0" cy="${y0 + headR}" r="${headR}"></circle>
+    <path class="body-line" d="${torso}"></path>
+    <path class="body-line" d="${arms}"></path>
+    <path class="body-line" d="${legs}"></path>
+  </svg>`;
+}
+
+const SHAPES = [
+  { key: 'low',    label: '偏瘦', shoulder: 19, waist: 13, hip: 17, armOut: 5, legGap: 5 },
+  { key: 'normal', label: '正常', shoulder: 24, waist: 18, hip: 22, armOut: 7, legGap: 7 },
+  { key: 'over',   label: '超重', shoulder: 28, waist: 26, hip: 28, armOut: 9, legGap: 8 },
+  { key: 'obese',  label: '肥胖', shoulder: 31, waist: 33, hip: 33, armOut: 10, legGap: 8 },
+];
+const activeKey = BANDS.find((b) => bmi >= b.from && bmi < b.to)?.key || 'normal';
+const box = document.getElementById('figures');
+for (const f of SHAPES) {
+  const cell = document.createElement('div');
+  cell.className = 'figure' + (f.key === activeKey ? ' is-active' : '');
+  cell.innerHTML = figure(f) + `<span>${f.label}</span>`;
+  box.appendChild(cell);
+}
+</script>
+</body>
+</html>

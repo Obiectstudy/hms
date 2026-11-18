@@ -1,0 +1,1 @@
+{"path":"/register","httpMethod":"POST","headers":{"content-type":"application/json"},"body":"{\"username\":\"probe_user_1\",\"password\":\"probe-pass-1234\"}","isBase64Encoded":false}

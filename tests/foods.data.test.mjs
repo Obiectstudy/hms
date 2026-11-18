@@ -247,6 +247,120 @@ async function run() {
   }
   check('全库份量单位 name 非空且 grams > 0', badAllUnits.length === 0, [...new Set(badAllUnits)].slice(0, 6).join(', '));
 
+
+  // ---------- v1.8：健身人群常见饮食（补剂 / 高蛋白 / 慢碳 / 果蔬 / 脂肪 / 健身餐） ----------
+  // 新增条目的 id 清单：改数据必须同步改这里，防止「悄悄删条目」也能过测试。
+  const V18_BASELINE = 688; // v1.7 收工时的库容量
+  const V18_SUPP = ['yeast-protein', 'whey-concentrate', 'whey-hydrolysate', 'casein-powder', 'pea-protein', 'soy-protein-isolate', 'plant-protein-blend', 'rice-protein', 'egg-white-powder', 'milk-protein-powder', 'mass-gainer', 'protein-bar-lowcarb', 'protein-wafer', 'protein-cookie', 'protein-granola', 'protein-crisps', 'protein-icecream', 'protein-rtd', 'yogurt-protein-drink', 'collagen-peptide', 'creatine-monohydrate', 'bcaa', 'glutamine', 'maltodextrin', 'electrolyte-powder', 'energy-gel', 'glucose-powder'];
+  const V18_PROTEIN = ['turkey-breast-raw', 'turkey-breast-cooked', 'beef-round-lean', 'tilapia', 'skyr', 'cottage-cheese', 'mozzarella-lowfat', 'skim-milk-powder', 'lowfat-cheese-slice', 'chickpea-cooked', 'lentil-cooked', 'chicken-breast-instant-blackpepper', 'chicken-breast-instant-spicy', 'smoked-salmon', 'tuna-water-drained', 'cod-cooked', 'sardine-canned', 'egg-white-liquid', 'chicken-breast-mince'];
+  const V18_CARB = ['ww-pasta-dry', 'ww-pasta-cooked', 'rye-bread', 'ww-tortilla', 'purple-sweet-potato-steamed', 'yam-steamed', 'sweet-potato-roasted', 'hummus', 'cornmeal', 'barley-raw', 'red-bean-cooked', 'whole-wheat-flour', 'oat-groats', 'whole-wheat-bagel', 'konjac-knot', 'protein-bread'];
+  const V18_PRODUCE = ['cauliflower', 'bell-pepper', 'kale', 'brussels-sprouts', 'raspberry', 'grapefruit', 'papaya', 'cauliflower-rice', 'edamame-cooked'];
+  const V18_FAT = ['flaxseed', 'chia-seed', 'coconut-oil', 'pumpkin-seed', 'macadamia', 'pine-nut', 'hazelnut', 'sesame-paste', 'flaxseed-oil', 'pecan'];
+  const V18_MEAL = ['protein-oat-bowl', 'quinoa-chicken-bowl', 'beef-brown-rice-bowl', 'salmon-asparagus-plate', 'whole-wheat-chicken-sandwich', 'tuna-whole-wheat-wrap', 'overnight-oats-whey', 'protein-pancake', 'banana-protein-shake', 'avocado-egg-toast', 'shrimp-broccoli-plate', 'chicken-quinoa-salad', 'greek-yogurt-berry-bowl', 'egg-white-omelette', 'chicken-purple-potato-box', 'tuna-quinoa-bowl', 'beef-broccoli-lowoil', 'steamed-cod-broccoli', 'salmon-brown-rice', 'chicken-whole-wheat-wrap', 'protein-latte', 'egg-avocado-salad', 'quinoa-avocado-salad', 'tuna-egg-white-salad'];
+  const V18_IDS = [...V18_SUPP, ...V18_PROTEIN, ...V18_CARB, ...V18_PRODUCE, ...V18_FAT, ...V18_MEAL];
+  const v18 = FOODS.filter((f) => V18_IDS.includes(f.id));
+
+  check('v1.8 新增清单 ≥ 100 条', V18_IDS.length >= 100, `清单只有 ${V18_IDS.length} 条`);
+  check('v1.8 新增条目全部在库', v18.length === V18_IDS.length,
+    `缺失 id: ${V18_IDS.filter((id) => !FOODS.some((f) => f.id === id)).join(',')}`);
+  check('v1.8 库内总数 = 基线 + 新增（只增不减）', FOODS.length === V18_BASELINE + V18_IDS.length,
+    `库 ${FOODS.length}，应为 ${V18_BASELINE} + ${V18_IDS.length} = ${V18_BASELINE + V18_IDS.length}`);
+  check('v1.8 库内总数 ≥ 788（688 基线 + 100 新增）', FOODS.length >= V18_BASELINE + 100, `实际 ${FOODS.length}`);
+  check('v1.8 新增 id 均为英文小写短横线',
+    v18.every((f) => /^[a-z0-9]+(-[a-z0-9]+)*$/.test(f.id)),
+    v18.filter((f) => !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(f.id)).map((f) => f.id).join(','));
+  check('v1.8 新增 id 清单本身不重复', new Set(V18_IDS).size === V18_IDS.length,
+    `${V18_IDS.length} 条里有 ${V18_IDS.length - new Set(V18_IDS).size} 个重复`);
+  const v18DupName = v18.map((f) => f.name).filter((v, i, a) => a.indexOf(v) !== i);
+  check('v1.8 新增 name 不重复', v18DupName.length === 0, [...new Set(v18DupName)].slice(0, 5).join(','));
+
+  const v18NoFiber = v18.filter((f) => !f.per100g || typeof f.per100g.fiber !== 'number' || !Number.isFinite(f.per100g.fiber));
+  check('v1.8 新增条目全部带 fiber（0 也要写 0）', v18NoFiber.length === 0,
+    `缺失 ${v18NoFiber.length} 条: ${v18NoFiber.map((f) => f.name).slice(0, 6).join(',')}`);
+
+  const v18Off = [];
+  for (const f of v18) {
+    const p = f.per100g || {};
+    if (![p.kcal, p.carb, p.protein, p.fat].every((n) => typeof n === 'number' && Number.isFinite(n))) {
+      v18Off.push(`${f.name}(数值缺失)`);
+      continue;
+    }
+    const calc = p.carb * 4 + p.protein * 4 + p.fat * 9;
+    const tol = Math.max(20, p.kcal * 0.15);
+    if (Math.abs(calc - p.kcal) > tol) v18Off.push(`${f.name}(标${p.kcal}/算${Math.round(calc)})`);
+  }
+  check('v1.8 新增条目 4/4/9 自洽（严格 ±15% 或 ±20kcal，0 例外）', v18Off.length === 0,
+    `超阈值 ${v18Off.length} 条: ${v18Off.slice(0, 6).join(', ')}`);
+
+  // 蛋白粉：用户实际按「1 勺」记录，克数必须落在 20–40g
+  const V18_POWDER = ['yeast-protein', 'whey-concentrate', 'whey-hydrolysate', 'casein-powder', 'pea-protein',
+    'soy-protein-isolate', 'plant-protein-blend', 'rice-protein', 'egg-white-powder', 'milk-protein-powder', 'mass-gainer'];
+  const v18PowderBad = [];
+  for (const id of V18_POWDER) {
+    const f = FOODS.find((x) => x.id === id);
+    if (!f) { v18PowderBad.push(`${id}(不在库)`); continue; }
+    const scoop = (f.units || []).find((u) => /勺/.test(String(u.name)));
+    if (!scoop) { v18PowderBad.push(`${f.name}(没有「1 勺」)`); continue; }
+    const g = Number(scoop.grams);
+    if (!(g >= 20 && g <= 40)) v18PowderBad.push(`${f.name}(1 勺 ${g}g 越界)`);
+  }
+  check('v1.8 蛋白粉类都有「1 勺」且克数 20–40g', v18PowderBad.length === 0, v18PowderBad.slice(0, 6).join(', '));
+  check('v1.8 蛋白粉类 ≥ 10 条且全部属于本轮新增',
+    V18_POWDER.length >= 10 && V18_POWDER.every((id) => V18_IDS.includes(id)), `${V18_POWDER.length} 条`);
+  const v18PowderThin = V18_POWDER.filter((id) => id !== 'mass-gainer')
+    .map((id) => FOODS.find((x) => x.id === id))
+    .filter(Boolean)
+    .filter((f) => !(f.per100g.protein >= 60 && f.per100g.kcal >= 320 && f.per100g.kcal <= 420))
+    .map((f) => `${f.name}(蛋白 ${f.per100g.protein}/${f.per100g.kcal}kcal)`);
+  check('v1.8 蛋白粉类蛋白 ≥ 60g 且能量 320–420 kcal（增肌粉除外）', v18PowderThin.length === 0, v18PowderThin.join(', '));
+
+  // 用户点名的检索路径
+  check('searchFoods("酵母蛋白粉") 首位命中酵母蛋白粉', searchFoods('酵母蛋白粉')[0]?.id === 'yeast-protein',
+    `实际 ${searchFoods('酵母蛋白粉')[0]?.name}`);
+  const v18HitFen = searchFoods('蛋白粉', 20).map((f) => f.id);
+  check('searchFoods("蛋白粉") 命中酵母/浓缩乳清/分离乳清/蛋清蛋白粉',
+    ['yeast-protein', 'whey-concentrate', 'whey-isolate', 'egg-white-powder'].every((id) => v18HitFen.includes(id)), v18HitFen.join(','));
+  const v18HitRu = searchFoods('乳清', 20).map((f) => f.id);
+  check('searchFoods("乳清") 命中乳清蛋白粉与乳清蛋白粉（浓缩）',
+    v18HitRu.includes('whey-protein') && v18HitRu.includes('whey-concentrate'), v18HitRu.join(','));
+  check('findFood("酵母蛋白") 由别名命中酵母蛋白粉', findFood('酵母蛋白')?.id === 'yeast-protein',
+    `实际 ${findFood('酵母蛋白')?.name}`);
+
+  // 必含项：按标准名逐条在库
+  const V18_MUST = ['酵母蛋白粉', '乳清蛋白粉（浓缩）', '水解乳清蛋白粉', '酪蛋白粉（缓释）', '豌豆蛋白粉', '大豆分离蛋白粉',
+    '植物蛋白粉（混合）', '增肌粉（碳水型）', '低糖蛋白棒', '即饮蛋白饮', '胶原蛋白肽', '火鸡胸肉（生）', '牛后腿肉（瘦）',
+    '罗非鱼', '冰岛酸奶（Skyr）', '茅屋奶酪（低脂）', '低脂马苏里拉奶酪', '脱脂奶粉', '菜花（花椰菜）', '彩椒（甜椒）',
+    '羽衣甘蓝', '抱子甘蓝', '树莓', '西柚（葡萄柚）', '亚麻籽', '奇亚籽', '椰子油', '南瓜籽（仁）', '夏威夷果', '松子（仁）',
+    '榛子', '碧根果', '全麦意面（干）', '黑麦面包', '全麦卷饼', '紫薯（蒸，熟）', '山药（蒸，熟）', '红薯（烤）',
+    '鹰嘴豆泥（无糖）', '大麦（生）', '魔芋结（水煮）', '蛋白燕麦碗', '藜麦鸡胸饭', '牛肉糙米饭', '香煎三文鱼配芦笋',
+    '全麦鸡胸三明治', '金枪鱼全麦卷', '希腊酸奶莓果碗', '蛋白蛋卷（鸡蛋白）'];
+  const v18MustMissing = V18_MUST.filter((n) => !FOODS.some((f) => f.name === n));
+  check('v1.8 必含项逐条按标准名在库', v18MustMissing.length === 0, `缺少: ${v18MustMissing.join(',')}`);
+  // 巴沙鱼不单列：库里既有「龙利鱼」已把「巴沙鱼」当别名（市售鱼柳的通称），单列必然撞名
+  check('v1.8「巴沙鱼」由既有「龙利鱼」别名命中，不另立重复条目', findFood('巴沙鱼')?.name === '龙利鱼',
+    `实际 ${findFood('巴沙鱼')?.name}`);
+
+  // 分类计数：任一分类塌了都要红
+  check('v1.8 分类覆盖：补剂 ≥ 20', FOODS.filter((f) => V18_SUPP.includes(f.id)).length >= 20, `${V18_SUPP.length}`);
+  check('v1.8 分类覆盖：高蛋白食材 ≥ 15', FOODS.filter((f) => V18_PROTEIN.includes(f.id)).length >= 15, `${V18_PROTEIN.length}`);
+  check('v1.8 分类覆盖：慢碳主食 ≥ 12', FOODS.filter((f) => V18_CARB.includes(f.id)).length >= 12, `${V18_CARB.length}`);
+  check('v1.8 分类覆盖：蔬菜水果 ≥ 6', FOODS.filter((f) => V18_PRODUCE.includes(f.id)).length >= 6, `${V18_PRODUCE.length}`);
+  check('v1.8 分类覆盖：健康脂肪 ≥ 8', FOODS.filter((f) => V18_FAT.includes(f.id)).length >= 8, `${V18_FAT.length}`);
+  check('v1.8 分类覆盖：健身餐 ≥ 20', FOODS.filter((f) => V18_MEAL.includes(f.id)).length >= 20, `${V18_MEAL.length}`);
+
+  // 份量 1–3 个、unit 与 units[0] 一致、别名 ≥ 2、健身餐写明 recipe
+  const v18BadUnits = [];
+  for (const f of v18) {
+    const units = Array.isArray(f.units) ? f.units : [];
+    if (units.length === 0 || units.length > 3) { v18BadUnits.push(`${f.name}(${units.length} 个份量)`); continue; }
+    if (!f.unit || f.unit.name !== units[0].name || f.unit.grams !== units[0].grams) v18BadUnits.push(`${f.name}(unit 与 units[0] 不一致)`);
+  }
+  check('v1.8 新增条目份量 1–3 个且 unit 与 units[0] 一致', v18BadUnits.length === 0, v18BadUnits.slice(0, 6).join(', '));
+  const v18BadAlias = v18.filter((f) => !Array.isArray(f.aliases) || f.aliases.length < 2);
+  check('v1.8 新增条目至少 2 个别名（俗称 + 英文）', v18BadAlias.length === 0, v18BadAlias.map((f) => f.name).slice(0, 6).join(','));
+  const v18NoRecipe = FOODS.filter((f) => V18_MEAL.includes(f.id)).filter((f) => typeof f.recipe !== 'string' || !f.recipe.trim());
+  check('v1.8 健身餐都写明配方（recipe 非空）', v18NoRecipe.length === 0, v18NoRecipe.map((f) => f.name).join(','));
+
   return {
     passed,
     failed: failures.length,
