@@ -168,6 +168,30 @@ function lockScroll() {
   return () => { document.body.style.overflow = prev; };
 }
 
+/**
+ * 弹层退场（第三批）。调用点在 finish() 已经把 Promise settle 之后 ——
+ * 动画只在视觉层跑，谁都不等它：await openSheet(...) 的时序与第三批之前一帧不差。
+ *
+ * 降级（motionAllowed() 为假）＝第三批之前的行为：立刻摘节点，一毫秒都不多留。
+ * 动效开启时先挂 .hms-sheet-out（面板往下方位移 + 淡出，遮罩淡出、不再吃点击），
+ * 由 animationend 摘节点；另起一个定时器兜底，防止动画被打断（切页、标签页被隐藏、
+ * 系统临时开了减弱动效）之后节点永远留在 body 上。
+ */
+function dismissOverlay(backdrop) {
+  if (!backdrop || typeof backdrop.remove !== 'function') return;
+  if (!motionAllowed()) { backdrop.remove(); return; } // 降级：瞬时移除
+  let done = false;
+  const remove = () => {
+    if (done) return;
+    done = true;
+    backdrop.remove();
+  };
+  backdrop.classList.add('hms-sheet-out');
+  backdrop.setAttribute('aria-hidden', 'true');
+  if (typeof backdrop.addEventListener === 'function') backdrop.addEventListener('animationend', remove);
+  setTimeout(remove, 320); // 兜底：animationend 没来（被打断 / 动画被禁用）也不会漏节点
+}
+
 export function confirmDialog({ title = '确认', message = '', okText = '确定', cancelText = '取消' } = {}) {
   return new Promise((resolve) => {
     const unlock = lockScroll();
@@ -214,8 +238,9 @@ export function openSheet({ title = '', content = null, actions = [] } = {}) {
       unregister();
       unlock();
       document.removeEventListener('keydown', onKey);
-      backdrop.remove();
+      // 先 settle，再放退场视觉：动画不参与 Promise（也不许参与），调用方拿到的时机不变。
       resolve(value);
+      dismissOverlay(backdrop);
     };
     const onKey = (e) => {
       if (e.key === 'Escape') finish(null);
@@ -245,6 +270,9 @@ export function openSheet({ title = '', content = null, actions = [] } = {}) {
     const rendered = typeof content === 'function' ? content({ close: finish }) : content;
     if (rendered) appendChildren(body, [rendered]);
     document.body.appendChild(backdrop);
+    // 开：面板从下方轻微位移 + 淡入，遮罩同步淡入（keyframes 自带 both，插入即入画，不用排帧）。
+    // 降级时不挂类 → 与第三批之前完全一样（styles.css 里 .sheet 自己的入场动画不受影响）。
+    if (motionAllowed()) backdrop.classList.add('hms-sheet-in');
   });
 }
 
@@ -268,21 +296,42 @@ function ratio(value, max) {
   return Math.min(1, Math.max(0, v / m));
 }
 
-export function ring({ value = 0, max = 1, label = '', unit = '', color = 'var(--brand)' } = {}) {
+// 环的线宽（与 circle 上的 stroke-width 同源）。圆头（round cap）每端多画半个线宽，
+// 所以「把弧推到看不见」的起点要额外带上这段长度，不然收尾处会留一个小圆点。
+const RING_STROKE = 12;
+
+/**
+ * 进度环。grow 控制第三批的「弧长生长」：可传 false 得到一条静态终值的环。
+ *
+ * 弧长生长怎么实现的（三条红线，改之前先读）：
+ *  1. stroke-dasharray 永远写终值（实线段长 dash + 一整圈空隙）—— 它与进度一一对应，
+ *     任何时刻读到的都必须等于当前百分比，动效不许碰它。
+ *  2. 补间只发生在 stroke-dashoffset：把整段弧（连两端的圆头）推到路径起点之前 = 完全不可见，
+ *     再补到 0 = 恰好停在终值弧上。视觉上就是从 12 点方向沿圆周「长」到当前百分比。
+ *  3. 起点值不写成元素的 stroke-dashoffset，而是落在 CSS 变量 --hms-ring-from 里，
+ *     由 @keyframes hms-ring-grow 的 from 去读。这样元素自身的 stroke-dashoffset 只有默认的 0：
+ *     动画没跑（降级 / 减弱动效 / 老 WebView / 页面没挂 .hms-motion）时环就是终态，
+ *     绝不会留下一个看不见的环。
+ */
+export function ring({ value = 0, max = 1, label = '', unit = '', color = 'var(--brand)', grow = true } = {}) {
   const pct = ratio(value, max);
   const r = 52;
   const circumference = 2 * Math.PI * r;
   const dash = circumference * pct;
+  // 起点 = 弧长 + 一个线宽：弧本身（dash）和两端圆头（各半个线宽）都被推到 s<0，起点处一点残影都不剩。
+  const growFrom = dash + RING_STROKE;
+  const arcGrow = grow && pct > 0 && motionAllowed();
+  const valueStyle = arcGrow ? `stroke:${color};--hms-ring-from:${growFrom.toFixed(2)}px` : `stroke:${color}`;
   const svgNode = svg('svg', { viewBox: '0 0 120 120', class: 'ring__svg', 'aria-hidden': 'true' },
-    svg('circle', { cx: 60, cy: 60, r, fill: 'none', 'stroke-width': 12, class: 'ring__track' }),
+    svg('circle', { cx: 60, cy: 60, r, fill: 'none', 'stroke-width': RING_STROKE, class: 'ring__track' }),
     // pct 为 0 时圆头会留下一个孤立圆点，看起来像坏掉的小圆——0 值直接不画。
     pct > 0
       ? svg('circle', {
-        cx: 60, cy: 60, r, fill: 'none', 'stroke-width': 12, 'stroke-linecap': 'round',
-        class: 'ring__value',
+        cx: 60, cy: 60, r, fill: 'none', 'stroke-width': RING_STROKE, 'stroke-linecap': 'round',
+        class: arcGrow ? 'ring__value hms-ring-arc' : 'ring__value',
         'stroke-dasharray': `${dash} ${circumference}`,
         transform: 'rotate(-90 60 60)',
-        style: `stroke:${color}`,
+        style: valueStyle,
       })
       : null,
   );
@@ -598,13 +647,33 @@ export function field({ label = '', type = 'text', value = '', placeholder = '',
 // 任何时刻读文本 / 读属性都必须拿到终值，中间帧只允许改 transform / opacity（样式见 styles.css 的动效节）。
 
 /**
- * 动效总闸：能力 + 用户意愿，两样都成立才允许动。
+ * 读 navigator.deviceMemory（单位 GB，浏览器会向下取整到 0.25 / 0.5 / 1 / 2 / 4 / 8）。
  *
- * 降级行为（一处判定，四个入口全部走它：armPageMotion / staggerEnter / countUp / toast 的达标反馈）：
+ * 「未知」一律返回 null：字段缺失（Safari、Firefox 至今都没有这个 API）、undefined、
+ * 非数字、读取时抛错，全都走这一条。null 的语义是「没证据」，由调用方按正常设备处理。
+ */
+function deviceMemoryGB() {
+  let nav = null;
+  try {
+    nav = typeof navigator === 'undefined' ? null : navigator;
+  } catch {
+    nav = null; // 某些环境下访问 navigator 本身会抛（跨域 iframe 等）：当未知处理
+  }
+  if (!nav) return null;
+  const gb = Number(nav.deviceMemory);
+  return Number.isFinite(gb) ? gb : null;
+}
+
+/**
+ * 动效总闸：能力 + 用户意愿 + 设备余量，三样都成立才允许动。
+ *
+ * 降级行为（一处判定，所有入口全部走它：armPageMotion / staggerEnter / countUp / toast 的达标反馈 /
+ * ring 的弧长生长 / 折叠与弹层的缓动）：
  *  1. 没有 requestAnimationFrame（本机假 DOM、老 WebView）→ false：一条动效都不执行，直接呈现终值。
  *  2. 命中 prefers-reduced-motion: reduce（系统「减弱动态效果」）→ false：同上。
- *  3. 根节点带 .hms-motion-off（低端机 / 省电模式的顶层开关）→ false：同上。
- * 每次调用现算，不缓存：媒体查询的取值与根节点上的开关都可能在运行期变化。
+ *  3. 系统明确暴露 navigator.deviceMemory 且 <= 2GB（真·低端机）→ false：同上。
+ *  4. 根节点带 .hms-motion-off（页面级顶层开关 / 排障兜底）→ false：同上。
+ * 每次调用现算，不缓存：媒体查询的取值、设备内存与根节点上的开关都可能在运行期变化。
  */
 export function motionAllowed() {
   // 没有帧回调就没有动画 —— 先判能力，这决定了假 DOM / 老 WebView 里的行为。
@@ -620,6 +689,12 @@ export function motionAllowed() {
     }
     if (reduced) return false;
   }
+  // 低端机降级：判据刻意窄到只剩一个信号 —— 系统明确报出 <= 2GB。
+  // 不用 UA / 屏幕尺寸 / CPU 核数去猜：那几样在好设备上误判的概率比真低端机还高，
+  // 而误判的代价是「好设备被永久关掉动效」。deviceMemory 缺失时返回 null = 没证据 = 按正常设备处理：
+  // 宁可让少数低端机多跑一次 280ms 的 transform，也不误伤主力机。内存约 3~4GB 的机器报 4，照常开动效。
+  const memoryGB = deviceMemoryGB();
+  if (memoryGB != null && memoryGB <= 2) return false;
   // 最后看页面级硬开关（styles.css 里 .hms-motion-off 会连 animation/transition 一起关掉）。
   // <html> 与 <body> 都看：开关挂在哪一层都算数。
   const doc = typeof document === 'undefined' ? null : document;
@@ -708,5 +783,41 @@ export function countUp(target, from, to, formatFn) {
     target.style.transform = '';
     target.style.opacity = '';
   });
+}
+
+/* ---------- 动效（第三批：折叠缓动） ---------- */
+
+/**
+ * 展开一段折叠内容，返回 { node, close } 句柄；close() 同步把内容从 DOM 里摘掉。
+ *
+ * 为什么内容「展开后立即可读」：
+ *  - 内容节点在 appendChild 的同一帧就进了 DOM，之后没有 display:none / visibility:hidden /
+ *    content-visibility 之类的开关，也没有「等动画结束再插节点」这种顺序。
+ *  - 高度补间只作用在外层 .hms-fold（grid-template-rows 0fr → 1fr，内层 overflow:hidden），
+ *    没有把高度写死成像素，所以内容是自然尺寸，折行 / 字号变化都正确。
+ *  - 因此文本、aria、选中、无障碍树从一开始就是完整的；动画只是让它「露出来」。
+ *
+ * 为什么收起不补间：收起必须同步把节点摘掉（既有的折叠断言要求收起后 DOM 里没有条目，
+ * 「收起后不可读」也是同一条契约）。留一个正在播放退场动画的空壳会让文本在收起后继续留在
+ * 无障碍树里 —— 那不是缓动，是 bug。所以 close() 直接移除，收起方向是瞬时的。
+ *
+ * 降级（motionAllowed() 为假）：不挂 --anim / --closed，直接 1fr —— 与第三批之前行为一致。
+ */
+export function revealFold(slot, content) {
+  const wrap = el('div', { className: 'hms-fold' }, el('div', { className: 'hms-fold__inner' }, content));
+  if (!slot || typeof slot.appendChild !== 'function') return { node: wrap, close() {} };
+  slot.appendChild(wrap);
+  if (motionAllowed()) {
+    wrap.classList.add('hms-fold--anim', 'hms-fold--closed');
+    // 下一帧摘掉起点：transition 把 grid-template-rows 从 0fr 拉到 1fr。
+    // 帧回调只碰类名，不碰内容 —— 内容在上一行就已经可读了。
+    requestAnimationFrame(() => wrap.classList.remove('hms-fold--closed'));
+  }
+  return {
+    node: wrap,
+    close() {
+      if (wrap.parentNode) wrap.remove();
+    },
+  };
 }
 

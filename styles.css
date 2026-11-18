@@ -1194,7 +1194,8 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   --motion-step-ms: 40ms;                       /* 错峰步长（js/ui.js 的 staggerEnter stepMs 默认 40） */
   --motion-enter-y: 8px;                        /* 入场位移量 */
   --motion-press: .97;                          /* 按下缩放 */
-  --motion-ring-from: .92;                      /* 环入场起始缩放 */
+  --motion-fold-dur: 260ms;                     /* 折叠展开：grid-template-rows 0fr → 1fr */
+  --motion-sheet-y: 18px;                       /* 弹层面板的起始 / 退场位移 */
 }
 
 /* 顶层开关：任何祖先带 .hms-motion-off，整页动效关闭（低端机 / 省电 / 排障兜底）。 */
@@ -1219,23 +1220,19 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
 .hms-motion .btn:active { transform: scale(var(--motion-press)); }
 
 /*
- * 进度增长：宽度 / 圆弧长度在 DOM 里始终是终值（bar() 写的 width、ring() 写的 stroke-dasharray），
- * 这里只让「视觉」从 0 长到终值 —— 起始态由 .hms-grow-pending 提供（transform: scaleX(0)），
- * 视图在下一帧把它摘掉，transition 就把 transform 拉回 1。全程不碰布局属性。
+ * 进度增长（条）：宽度在 DOM 里始终是终值（bar() 写的 width），这里只让「视觉」从 0 长到终值 ——
+ * 起始态由 .hms-grow-pending 提供（transform: scaleX(0)），视图在下一帧把它摘掉，
+ * transition 就把 transform 拉回 1。全程不碰布局属性。
+ *
+ * 进度环第三批已改成「弧长生长」（见下面的 hms-ring-grow）：这条总闸现在只管条形进度条，
+ * 环不再整体缩放 —— 缩放会把圆环和中心数字一起缩，既糊又和弧长动画打架。
  */
 .hms-motion .bar__fill {
   transform-origin: left center;
   transform: scaleX(1);
   transition: transform var(--motion-dur) var(--motion-ease-out);
 }
-.hms-motion .ring__svg {
-  transform-origin: center;
-  transform: scale(1);
-  opacity: 1;
-  transition: transform var(--motion-dur) var(--motion-ease-out), opacity var(--motion-dur) var(--motion-ease);
-}
 .hms-motion.hms-grow-pending .bar__fill { transform: scaleX(0); transition: none; }
-.hms-motion.hms-grow-pending .ring__svg { transform: scale(var(--motion-ring-from)); opacity: .45; transition: none; }
 
 /* 卡片错峰入场：keyframes 只有一条，逐项延迟由 js/ui.js 的 staggerEnter 写进内联 animation-delay。
  * animation-fill-mode: both 保证延迟期间也停在 from（透明），不会先闪一下再入场。 */
@@ -1300,25 +1297,94 @@ input[type="file"].input { padding-top: 10px; font-size: 13px; }
   to { opacity: 0; }
 }
 
+/* ---------- 动效（第三批：环弧长生长 / 折叠与弹层缓动） ---------- */
+
+/*
+ * 进度环的弧长生长。
+ * stroke-dasharray 是终值（js/ui.js 的 ring() 按百分比写成「实线段 + 一整圈空隙」），永远不动；
+ * 这里只补间 stroke-dashoffset：起点把整段弧（连同两端圆头）推到路径起点之前 → 完全看不见，
+ * 终点 0 → 恰好停在终值弧上。视觉上就是从 12 点方向沿圆周「长」到当前百分比。
+ *
+ * 起点值由 ring() 写进元素的 --hms-ring-from（= 弧长 + 线宽）；
+ * 元素自身的 stroke-dashoffset 从没被写过，默认就是 0 —— 所以动画没跑成时环是终态，不是空环。
+ * 用 animation 而不是 transition：一次性入场，没有「起点类」需要中途摘掉，也不会被连续的数值刷新打断。
+ */
+.hms-motion .hms-ring-arc {
+  animation: hms-ring-grow var(--motion-dur) var(--motion-ease-out) both;
+}
+@keyframes hms-ring-grow {
+  from { stroke-dashoffset: var(--hms-ring-from, 0); }
+  to { stroke-dashoffset: 0; }
+}
+
+/*
+ * 折叠展开：高度走 grid-template-rows 0fr → 1fr（内层 overflow: hidden）。
+ * 这是目前跨浏览器最稳的「自动高度」补间方式：不用把高度量成像素，内容折行 / 字号变化 / 字体晚到都对。
+ * 内容在 js/ui.js 的 revealFold() 里就已经进 DOM 了，这里的动画只决定「露出来多少」，不影响可读性。
+ * --anim 只由 revealFold() 在 motionAllowed() 为真时挂上；降级时没有这个类，也就没有过渡。
+ */
+.hms-fold {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+.hms-fold__inner {
+  overflow: hidden;
+  min-height: 0;
+}
+.hms-fold--anim { transition: grid-template-rows var(--motion-fold-dur) var(--motion-ease-out); }
+.hms-fold--closed { grid-template-rows: 0fr; }
+
+/*
+ * 弹层开合：面板从下方轻微位移 + 淡入，关闭反向（位移 + 淡出），遮罩同步淡入淡出。
+ * 类只由 js/ui.js 的 openSheet / dismissOverlay 在 motionAllowed() 为真时挂：
+ *  - .hms-sheet-in  插入弹层时挂，keyframes 自带 both，所以不需要排帧；
+ *  - .hms-sheet-out 关闭时挂，此时 Promise 已经 resolve —— 动画一帧都不占调用方的时序。
+ * 退场期间 pointer-events: none：不给用户一个「点了没反应」的 280ms 窗口。
+ */
+.sheet-backdrop.hms-sheet-in { animation: hms-overlay-in var(--motion-dur) var(--motion-ease-out) both; }
+.sheet-backdrop.hms-sheet-in .sheet { animation: hms-sheet-in var(--motion-dur) var(--motion-ease-out) both; }
+.sheet-backdrop.hms-sheet-out {
+  animation: hms-overlay-out var(--motion-dur-fast) linear both;
+  pointer-events: none;
+}
+.sheet-backdrop.hms-sheet-out .sheet { animation: hms-sheet-out var(--motion-dur-fast) var(--motion-ease) both; }
+@keyframes hms-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes hms-overlay-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes hms-sheet-in {
+  from { opacity: .6; transform: translate3d(0, var(--motion-sheet-y), 0); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes hms-sheet-out {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: translate3d(0, var(--motion-sheet-y), 0); }
+}
+
 /* 减弱动态效果：整批归零（与文件里既有的全局 reduced-motion 规则叠加，这里是动效节的显式兜底）。 */
 @media (prefers-reduced-motion: reduce) {
   .hms-motion .btn,
   .hms-motion .btn:active,
   .hms-motion .bar__fill,
-  .hms-motion .ring__svg,
+  .hms-motion .hms-ring-arc,
   .hms-motion .hms-enter,
   .hms-count,
   .hms-page-enter,
   .hms-toast-ok::before,
   .hms-motion.hms-grow-pending .bar__fill,
-  .hms-motion.hms-grow-pending .ring__svg {
+  .hms-fold--anim,
+  .sheet-backdrop.hms-sheet-in,
+  .sheet-backdrop.hms-sheet-in .sheet,
+  .sheet-backdrop.hms-sheet-out,
+  .sheet-backdrop.hms-sheet-out .sheet {
     animation: none !important;
     transition: none !important;
     transform: none !important;
   }
-  .hms-motion.hms-grow-pending .ring__svg { opacity: 1 !important; }
   .hms-count { opacity: 1 !important; }
   .hms-page-enter { opacity: 1 !important; }
+  /* 减弱动效时环直接是终态：元素本身没有 stroke-dashoffset，animation: none 之后就落在 0。 */
+  .hms-motion .hms-ring-arc { stroke-dashoffset: 0 !important; }
+  /* 折叠直接摊开 / 收起到终态。 */
+  .hms-fold--closed { grid-template-rows: 0fr !important; }
   /* ghost 本来就是旧页的快照：减弱动效时立刻不可见，等兜底定时器摘掉即可。 */
   .page-ghost { opacity: 0 !important; }
 }

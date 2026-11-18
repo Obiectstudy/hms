@@ -6363,6 +6363,408 @@ await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不�
     });
 
 
+/* ------------------------------------------------------------------
+     * 动效第三批：进度环弧长生长 · 弹层开合 · 折叠缓动 · 低端机降级
+     * 实现先于测试落地，本轮只补断言。每一条都用变异自检验证过「改成坏实现就会红」
+     * （自检记录见提交说明：环终态不复位 offset / deviceMemory 缺失也判低端）。
+     * ------------------------------------------------------------------ */
+
+    /** 环的值圆弧：SVG 的 class 走 setAttribute（ui.js 的 svg() 只写属性），只能读 getAttribute。 */
+    const ringCircleOf = (node) => (node ? node.walk().find((n) => String(n.getAttribute('class') || '').split(/\s+/).includes('ring__value')) || null : null);
+    /** SVG 的 style 也是属性串（不是对象）：svg() 对每个 attrs 都 setAttribute。 */
+    const styleAttrOf = (node) => String((node && node.getAttribute('style')) || '');
+    /** 动画起点：ring() 把「让弧完全不可见」的 offset 写进 --hms-ring-from，交给 keyframes 的 from 去读。 */
+    const ringFromOf = (circle) => {
+      const m = /--hms-ring-from:\s*(-?[\d.]+)px/.exec(styleAttrOf(circle));
+      return m ? Number(m[1]) : null;
+    };
+    /** 元素「自身」的 stroke-dashoffset：属性或内联样式里出现过才算；都没有 = 默认 0 = 终态。 */
+    const ringOffsetOf = (circle) => {
+      const attr = circle.getAttribute('stroke-dashoffset');
+      if (attr != null) return Number(attr);
+      const inline = /stroke-dashoffset:\s*(-?[\d.]+)/.exec(styleAttrOf(circle));
+      return inline ? Number(inline[1]) : 0;
+    };
+    const attachedToBody = (node) => dom.body.childNodes.includes(node);
+    /** 环的最终读数：弧长、中心数字、是否进了弧长生长、起点值。 */
+    const ringReadingOf = (root) => {
+      const circle = ringCircleOf(root);
+      const num = root.walk().find((n) => String(n.className).split(/\s+/).includes('ring__num'));
+      return {
+        has: Boolean(circle),
+        dash: circle ? String(circle.getAttribute('stroke-dasharray') || '') : '',
+        num: num ? num.textOf() : '',
+        arc: circle ? String(circle.getAttribute('class')).split(/\s+/).includes('hms-ring-arc') : false,
+        from: circle ? ringFromOf(circle) : null,
+      };
+    };
+
+    // 【1】弧长的既有契约（stroke-dasharray = 终值）在动效态下必须同样成立 —— 与既有的
+    // 「动效红线：进度环的圆弧长度同步写入」是同一条契约的第二道保护：那一条只比了降级态，这里把动效态也钉住。
+    await checkAsync('动效第三批【1】：stroke-dasharray 在动效态仍是终值（弧长 + 整圈空隙），与降级态逐字相同', async () => {
+      const r = 52;
+      const circumference = 2 * Math.PI * r;
+      const expected = circumference * 0.4;
+      const dashOf = (node) => {
+        const circle = ringCircleOf(node);
+        return circle ? String(circle.getAttribute('stroke-dasharray') || '') : '';
+      };
+      const plain = dashOf(uiMotion.ring({ value: 400, max: 1000 }));
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, () => {
+          const dash = dashOf(uiMotion.ring({ value: 400, max: 1000 }));
+          assert.equal(dash, plain, '动效开启后 stroke-dasharray 变了：' + dash + ' vs ' + plain + '（弧长被拿去当动画量了）');
+          const parts = dash.split(' ').map(Number);
+          assert.ok(Math.abs(parts[0] - expected) < 0.01, '弧长不是终值 ' + expected.toFixed(2) + '：' + dash);
+          assert.ok(Math.abs(parts[1] - circumference) < 0.01, '空隙不是一整圈周长 ' + circumference.toFixed(2) + '：' + dash);
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    // 【2】弧长生长的两条红线：起点让弧（连圆头）完全不可见；元素自身的 offset 恒为 0（终态）。
+    await checkAsync('动效第三批【2】：动效态起点把整段弧推到不可见，元素自身 stroke-dashoffset 仍是 0（动画不跑就是终态）', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, () => {
+          const node = uiMotion.ring({ value: 500, max: 1000 });
+          const circle = ringCircleOf(node);
+          assert.ok(circle, '动效态没有画出值圆弧');
+          assert.ok(String(circle.getAttribute('class')).split(/\s+/).includes('hms-ring-arc'), '动效态没有挂 .hms-ring-arc（弧长动画根本没接上）');
+          const dash = Number(String(circle.getAttribute('stroke-dasharray')).split(' ')[0]);
+          const from = ringFromOf(circle);
+          assert.ok(from != null, '动效态没有写 --hms-ring-from：keyframes 的起点无所可读');
+          assert.ok(from > dash, '起点 offset ' + from + ' 没有越过弧长 ' + dash.toFixed(2) + '：第一帧就能看到一段弧');
+          assert.ok(from >= dash + 12 - 0.01, '起点没有把两端圆头（各半个线宽，共 12）一起推出去：起点会留两个圆点');
+          assert.equal(ringOffsetOf(circle), 0, '元素自身带着非 0 的 stroke-dashoffset：动画没跑成时环会永远不可见');
+          const at = cssText.indexOf('@keyframes hms-ring-grow');
+          assert.ok(at >= 0, 'styles.css 里没有 hms-ring-grow 关键帧');
+          const keyframes = cssText.slice(at, cssText.indexOf('\n}', at) + 2);
+          assert.ok(/from\s*\{[^}]*stroke-dashoffset:\s*var\(--hms-ring-from,\s*0\)/.test(keyframes), '关键帧起点不是读 --hms-ring-from（也没有 0 兜底）：' + keyframes);
+          assert.ok(/to\s*\{[^}]*stroke-dashoffset:\s*0/.test(keyframes), '关键帧终点不是 0：动画跑完弧会停在不可见处');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    // 【3】降级（无 rAF）：一条动效都不许碰环，且绝不能留下一个不可见的环。
+    await checkAsync('动效第三批【3】降级：无 rAF 时环直接是终态（无 arc 类、无起点变量、offset=0）', async () => {
+      assert.equal(typeof globalThis.requestAnimationFrame, 'undefined', '前置：本机假 DOM 没有 rAF，这一条必须在降级环境里跑');
+      const circle = ringCircleOf(uiMotion.ring({ value: 300, max: 1200 }));
+      assert.ok(circle, '降级时没有画出值圆弧');
+      assert.equal(String(circle.getAttribute('class')).split(/\s+/).includes('hms-ring-arc'), false, '降级时仍挂了 .hms-ring-arc（会跑一段永远不结束的动画）');
+      assert.equal(ringFromOf(circle), null, '降级时仍写了 --hms-ring-from');
+      assert.equal(ringOffsetOf(circle), 0, '降级时 offset 不是 0：留下一个看不见的环（用户只看到空环）');
+      const dash = Number(String(circle.getAttribute('stroke-dasharray')).split(' ')[0]);
+      assert.ok(Math.abs(dash - 2 * Math.PI * 52 * 0.25) < 0.01, '降级时弧长不是终值：' + dash);
+    });
+
+    // 【4】视图可以按需关掉单个环（grow:false）；值为 0 时不画弧 —— 动效态下这两条同样成立。
+    await checkAsync('动效第三批【4】：动效态下 grow:false 仍是静态终值，pct=0 仍不画弧', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, () => {
+          const off = ringCircleOf(uiMotion.ring({ value: 800, max: 1000, grow: false }));
+          assert.ok(off, 'grow:false 时没有画出值圆弧');
+          assert.equal(String(off.getAttribute('class')).split(/\s+/).includes('hms-ring-arc'), false, 'grow:false 仍挂了弧长动画类');
+          assert.equal(ringFromOf(off), null, 'grow:false 仍写了 --hms-ring-from');
+          assert.equal(ringOffsetOf(off), 0, 'grow:false 时元素自身 offset 不是 0');
+          assert.equal(ringCircleOf(uiMotion.ring({ value: 0, max: 1000 })), null, '值为 0 时画出了圆弧：圆头会留下一个孤立圆点');
+          assert.ok(nodeText(uiMotion.ring({ value: 0, max: 1000 })).includes('0'), '值为 0 时中心数字丢了');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    // 【5】两页实测：动效开着渲染时，环的弧长与中心数字必须与降级态逐字一致，且等于终值。
+    await checkAsync('动效第三批【5】：饮水页 / 今日页的环 —— 弧长与中心数字在动效态与降级态逐字一致，且是终值', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        const today = nutrition.localDateStr();
+        const goals = await store.getGoals();
+        const target = Number(goals.waterMl) || 2000;
+        const before = await store.daySummary(today);
+        const waterBefore = Number(before.water) || 0;
+        const netBefore = Math.round(Number(before.intake.kcal) - Number(before.burned));
+        let fillerId = null;
+        try {
+          await store.setWater(today, 800);
+          // 今日页的环画的是「净热量」：净热量 <= 0 时 pct=0，环里没有弧 —— 那样「数值未变」就成了空话，先垫一餐。
+          if (!(netBefore > 0)) {
+            fillerId = await store.logMeal({
+              date: today, slot: 'snack', source: 'manual',
+              items: [{ name: '环终值测试餐', grams: 100, kcal: 600, carb: 1, protein: 1, fat: 1 }],
+            });
+          }
+          assert.equal(typeof globalThis.requestAnimationFrame, 'undefined', '前置：先在降级环境里取一组基准读数');
+          const plainWater = ringReadingOf(await renderView('water'));
+          const plainDash = ringReadingOf(await renderView('dashboard'));
+          const frames = installFrames();
+          let motionWater;
+          let motionDash;
+          try {
+            await withReducedMotion(false, async () => {
+              motionWater = ringReadingOf(await renderView('water'));
+              motionDash = ringReadingOf(await renderView('dashboard'));
+            });
+          } finally {
+            frames.restore();
+          }
+          const expectedDash = 2 * Math.PI * 52 * Math.min(1, Math.max(0, 800 / target));
+          assert.equal(motionWater.arc, true, '饮水页动效态没有进入弧长生长（.hms-ring-arc 缺失）');
+          assert.equal(plainWater.arc, false, '降级态不该挂 .hms-ring-arc');
+          assert.equal(motionWater.dash, plainWater.dash, '动效改变了饮水页环的 stroke-dasharray：' + motionWater.dash + ' vs ' + plainWater.dash);
+          assert.ok(Math.abs(Number(plainWater.dash.split(' ')[0]) - expectedDash) < 0.01, '饮水页环弧长不是终值 ' + expectedDash.toFixed(2) + '：' + plainWater.dash);
+          assert.equal(motionWater.num, plainWater.num, '动效改变了饮水页环的中心数字：' + motionWater.num + ' vs ' + plainWater.num);
+          assert.equal(plainWater.num, '800', '饮水页环中心显示的不是当前水量 800：' + plainWater.num);
+          assert.ok(motionDash.has, '前置：今日页消费环没有画出来（净热量 <= 0），本用例无从比较');
+          assert.equal(motionDash.arc, true, '今日页动效态没有进入弧长生长');
+          assert.equal(motionDash.dash, plainDash.dash, '动效改变了今日页环的 stroke-dasharray：' + motionDash.dash + ' vs ' + plainDash.dash);
+          assert.equal(motionDash.num, plainDash.num, '动效改变了今日页环的中心数字：' + motionDash.num + ' vs ' + plainDash.num);
+          assertNoLeak(motionDash.num, 'dashboard(环中心)');
+        } finally {
+          await store.setWater(today, waterBefore);
+          if (fillerId != null) await store.deleteMeal(fillerId);
+        }
+      });
+    });
+
+    // 【6】弹层开：开启有过渡类；关闭时 Promise 先 settle，退场动画后跑（谁都不许等动画）。
+    await checkAsync('动效第三批【6】：弹层开启挂 .hms-sheet-in；关闭时 Promise 先 settle、退场类后挂、animationend 才摘点', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, async () => {
+          clearOverlays();
+          let settled = false;
+          let value;
+          const pending = uiMotion.openSheet({
+            title: '退场时序测试',
+            content: uiMotion.el('div', { text: '内容' }),
+            actions: [{ text: '完成', value: 'done', primary: true }],
+          }).then((v) => { settled = true; value = v; });
+          const backdrop = dom.body.childNodes.find((n) => classListOf(n).includes('sheet-backdrop'));
+          assert.ok(backdrop, '弹层没有挂到 body 上');
+          assert.ok(classListOf(backdrop).includes('hms-sheet-in'), '开启时没有过渡类 .hms-sheet-in：开合动画没接上');
+          fireClick(findButton(backdrop, '完成'));
+          assert.equal(settled, false, '前置：点击后同步读到 settled 应为 false（resolve 走微任务）');
+          await pending;
+          assert.equal(value, 'done', '弹层没有把点击值交给调用方');
+          assert.equal(attachedToBody(backdrop), true, 'Promise 已经 resolve，节点却被同步摘掉了：退场动画没生效，或被塞进了 resolve 之前');
+          assert.ok(classListOf(backdrop).includes('hms-sheet-out'), '关闭时没有挂退场类 .hms-sheet-out');
+          assert.equal(backdrop.getAttribute('aria-hidden'), 'true', '退场中的弹层没有 aria-hidden：读屏还会再念一遍已经 resolve 的弹层');
+          const handlers = backdrop.listeners.animationend || [];
+          assert.equal(handlers.length, 1, '退场没有登记 animationend（实为 ' + handlers.length + ' 个）：只能等兜底定时器');
+          for (const fn of handlers) fn({ type: 'animationend' });
+          assert.equal(attachedToBody(backdrop), false, 'animationend 到达后节点没有被摘掉');
+          clearOverlays();
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    // 【7】弹层降级：无 rAF = 第三批之前的行为，一毫秒都不多留、不留孤儿。
+    await checkAsync('动效第三批【7】降级：无 rAF 时弹层关闭立刻摘节点（不留过渡类、body 上无孤儿）', async () => {
+      assert.equal(typeof globalThis.requestAnimationFrame, 'undefined', '前置：假 DOM 没有 rAF，这一条必须在降级环境里跑');
+      clearOverlays();
+      const overflowBefore = dom.body.style.overflow;
+      const pending = uiMotion.openSheet({ title: '降级弹层', content: uiMotion.el('div', { text: '内容' }), actions: [{ text: '关闭', value: 1 }] });
+      const backdrop = dom.body.childNodes.find((n) => classListOf(n).includes('sheet-backdrop'));
+      assert.ok(backdrop, '降级时弹层没有挂上');
+      assert.equal(classListOf(backdrop).includes('hms-sheet-in'), false, '降级时仍挂了开启过渡类：' + classListOf(backdrop).join(' '));
+      fireClick(findButton(backdrop, '关闭'));
+      assert.equal(await pending, 1, '降级时弹层没有交出点击值');
+      assert.equal(attachedToBody(backdrop), false, '降级时节点没有在同一个 tick 被摘掉（残留动画空壳）');
+      assert.equal(classListOf(backdrop).includes('hms-sheet-out'), false, '降级时仍挂了退场类');
+      assert.equal(overlays('sheet-backdrop').length, 0, 'body 上仍有 sheet-backdrop 孤儿节点');
+      assert.equal(dom.body.style.overflow, overflowBefore, '降级时滚动锁没有复原');
+    });
+
+    // 【8】兜底定时器：动画事件永远不来（被打断 / 标签页被隐藏）时，节点仍然会被摘掉。
+    await checkAsync('动效第三批【8】：退场动画事件不来时，兜底定时器仍然把节点摘掉（不留孤儿）', async () => {
+      const frames = installFrames();
+      const realSetTimeout = globalThis.setTimeout;
+      const timers = [];
+      try {
+        await withReducedMotion(false, async () => {
+          clearOverlays();
+          let backdrop;
+          let value;
+          globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms: Number(ms) || 0 }); return timers.length; };
+          try {
+            const pending = uiMotion.openSheet({ title: '兜底定时器', content: null, actions: [{ text: '关', value: 'x' }] });
+            backdrop = dom.body.childNodes.find((n) => classListOf(n).includes('sheet-backdrop'));
+            fireClick(findButton(backdrop, '关'));
+            value = await pending; // 只等微任务：被替换的 setTimeout 不参与 resolve
+          } finally {
+            globalThis.setTimeout = realSetTimeout;
+          }
+          assert.equal(value, 'x', '前置：弹层没有交出点击值');
+          assert.equal(attachedToBody(backdrop), true, '前置：动画事件没来之前节点应还在做退场');
+          const fallback = timers.filter((t) => t.ms > 0);
+          assert.equal(fallback.length, 1, '退场没有登记兜底定时器（动画被打断时节点会永远留在 body 上）：' + JSON.stringify(timers.map((t) => t.ms)));
+          assert.ok(fallback[0].ms <= 1000, '兜底定时器太长（' + fallback[0].ms + 'ms）：被打断的退场会让节点压在 body 上很久');
+          fallback[0].fn(); // 只推进这一条，不跑真实时钟
+          assert.equal(attachedToBody(backdrop), false, '兜底定时器到点后节点没有被摘掉');
+          for (const fn of backdrop.listeners.animationend || []) fn({ type: 'animationend' }); // 迟到的动画事件：不能再动一次
+          assert.equal(attachedToBody(backdrop), false, '迟到的 animationend 把已摘的节点又处理了一遍');
+          clearOverlays();
+        });
+      } finally {
+        globalThis.setTimeout = realSetTimeout;
+        frames.restore();
+      }
+    });
+
+    // 【9】折叠：内容「展开即可读」，缓动只决定露出多少；收起必须同步不可读。
+    await checkAsync('动效第三批【9】：折叠展开后同一 tick 即可读，起点 0fr 由下一帧摘掉；收起后不可读', async () => {
+      const frames = installFrames();
+      try {
+        await withReducedMotion(false, () => {
+          const slot = new dom.FakeNode('div');
+          const fold = uiMotion.revealFold(slot, uiMotion.el('div', { text: '午餐 · 552 kcal' }));
+          assert.ok(nodeText(slot).includes('午餐 · 552 kcal'), '展开后同一 tick 读不到内容：可读性被绑在动画上了');
+          assert.ok(classListOf(fold.node).includes('hms-fold--anim'), '动效态没有过渡类（grid-template-rows 补间不会发生）');
+          assert.ok(classListOf(fold.node).includes('hms-fold--closed'), '起点不是 0fr：内容会先整段闪出来再补间');
+          const inner = byClass(fold.node, 'hms-fold__inner')[0];
+          assert.ok(inner, '内容没有包进 .hms-fold__inner：缺 overflow:hidden，收起时会溢出到卡片外');
+          assert.equal(inner.childNodes.length, 1, '折叠内层没有正好包住一段内容');
+          assert.equal(frames.queue.length, 1, '没有排「摘掉 0fr 起点」的帧回调');
+          frames.queue.shift()(16);
+          assert.equal(classListOf(fold.node).includes('hms-fold--closed'), false, '帧回调没有摘掉 0fr 起点（内容永远是收起的）');
+          assert.ok(nodeText(slot).includes('午餐 · 552 kcal'), '帧回调之后内容丢了');
+          fold.close();
+          assert.equal(nodeText(slot).includes('午餐 · 552 kcal'), false, '收起后内容仍可读：退场空壳留在了无障碍树里');
+          assert.equal(slot.childNodes.length, 0, '收起后节点没摘干净：剩 ' + slot.childNodes.length + ' 个');
+        });
+      } finally {
+        frames.restore();
+      }
+    });
+
+    // 【10】折叠降级：瞬时开合，一个缓动类都不挂。
+    await checkAsync('动效第三批【10】降级：折叠瞬时开合（不挂缓动类、不排帧、内容照样立即可读）', async () => {
+      assert.equal(typeof globalThis.requestAnimationFrame, 'undefined', '前置：假 DOM 没有 rAF');
+      const slot = new dom.FakeNode('div');
+      const fold = uiMotion.revealFold(slot, uiMotion.el('div', { text: '早餐 · 72 kcal' }));
+      assert.deepEqual(classListOf(fold.node), ['hms-fold'], '降级时仍挂了缓动类：' + classListOf(fold.node).join(' '));
+      assert.ok(nodeText(slot).includes('早餐 · 72 kcal'), '降级时内容不可读');
+      fold.close();
+      assert.equal(slot.childNodes.length, 0, '降级时收起没有瞬时摘除');
+      assert.equal(nodeText(slot).includes('早餐 · 72 kcal'), false, '降级时收起后内容仍可读');
+    });
+
+    // 【11】折叠接线（页面级）：今日页「今日餐次」在动效态下同一 tick 展开即可读、收起即不可读。
+    await checkAsync('动效第三批【11】：今日页「今日餐次」同一 tick 展开即可读、收起即不可读（动效不拖时序）', async () => {
+      await withStorage(async () => {
+        clearOverlays();
+        await accountsMod.ensureDefaultAccount();
+        // 折叠头行只在「当天有餐次」时才渲染：库被前序用例清空过，这里显式垫一餐（收尾删掉）。
+        const today = nutrition.localDateStr();
+        const mealId = await store.logMeal({
+          date: today, slot: 'lunch', source: 'manual',
+          items: [{ name: '米饭', grams: 200, kcal: 232, carb: 51.8, protein: 5.2, fat: 0.6 }],
+        });
+        const frames = installFrames();
+        try {
+          await withReducedMotion(false, async () => {
+            const root = await renderView('dashboard');
+            assert.ok(classListOf(root).includes('hms-motion'), '前置：动效作用域没有打开');
+            assert.equal(byClass(root, 'meal-fold__list').length, 0, '前置：今日餐次默认就该是收起的');
+            const fold = byClass(root, 'meal-fold')[0];
+            assert.ok(fold, '今日餐次没有折叠开关');
+            fireClick(fold);
+            assert.ok(nodeText(root).includes('米饭'), '展开后同一 tick 读不到餐次内容（渲染被绑在动画上）：' + nodeText(root).slice(0, 160));
+            assert.equal(fold.getAttribute('aria-expanded'), 'true', '展开后 aria-expanded 不是 true');
+            assert.equal(byClass(root, 'meal-fold__list').length, 1, '展开后没有渲染逐餐列表');
+            fireClick(fold);
+            assert.equal(nodeText(root).includes('米饭'), false, '收起后内容仍可读');
+            assert.equal(fold.getAttribute('aria-expanded'), 'false', '收起后 aria-expanded 不是 false');
+            assert.equal(byClass(root, 'meal-fold__list').length, 0, '收起后列表节点没有摘掉');
+          });
+        } finally {
+          frames.restore();
+          await store.deleteMeal(mealId);
+        }
+      });
+    });
+
+    // 【12】低端机降级：只有「系统明确报出 <= 2GB」才关动效；缺失 / 非数字 / 没有 navigator 都不许误降级。
+    await checkAsync('动效第三批【12】：deviceMemory 2/0.5 判低端，8/4 照常动，缺失与非数字不误降级（并传导到环）', async () => {
+      const frames = installFrames();
+      const navigatorDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+      const setNavigator = (value) => {
+        if (value === undefined) { delete globalThis.navigator; return; }
+        Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true, enumerable: true });
+      };
+      try {
+        await withReducedMotion(false, async () => {
+          setNavigator({ deviceMemory: 2 });
+          assert.equal(uiMotion.motionAllowed(), false, 'deviceMemory=2 没有判定为低端机');
+          setNavigator({ deviceMemory: 0.5 });
+          assert.equal(uiMotion.motionAllowed(), false, 'deviceMemory=0.5 没有判定为低端机');
+          setNavigator({ deviceMemory: 8 });
+          assert.equal(uiMotion.motionAllowed(), true, 'deviceMemory=8 被误判成低端机（主力机动效被永久关掉）');
+          setNavigator({ deviceMemory: 4 });
+          assert.equal(uiMotion.motionAllowed(), true, 'deviceMemory=4 被误判成低端机');
+          setNavigator({});
+          assert.equal(uiMotion.motionAllowed(), true, 'deviceMemory 字段缺失被误降级（Safari / Firefox 至今没有这个 API：这会把好设备一律关掉动效）');
+          setNavigator({ deviceMemory: 'abc' });
+          assert.equal(uiMotion.motionAllowed(), true, 'deviceMemory 非数字被误降级');
+          setNavigator(undefined);
+          assert.equal(uiMotion.motionAllowed(), true, '环境里根本没有 navigator 时被误降级');
+          // 判据必须真的传导到环上，而不是只影响总闸
+          setNavigator({ deviceMemory: 2 });
+          const lowEnd = ringCircleOf(uiMotion.ring({ value: 500, max: 1000 }));
+          assert.equal(String(lowEnd.getAttribute('class')).split(/\s+/).includes('hms-ring-arc'), false, '低端机上的环仍挂了弧长动画');
+          assert.equal(ringFromOf(lowEnd), null, '低端机上仍写了 --hms-ring-from');
+          setNavigator({ deviceMemory: 8 });
+          const good = ringCircleOf(uiMotion.ring({ value: 500, max: 1000 }));
+          assert.equal(String(good.getAttribute('class')).split(/\s+/).includes('hms-ring-arc'), true, '正常设备上的环没有弧长动画：降级判据把好设备一起打掉了');
+        });
+      } finally {
+        if (navigatorDesc) Object.defineProperty(globalThis, 'navigator', navigatorDesc);
+        else delete globalThis.navigator;
+        frames.restore();
+      }
+    });
+
+    // 【13】源码保护：ring() 的 stroke-dasharray 赋值处必须仍是终值，防止将来有人为了动画把它改成动态量。
+    await checkAsync('动效第三批【13】源码保护：ring() 的 stroke-dasharray 赋值仍是「终值弧长 + 整圈空隙」', async () => {
+      const assignments = [...uiText.matchAll(/'stroke-dasharray':\s*([^,\n]+)/g)].map((m) => m[1].trim());
+      assert.ok(assignments.length >= 1, 'js/ui.js 里找不到 stroke-dasharray 的赋值');
+      // 反引号与 $ 都拆开拼：这条断言要求赋值处**逐字**是「模板 + dash + 空格 + circumference」。
+      const bt = String.fromCharCode(96);
+      const expectedAssign = bt + '$' + '{dash} ' + '$' + '{circumference}' + bt;
+      assert.deepEqual([...new Set(assignments)], [expectedAssign], 'stroke-dasharray 的赋值不再是「终值弧长 + 整圈空隙」：' + JSON.stringify(assignments));
+      assert.ok(/const\s+circumference\s*=\s*2\s*\*\s*Math\.PI\s*\*\s*r;/.test(uiText), '周长不再由半径算出');
+      assert.ok(/const\s+dash\s*=\s*circumference\s*\*\s*pct;/.test(uiText), '弧长不再直接由 pct 算出（被换成动画量了）');
+      assert.ok(/const\s+growFrom\s*=\s*dash\s*\+\s*RING_STROKE;/.test(uiText), '起点值不再是 dash + 线宽（圆头会露在起点外）');
+      // 声明级检查：注释里讲 stroke-dasharray 是对的，但**任何一条声明**都不许碰它。
+      const stripComments = (css) => css.replace(/\/\*[\s\S]*?\*\//g, '');
+      const batchStart = cssText.indexOf('动效（第三批');
+      assert.ok(batchStart > 0, 'styles.css 里找不到第三批动效节');
+      assert.equal(stripComments(cssText.slice(batchStart)).includes('stroke-dasharray'), false, '第三批动效节的声明里出现了 stroke-dasharray：弧长会被动画改掉');
+      const growAt = cssText.indexOf('@keyframes hms-ring-grow');
+      const growBlock = growAt < 0 ? '' : cssText.slice(growAt, cssText.indexOf('\n}', growAt) + 2);
+      assert.equal(stripComments(growBlock).includes('stroke-dasharray'), false, 'hms-ring-grow 关键帧碰了 stroke-dasharray（只许补 stroke-dashoffset）');
+    });
+
+    // 【14】减弱动效：环 / 折叠 / 弹层退场都必须被钉在终态，旧的「整环缩放」实现不许回来。
+    await checkAsync('动效第三批【14】：减弱动效把环钉在终态（offset 0），旧的整环缩放实现已删除', async () => {
+      const reduced = cssText.slice(cssText.lastIndexOf('@media (prefers-reduced-motion: reduce)'));
+      assert.ok(/\.hms-motion \.hms-ring-arc\s*\{[^}]*stroke-dashoffset:\s*0\s*!important/.test(reduced), '减弱动效清单里没有把环的 stroke-dashoffset 归零：环会停在不可见处');
+      assert.ok(reduced.includes('.hms-fold--closed'), '减弱动效清单里漏了折叠终态（收起时会漏出内容）');
+      assert.ok(reduced.includes('.sheet-backdrop.hms-sheet-out'), '减弱动效清单里漏了弹层退场（会跑一段 280ms 的空动画）');
+      assert.equal(/\.hms-motion \.ring__svg\s*\{/.test(cssText), false, '环又回到了整体缩放的旧实现（弧长生长被撤销了）');
+      assert.ok(/\.hms-motion \.hms-ring-arc\s*\{\s*animation:\s*hms-ring-grow/.test(cssText), '.hms-ring-arc 没有挂 hms-ring-grow 动画');
+    });
+
     await checkAsync('回归：切页丢下弹层时弹层要走完收尾（监听器/滚动锁/Promise 都回到基线）', async () => {
       const uiMod = await import('../js/ui.js');
       clearOverlays();
