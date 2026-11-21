@@ -9,7 +9,7 @@ import {
 import { testConnection, MODEL_CANDIDATES, DEFAULT_BASE_URL, DEFAULT_MODEL } from '../js/vision.js';
 import {
   checkForUpdate, clearDismissed, installUpdate, isInstallAvailable,
-  versionLabel, webUpdateGuidance,
+  updateErrorText, versionLabel, webUpdateGuidance,
 } from '../js/update.js';
 
 const ACTIVITIES = [
@@ -698,8 +698,9 @@ export async function render(root) {
     try {
       const result = await checkForUpdate();
       if (result.status === 'unavailable') { showUpdateText(webUpdateGuidance()); return; }
-      if (result.status === 'timeout') { showUpdateText('检查超时，请确认网络后重试'); return; }
-      if (result.status === 'error') { showUpdateText(`检查失败：${result.error || '未知错误'}`); return; }
+      // 失败分两种：网络不通（已试 N 个地址）与清单内容不对——都直接说清楚，不笼统报「检查失败」。
+      if (result.status === 'timeout') { showUpdateText(updateErrorText(result)); return; }
+      if (result.status === 'error') { showUpdateText(updateErrorText(result)); return; }
       if (result.status === 'latest') {
         const current = result.local && result.local.versionName ? `（当前 ${result.local.versionName}）` : '';
         showUpdateText(`已是最新版本${current}`);

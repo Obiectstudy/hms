@@ -87,6 +87,59 @@ async function run() {
   check('searchFoods 菜品优先排序', firstIngredient === -1 || lastDish < firstIngredient, `首个原料在下标 ${firstIngredient}，末个菜在下标 ${lastDish}`);
   check('searchFoods("米饭") 非空', searchFoods('米饭').length > 0, '空结果');
 
+  // ---------- searchFoods 第三参 boost：历史添加过的名字排在前面 ----------
+  // 契约：boost 缺省 / 空 / 非法时结果与两参调用**逐项相同**（同一批对象、同一顺序）；
+  // 带 boost 时只做「稳定分区」—— 命中项整体前置，两批内部都保持既有排序。
+  const idsOf = (list) => list.map((f) => f.id);
+  const namesOf = (list) => list.map((f) => f.name);
+  const sameList = (a, b) => a.length === b.length && a.every((f, i) => f === b[i]);
+
+  const plainJi = searchFoods('鸡', 10);
+  check('searchFoods 三参缺省（undefined）与两参逐项相同（同一批对象、同一顺序）',
+    sameList(searchFoods('鸡', 10, undefined), plainJi), namesOf(searchFoods('鸡', 10, undefined)).join(','));
+  check('searchFoods 第三参 null / {} / 非法 boost 与两参逐项相同',
+    sameList(searchFoods('鸡', 10, null), plainJi)
+    && sameList(searchFoods('鸡', 10, {}), plainJi)
+    && sameList(searchFoods('鸡', 10, { boost: [] }), plainJi)
+    && sameList(searchFoods('鸡', 10, { boost: '鸡胸肉' }), plainJi)
+    && sameList(searchFoods('鸡', 10, { boost: [null, 42, '', '   '] }), plainJi),
+    '非法 boost 改变了结果');
+  check('searchFoods 默认 limit 仍是 20（两参与三参缺省一致）',
+    searchFoods('鸡').length === 20 && sameList(searchFoods('鸡', undefined, null), searchFoods('鸡', 20)),
+    `实际 ${searchFoods('鸡').length}`);
+
+  const boostJi = searchFoods('鸡', 10, { boost: ['鸡胸肉'] });
+  const plainJiAll = searchFoods('鸡', 1000);
+  const plainJiIdx = plainJiAll.findIndex((f) => f.id === 'chicken-breast');
+  check('searchFoods boost 命中项排到最前（鸡胸肉：原本被挤到 10 名之外）',
+    boostJi[0] && boostJi[0].id === 'chicken-breast' && plainJiIdx > 10,
+    `实际首位 ${boostJi[0]?.name} / 原下标 ${plainJiIdx}`);
+  const boostJiAll = searchFoods('鸡', 1000, { boost: ['鸡胸肉'] });
+  check('searchFoods boost 只改顺序：结果集合与条数不变',
+    boostJiAll.length === plainJiAll.length
+    && idsOf(boostJiAll).slice().sort().join(',') === idsOf(plainJiAll).slice().sort().join(','),
+    `${boostJiAll.length} / ${plainJiAll.length}`);
+  check('searchFoods boost 命中项之外保持原有相对顺序',
+    idsOf(boostJiAll).slice(1).join(',') === idsOf(plainJiAll).filter((id) => id !== 'chicken-breast').join(','),
+    idsOf(boostJiAll).slice(0, 6).join(','));
+
+  const plainDoufu = searchFoods('豆腐', 12);
+  const boostDoufu = searchFoods('豆腐', 12, { boost: ['油豆腐', '豆腐干'] });
+  const boostDoufuRev = searchFoods('豆腐', 12, { boost: ['豆腐干', '油豆腐'] });
+  check('searchFoods boost 多命中：命中项整体前置且保持原顺序（豆腐干 → 油豆腐）',
+    idsOf(boostDoufu).slice(0, 2).join(',') === 'tofu-dried,youdoufu',
+    idsOf(boostDoufu).slice(0, 4).join(','));
+  check('searchFoods boost 数组顺序不影响结果',
+    idsOf(boostDoufu).join(',') === idsOf(boostDoufuRev).join(','),
+    idsOf(boostDoufuRev).slice(0, 4).join(','));
+  check('searchFoods boost 名字含空白/大小写归一后仍命中（半角+全角空格 + 大小写别名 WHEY）',
+    searchFoods('蛋白粉', 20, { boost: [' \u3000WHEY\u3000 '] })[0]?.id === 'whey-protein'
+    && searchFoods('蛋白粉', 20).findIndex((f) => f.id === 'whey-protein') > 0,
+    `实际首位 ${searchFoods('蛋白粉', 20, { boost: [' WHEY '] })[0]?.name}`);
+  check('searchFoods boost 里有库里不存在的名字不报错且结果不变',
+    sameList(searchFoods('豆腐', 12, { boost: ['不存在的食物XYZ', '完全查无此项'] }), plainDoufu),
+    namesOf(plainDoufu).slice(0, 3).join(','));
+
   // 校准：整份菜走库值，而不是原料相加
   if (a) {
     const out = calibrateItems([{ name: '菠菜炒鸡蛋', grams: 300, kcal: 999, carb: 0, protein: 0, fat: 0, confidence: 'high' }]);

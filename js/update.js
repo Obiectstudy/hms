@@ -333,14 +333,234 @@ export function installUpdate(info, bridge) {
   }
 }
 
+/* ---------- 版本清单：有序地址 + 逐个尝试（与 HmsBridge.MANIFEST_URLS 一致） ---------- */
+
+/**
+ * 清单地址按顺序尝试，第一个给出可用清单的就是结果，后面的不再请求。
+ * CloudBase 在前：国内直连；GitHub Pages 只作回退（国内多半连不上——「检查更新失败」就是它）。
+ * 顺序即优先级，改动这里要同步 android 侧的 MANIFEST_URLS。
+ */
+export const MANIFEST_URLS = Object.freeze([
+  'https://hms-d4gnh63iw73f09792-1513758162.tcloudbaseapp.com/version.json',
+  'https://obiectstudy.github.io/hms/version.json',
+]);
+
+/** 单个地址的默认超时：两个地址轮完最多两倍，不能让「检查更新」无限转圈。 */
+const MANIFEST_TIMEOUT_MS = 8000;
+
+/** 老壳子把「已是最新」当失败回传时用的文案前缀。 */
+const LATEST_PREFIX = /^已是最新版本/;
+
+/** 失败类型：决定设置页说「网络不通」还是「清单内容不对」。 */
+const FAILURE_KINDS = ['network', 'manifest', 'timeout'];
+
+function invalidManifest(reason) {
+  const error = new Error(reason);
+  error.name = 'ManifestInvalid';
+  return error;
+}
+
+function offlineManifest(reason) {
+  const error = new Error(reason);
+  error.name = 'ManifestOffline';
+  return error;
+}
+
+function timeoutManifest() {
+  const error = new Error('请求超时');
+  error.name = 'ManifestTimeout';
+  return error;
+}
+
+function reasonOf(error) {
+  if (!error) return '';
+  return String(error.message != null ? error.message : error).trim();
+}
+
+/** 地址列表归一：接受单个字符串或数组（缺省用 MANIFEST_URLS）；空值丢掉，顺序不变。 */
+export function manifestUrls(urls) {
+  const source = urls == null ? MANIFEST_URLS : (Array.isArray(urls) ? urls : [urls]);
+  return source.map((url) => String(url == null ? '' : url).trim()).filter(Boolean);
+}
+
+/** 清单可用 = 有正数 versionCode（版本号缺失的清单不能拿来做比较）。 */
+export function hasVersionCode(manifest) {
+  const code = Number(manifest && manifest.versionCode);
+  return Number.isFinite(code) && code > 0;
+}
+
+/**
+ * 一次请求 + 解析。三类失败各自带名字，上层才能区分：
+ *   ManifestTimeout 超时 / ManifestOffline 连不上或非 2xx / ManifestInvalid 内容不对。
+ */
+async function requestManifest(fetchImpl, url, timeoutMs) {
+  const wait = Number(timeoutMs);
+  const limitMs = Number.isFinite(wait) && wait > 0 ? wait : MANIFEST_TIMEOUT_MS;
+  let controller = null;
+  try {
+    controller = typeof AbortController === 'function' ? new AbortController() : null;
+  } catch {
+    controller = null;
+  }
+  const request = (async () => {
+    const response = await fetchImpl(url, {
+      method: 'GET',
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    if (!response) throw invalidManifest('响应为空');
+    const status = Number(response.status);
+    if (response.ok === false || (Number.isFinite(status) && (status < 200 || status >= 300))) {
+      throw offlineManifest(`HTTP ${Number.isFinite(status) ? status : '错误'}`);
+    }
+    let body = null;
+    if (typeof response.json === 'function') {
+      try {
+        body = await response.json();
+      } catch {
+        throw invalidManifest('不是合法 JSON');
+      }
+    } else if (typeof response.text === 'function') {
+      try {
+        body = JSON.parse(await response.text());
+      } catch {
+        throw invalidManifest('不是合法 JSON');
+      }
+    } else {
+      throw invalidManifest('响应体无法读取');
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw invalidManifest('不是 JSON 对象');
+    return body;
+  })();
+  // 超时判负后请求仍可能失败：先挂一个兜底 handler，别变成未处理的 rejection。
+  request.catch(() => {});
+  let timer = null;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (controller) {
+        try { controller.abort(); } catch { /* 不支持 abort 的实现：忽略 */ }
+      }
+      reject(timeoutManifest());
+    }, limitMs);
+  });
+  try {
+    return await Promise.race([request, deadline]);
+  } finally {
+    if (timer != null) clearTimeout(timer);
+  }
+}
+
+/**
+ * 逐个尝试清单地址，第一份「能解析且带 versionCode」的清单直接采用，不再试后面的。
+ * 永不 reject；status：
+ *   'ok'          + remote/url/attempts
+ *   'error'       + kind 'network'（一个都连不上）或 'manifest'（答话了但内容不对）
+ *   'timeout'     + kind 'timeout'（全部超时）
+ *   'unavailable' 没有地址或环境不支持请求
+ * error 永远是能直接给用户看的中文，且带「已试 N 个地址」。
+ */
+export async function fetchManifest({ urls, fetchImpl, timeoutMs = MANIFEST_TIMEOUT_MS } = {}) {
+  const list = manifestUrls(urls);
+  const doFetch = typeof fetchImpl === 'function'
+    ? fetchImpl
+    : (typeof fetch === 'function' ? fetch : null);
+  if (!list.length) {
+    return { status: 'unavailable', remote: null, kind: 'unavailable', attempts: 0, tried: [], error: '没有配置版本清单地址' };
+  }
+  if (!doFetch) {
+    return { status: 'unavailable', remote: null, kind: 'unavailable', attempts: 0, tried: [], error: '当前环境不能发起网络请求' };
+  }
+  const tried = [];
+  let badContent = '';
+  let timeouts = 0;
+  for (const url of list) {
+    tried.push(url);
+    try {
+      const remote = await requestManifest(doFetch, url, timeoutMs);
+      if (!hasVersionCode(remote)) throw invalidManifest('缺少 versionCode');
+      return { status: 'ok', remote, url, attempts: tried.length, tried };
+    } catch (error) {
+      const name = error && error.name;
+      if (name === 'ManifestTimeout') timeouts += 1;
+      else if (name === 'ManifestInvalid') badContent = reasonOf(error) || '内容不对';
+      // 其余（fetch 抛错 / HTTP 非 2xx）算这个地址不通，继续试下一个。
+    }
+  }
+  const attempts = tried.length;
+  const count = `（已试 ${attempts} 个地址）`;
+  if (badContent) {
+    return { status: 'error', remote: null, kind: 'manifest', attempts, tried, error: `版本清单内容不对：${badContent}${count}` };
+  }
+  if (timeouts === attempts) {
+    return { status: 'timeout', remote: null, kind: 'timeout', attempts, tried, error: `检查超时，请确认网络后重试${count}` };
+  }
+  return { status: 'error', remote: null, kind: 'network', attempts, tried, error: `网络不通，无法检查更新${count}` };
+}
+
+/** web 层的检查更新：自己拉清单，返回与 checkForUpdate 同一套 status（字段语义不变）。 */
+export async function checkForUpdateFromWeb({ bridge, local, urls, fetchImpl, timeoutMs } = {}) {
+  const me = local && typeof local === 'object' ? local : localVersion(bridge);
+  const found = await fetchManifest({ urls, fetchImpl, timeoutMs });
+  if (found.status === 'ok') {
+    const shared = { remote: found.remote, local: me, attempts: found.attempts, source: found.url };
+    return isNewer(me.versionCode, found.remote.versionCode)
+      ? { status: 'new', ...shared }
+      : { status: 'latest', ...shared };
+  }
+  return {
+    status: found.status,
+    remote: null,
+    local: me,
+    error: found.error,
+    kind: found.kind,
+    attempts: found.attempts,
+    tried: found.tried,
+  };
+}
+
+/** 原生桥只给一句中文（老壳子）时，从文案里认失败类型，设置页才说得出人话。 */
+function bridgeKind(remote, error) {
+  const given = String((remote && remote.kind) || '').trim();
+  if (FAILURE_KINDS.includes(given)) return given;
+  const text = String(error || '');
+  if (/超时|timeout/i.test(text)) return 'timeout';
+  if (/网络|断网|无法连接|connect/i.test(text)) return 'network';
+  if (/清单|manifest|versionCode|JSON/i.test(text)) return 'manifest';
+  return '';
+}
+
+/**
+ * 设置页要显示的那句话：网络不通 / 清单内容不对 / 超时分开说，不再一律「检查失败」。
+ * 原生桥与 fetchManifest 给的 error 已是成品句（自带「已试 N 个地址」），原样返回；
+ * 只有拿不到失败类型的老壳子才退回「检查失败：…」。
+ */
+export function updateErrorText(result) {
+  const r = result && typeof result === 'object' ? result : {};
+  const error = String(r.error || '').trim();
+  const kind = String(r.kind || '');
+  const attempts = Number(r.attempts);
+  const count = Number.isFinite(attempts) && attempts > 0 ? `（已试 ${attempts} 个地址）` : '';
+  if (kind === 'network') return error || `网络不通，无法检查更新${count}`;
+  if (kind === 'manifest') return error || `版本清单内容不对${count}`;
+  if (kind === 'timeout') return error || `检查超时，请确认网络后重试${count}`;
+  return error ? `检查失败：${error}` : '检查失败：未知错误';
+}
+
 /**
  * 手动检查更新（设置页）：临时接管 window.__hmsUpdate 拿一次结果，用完立刻还原给今日页提示条。
  * status: 'unavailable' | 'new' | 'latest' | 'error' | 'timeout'；永不 reject。
+ * 没有原生桥时走 web 层（传 fetchImpl 才启用，PWA 不会因此偷偷发请求）。
  */
-export function checkForUpdate({ bridge, timeoutMs = 15000 } = {}) {
+export function checkForUpdate({ bridge, timeoutMs = 15000, fetchImpl, urls, manifestTimeoutMs = MANIFEST_TIMEOUT_MS } = {}) {
   const b = bridge || currentBridge();
   const local = localVersion(b);
-  if (!b || typeof b.checkUpdate !== 'function') return Promise.resolve({ status: 'unavailable', remote: null, local });
+  if (!b || typeof b.checkUpdate !== 'function') {
+    if (typeof fetchImpl === 'function') {
+      return checkForUpdateFromWeb({ bridge: b, local, urls, fetchImpl, timeoutMs: manifestTimeoutMs });
+    }
+    return Promise.resolve({ status: 'unavailable', remote: null, local });
+  }
   const hasWindow = typeof window !== 'undefined' && Boolean(window);
   return new Promise((resolve) => {
     const previous = hasWindow ? window.__hmsUpdate : undefined;
@@ -357,7 +577,22 @@ export function checkForUpdate({ bridge, timeoutMs = 15000 } = {}) {
       window.__hmsUpdate = (raw) => {
         const remote = parseBridgeJson(raw);
         if (!remote) { finish({ status: 'error', remote: null, local, error: '返回内容无法解析' }); return; }
-        if (remote.ok === false) { finish({ status: 'error', remote, local, error: String(remote.error || '检查失败') }); return; }
+        if (remote.ok === false) {
+          const error = String(remote.error || '检查失败');
+          // 老壳子把「已是最新」当失败回传：清单读到了、只是没新版，这不是错误。
+          if (LATEST_PREFIX.test(error)) { finish({ status: 'latest', remote, local }); return; }
+          const kind = bridgeKind(remote, error);
+          const attempts = Number(remote.attempts);
+          finish({
+            status: kind === 'timeout' ? 'timeout' : 'error',
+            remote,
+            local,
+            error,
+            kind,
+            attempts: Number.isFinite(attempts) && attempts > 0 ? attempts : 0,
+          });
+          return;
+        }
         finish(isNewer(local.versionCode, remote.versionCode)
           ? { status: 'new', remote, local }
           : { status: 'latest', remote, local });

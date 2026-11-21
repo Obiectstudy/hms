@@ -1068,8 +1068,47 @@ function nameKeys(value) {
 
 const isDish = (food) => food.kind === 'dish';
 
+/**
+ * boost 的比较口径：只做大小写与空白归一（不丢括号注释）。
+ * 不用 normalizeName 是故意的 —— 它会把「鸡胸肉（烤，无油）」也压成「鸡胸肉」，
+ * 那样「上次吃了鸡胸肉」会把好几种鸡胸肉菜一起顶上前面，boost 就失去了「就是这一条」的精度。
+ * 非字符串 / 归一后为空 -> 空串，调用方据此跳过。
+ */
+function boostKeyOf(value) {
+  return typeof value === 'string' ? value.toLowerCase().replace(/[\s\u3000]+/g, '') : '';
+}
+
+/**
+ * boost 归一化：把「最近吃过」的名字收成一个集合。
+ * 非数组（缺省 / null / 传了个字符串）或清理后为空 -> 空集合，调用方因此完全走老排序。
+ */
+function boostKeys(options) {
+  const raw = options && typeof options === 'object' ? options.boost : null;
+  if (!Array.isArray(raw)) return new Set();
+  const keys = new Set();
+  for (const value of raw) {
+    const key = boostKeyOf(value);
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+/**
+ * 一条食物算不算命中 boost：本名或别名落在集合里就算。
+ * 别名也要算 —— 历史条目名可能记的是「龙利鱼」这类别名，不该因为名字写法不同就不前置。
+ */
+function isBoosted(food, keys) {
+  for (const value of [food.name, ...(food.aliases || [])]) {
+    const key = boostKeyOf(value);
+    if (key && keys.has(key)) return true;
+  }
+  return false;
+}
+
 // 检索：分数的含义与旧版一致（0 精确 / 1 前缀 / 2 包含）；同分时菜品排在原料之前。
-export function searchFoods(query, limit = 20) {
+// options.boost（可选）：历史添加过的名字，命中项整体前置；两批内部都保持上面这套排序。
+// boost 缺省 / 空 / 非法时走的还是原来那条路径（同一批对象、同一顺序，行为逐字节一致）。
+export function searchFoods(query, limit = 20, options) {
   const max = Math.max(0, Number(limit) || 0);
   const q = normalizeName(query);
   if (!q) return HOT_FOODS.slice(0, max);
@@ -1091,7 +1130,16 @@ export function searchFoods(query, limit = 20) {
     }
   }
   scored.sort((a, b) => a.score - b.score || a.kindRank - b.kindRank || a.len - b.len || a.index - b.index);
-  return scored.slice(0, max).map((s) => s.food);
+  const keys = boostKeys(options);
+  // 稳定分区而不是再排一次：命中项与其余两批内部都保持刚才的既有顺序。
+  let ordered = scored;
+  if (keys.size) {
+    const hit = [];
+    const rest = [];
+    for (const s of scored) (isBoosted(s.food, keys) ? hit : rest).push(s);
+    ordered = hit.concat(rest);
+  }
+  return ordered.slice(0, max).map((s) => s.food);
 }
 
 // 名称解析：精确 → 去修饰词/份量 → 别名 → 包含匹配。

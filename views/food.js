@@ -625,14 +625,24 @@ async function removeTemplate(template, reload) {
 /* ---------- 套餐原地编辑（改的是原套餐，不是派生一份新的） ---------- */
 
 /**
- * 保存参数：带 id 交给数据层「原地更新原套餐」（不带 id 会按新套餐落库，等于派生一份）。
- * 套餐名与餐次沿用原套餐：编辑界面只改条目 —— 顺手改名会变成「改了名字的另一个套餐」。
+ * 套餐名校验：去首尾空白后为空就要拒绝（返回中文原因，空串表示通过）。
+ * 视图层在写库前先问它，所以空名既不会落库、也不会把弹层关掉。
  */
-export function templateEditPayload(template, items) {
+export function templateNameError(value) {
+  return String(value ?? '').trim() ? '' : '套餐名不能为空，请填一个名字再保存';
+}
+
+/**
+ * 保存参数：带 id 交给数据层「原地更新原套餐」（不带 id 会按新套餐落库，等于派生一份）。
+ * name 可传新名字（编辑层里的套餐名输入框）；不传（undefined）时沿用原套餐名，向后兼容。
+ * 名字由调用方先过 templateNameError，再传进来（这里只做去空白）。
+ */
+export function templateEditPayload(template, items, name) {
   const t = template && typeof template === 'object' ? template : {};
+  const nextName = typeof name === 'string' ? name.trim() : t.name;
   return {
     id: t.id,
-    name: t.name,
+    name: nextName,
     slot: t.slot,
     items: (Array.isArray(items) ? items : []).map((item) => ({ ...item })),
   };
@@ -642,9 +652,9 @@ export function templateEditPayload(template, items) {
  * 整日套餐的保存参数：与单餐套餐同一份契约 —— 带 id 交给数据层「原地更新原套餐」。
  * 编辑层允许把某一餐删到 0 项，但落库的套餐不留空餐次（与 normalizeDayMeals 同一口径），
  * 所以空餐在这里就被丢掉；全空时 meals 为空数组，由调用方当场拒绝保存。
- * 套餐名沿用原套餐：编辑界面只改每一餐的条目，顺手改名会变成「改了名字的另一个套餐」。
+ * name 可传新名字；不传（undefined）时沿用原套餐名，向后兼容（空名校验同样在调用方）。
  */
-export function dayTemplateEditPayload(template, meals) {
+export function dayTemplateEditPayload(template, meals, name) {
   const t = template && typeof template === 'object' ? template : {};
   const out = [];
   for (const meal of Array.isArray(meals) ? meals : []) {
@@ -655,7 +665,7 @@ export function dayTemplateEditPayload(template, meals) {
     if (!items.length) continue;
     out.push({ slot: meal.slot, items });
   }
-  return { id: t.id, name: t.name, meals: out };
+  return { id: t.id, name: typeof name === 'string' ? name.trim() : t.name, meals: out };
 }
 
 /** 编辑层里的一行：条目名 + 营养（含纤维）+ 删。 */
@@ -674,8 +684,9 @@ function renderTemplateEditRow(item, onRemove) {
 }
 
 /**
- * 编辑套餐：删条目 / 加食物，保存时按 id 原地覆盖原套餐。
+ * 编辑套餐：改名字 / 删条目 / 加食物，保存时按 id 原地覆盖原套餐。
  * 原地覆盖没有退路（数据层不留旧版本），所以标题、说明与保存前的二次确认三处都要说清这一点。
+ * 改名同样走原套餐那一条（id 不变、不派生第二份）：空名当场拒绝，不写库也不关层。
  * 整日套餐（kind === 'day'）不走这里：它没有 items，改的是每一餐（见 editDayTemplateFlow）。
  */
 async function editTemplateFlow(template, reload) {
@@ -688,6 +699,11 @@ async function editTemplateFlow(template, reload) {
     title: `编辑套餐 · ${template.name}`,
     actions: [],
     content: ({ close }) => {
+      // 套餐名可改：默认值就是当前名字，保存时和新条目一起提交（仍然只是更新原套餐那一条）。
+      const nameInput = el('input', {
+        className: 'input', type: 'text', value: String(template.name || ''), placeholder: '套餐名',
+        attr: { maxlength: '20', 'aria-label': '套餐名' },
+      });
       const listNode = el('div', { className: 'list' });
       const totalNode = el('div', { className: 'muted' });
       const repaint = () => {
@@ -710,21 +726,30 @@ async function editTemplateFlow(template, reload) {
       // 不能一点就把弹层关掉（actions 一旦被点就 resolve 收摊，没有挽回的余地）。
       const saveBtn = el('button', { className: 'btn btn--primary btn--block', text: '保存到原套餐' });
       saveBtn.addEventListener('click', async () => {
+        // 名字先校验：空名在这里就被拦下（给中文原因），既不写库也不关层。
+        const nextName = String(nameInput.value || '').trim();
+        const nameProblem = templateNameError(nextName);
+        if (nameProblem) {
+          toast(nameProblem, 'error');
+          return;
+        }
         if (!items.length) {
           toast('套餐里至少要留一项食物，空套餐不能保存', 'error');
           return;
         }
         const ok = await confirmDialog({
           title: '更新原套餐？',
-          message: `「${template.name}」会被这 ${items.length} 项覆盖，原套餐不会另存一份。`,
+          message: nextName === template.name
+            ? `「${template.name}」会被这 ${items.length} 项覆盖，原套餐不会另存一份。`
+            : `「${template.name}」会被这 ${items.length} 项覆盖并改名为「${nextName}」，原套餐不会另存一份。`,
           okText: '更新',
         });
         if (!ok) return;
         saveBtn.disabled = true;
         saveBtn.textContent = '保存中…';
         try {
-          await saveMealTemplate(templateEditPayload(template, items));
-          toast(`套餐已更新 · ${template.name}`, 'ok');
+          await saveMealTemplate(templateEditPayload(template, items, nextName));
+          toast(`套餐已更新 · ${nextName}`, 'ok');
           close('saved');
           await reload();
         } catch (err) {
@@ -736,6 +761,10 @@ async function editTemplateFlow(template, reload) {
 
       return el('div', { className: 'col' },
         el('div', { className: 'muted', text: '保存后原套餐会被更新（不会另存一份），先确认条目再保存。' }),
+        el('label', { className: 'field' },
+          el('span', { className: 'field__label', text: '套餐名' }),
+          nameInput,
+        ),
         el('div', { className: 'divider' }),
         listNode,
         totalNode,
@@ -753,9 +782,9 @@ async function editTemplateFlow(template, reload) {
 }
 
 /**
- * 编辑整日套餐：删条目 / 每餐加食物 / 删整餐，保存时按 id 原地覆盖原套餐。
+ * 编辑整日套餐：改名字 / 删条目 / 每餐加食物 / 删整餐，保存时按 id 原地覆盖原套餐。
  * 与单餐套餐同一套语义（见 editTemplateFlow）：弹层里不放 actions，空套餐在弹层内直接拒绝，
- * 保存前二次确认说清「覆盖，不另存一份」。
+ * 改名同样只更新原套餐那一条（id 不变、不派生第二份），空名当场拒绝。
  * 某一餐被删到 0 项时餐块先留在层里（用户还能往这一餐加回来），保存时由 dayTemplateEditPayload
  * 丢弃 —— 落库的套餐里不留空餐次，与全站「不留空餐次」一致。
  */
@@ -774,6 +803,11 @@ async function editDayTemplateFlow(template, reload) {
     title: `编辑整日套餐 · ${template.name}`,
     actions: [],
     content: ({ close }) => {
+      // 套餐名可改：默认值就是当前名字，保存时和每一餐一起提交（仍然只是更新原套餐那一条）。
+      const nameInput = el('input', {
+        className: 'input', type: 'text', value: String(template.name || ''), placeholder: '套餐名',
+        attr: { maxlength: '20', 'aria-label': '套餐名' },
+      });
       const mealBox = el('div', { className: 'col' });
       const totalNode = el('div', { className: 'muted' });
 
@@ -856,15 +890,24 @@ async function editDayTemplateFlow(template, reload) {
       // 不能一点就把弹层关掉（actions 一旦被点就 resolve 收摊，没有挽回的余地）。
       const saveBtn = el('button', { className: 'btn btn--primary btn--block', text: '保存到原套餐' });
       saveBtn.addEventListener('click', async () => {
+        // 名字先校验：空名在这里就被拦下（给中文原因），既不写库也不关层。
+        const nextName = String(nameInput.value || '').trim();
+        const nameProblem = templateNameError(nextName);
+        if (nameProblem) {
+          toast(nameProblem, 'error');
+          return;
+        }
         // 保存参数由唯一的纯函数产出：某一餐删到 0 项在这里被丢弃，全空则当场拒绝（不写库、不关层）。
-        const payload = dayTemplateEditPayload(template, meals);
+        const payload = dayTemplateEditPayload(template, meals, nextName);
         if (!payload.meals.length) {
           toast('整日套餐至少要留一餐，空套餐不能保存', 'error');
           return;
         }
         const ok = await confirmDialog({
           title: '更新原套餐？',
-          message: `「${template.name}」会被这 ${payload.meals.length} 餐覆盖，原套餐不会另存一份。`,
+          message: nextName === template.name
+            ? `「${template.name}」会被这 ${payload.meals.length} 餐覆盖，原套餐不会另存一份。`
+            : `「${template.name}」会被这 ${payload.meals.length} 餐覆盖并改名为「${nextName}」，原套餐不会另存一份。`,
           okText: '更新',
         });
         if (!ok) return;
@@ -872,7 +915,7 @@ async function editDayTemplateFlow(template, reload) {
         saveBtn.textContent = '保存中…';
         try {
           await saveDayTemplate(payload);
-          toast(`整日套餐已更新 · ${template.name}`, 'ok');
+          toast(`整日套餐已更新 · ${nextName}`, 'ok');
           close('saved');
           await reload();
         } catch (err) {
@@ -884,6 +927,10 @@ async function editDayTemplateFlow(template, reload) {
 
       return el('div', { className: 'col' },
         el('div', { className: 'muted', text: '保存后原套餐会被更新（不会另存一份），先确认每一餐的条目再保存。' }),
+        el('label', { className: 'field' },
+          el('span', { className: 'field__label', text: '套餐名' }),
+          nameInput,
+        ),
         el('div', { className: 'divider' }),
         mealBox,
         totalNode,
@@ -1200,6 +1247,21 @@ export async function openDraftSheet(initialItems, meta) {
   });
 }
 
+/**
+ * 最近吃过的条目 → 搜索 boost 的名字集合。
+ * 脏返回（非数组 / 条目名字不是字符串）一律当空：这个名字集合只用来「排前面」，
+ * 任何一个用例都不该因为历史数据长歪而让搜索报错。
+ */
+export function recentNamesForBoost(entries) {
+  if (!Array.isArray(entries)) return [];
+  const out = [];
+  for (const entry of entries) {
+    const name = entry && typeof entry === 'object' ? entry.name : '';
+    if (typeof name === 'string' && name.trim()) out.push(name);
+  }
+  return out;
+}
+
 // 食物搜索 + 份量选择，解析为 { food, item }（item 为按克数算好的 MealItem）或 null。
 // mode === 'dish' 时给的是「整份替换」语境：文案改成挑一道菜，数据侧没菜时也照常可选原料。
 function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
@@ -1225,17 +1287,13 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
         }));
       };
 
+      // 搜索 boost 用的名字（历史添加过的排前面）。读不到就一直是空数组：搜索照常，只是不 boost。
+      let boostNames = [];
+
       // 「最近吃过」：无数据整块不渲染；默认折叠成一行，点开才 inline 展开。
       // 折叠时不建行节点，弹层一打开不会先被 8 条历史占满一屏。
-      const showRecent = async () => {
+      const showRecent = (entries) => {
         if (isDishMode) return;
-        let entries = [];
-        try {
-          entries = await recentFoodItems(RECENT_LIMIT);
-        } catch {
-          // 最近吃过只是锦上添花：读不到就整块不渲染，不影响搜索与手动添加。
-          return;
-        }
         if (!Array.isArray(entries) || !entries.length) return;
         const rows = entries.slice(0, RECENT_LIMIT);
         const list = el('div', { className: 'list recent-list' });
@@ -1275,8 +1333,26 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
         recentBox.appendChild(toggle);
       };
 
+      // 只读一次最近吃过：折叠区用它渲染，搜索用它做 boost。
+      // 抛错 / 脏返回只影响这两处「锦上添花」的部分 —— 搜索本身绝不能被它带崩。
+      const loadRecent = async () => {
+        let entries = [];
+        try {
+          entries = await recentFoodItems(RECENT_LIMIT);
+        } catch {
+          entries = [];
+        }
+        boostNames = recentNamesForBoost(entries);
+        showRecent(entries);
+        // 名字晚到：用户已经开始搜了，就按新的 boost 重画一次。
+        if (search.value.trim()) runSearch();
+      };
+
       const runSearch = () => {
-        const foods = orderFoodsForPick(searchFoods(search.value.trim(), 20));
+        const keyword = search.value.trim();
+        // 只在搜索框有内容时 boost；空搜索走既有热门口径（不受历史影响）。
+        const options = keyword && boostNames.length ? { boost: boostNames } : undefined;
+        const foods = orderFoodsForPick(searchFoods(keyword, 20, options));
         clear(results);
         if (!foods.length) {
           results.appendChild(el('div', { className: 'empty', text: '没有匹配的食物，换个关键词试试' }));
@@ -1294,7 +1370,7 @@ function openPickFoodSheet({ title = '手动添加', mode = 'pick' } = {}) {
         timer = window.setTimeout(runSearch, 200);
       });
       runSearch();
-      showRecent();
+      loadRecent();
 
       return el('div', { className: 'col' },
         search,

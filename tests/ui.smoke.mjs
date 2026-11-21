@@ -1246,6 +1246,153 @@ export async function run() {
       }
     });
 
+    // ---- 更新清单多地址回退：CloudBase 主源 + GitHub Pages 回退 ----
+    await checkAsync('更新清单多地址：web 层逐个尝试、首个成功即停、全失败报次数、清单坏了与断网可区分、超时不挂死', async () => {
+      const update = await import('../js/update.js');
+      const urls = ['https://cloudbase.example/version.json', 'https://pages.example/version.json'];
+      // 本地 4 / 1.3.0；这里只给 version()、不给 checkUpdate —— 等于老壳子，检查走 web 层
+      const bridge = { version: () => JSON.stringify({ versionCode: 4, versionName: '1.3.0' }) };
+      const body = (payload) => ({ ok: true, status: 200, json: async () => payload });
+      const good = body({ versionCode: 5, versionName: '1.4.0', apkUrl: 'https://example.com/x.apk', sha256: 'abc' });
+
+      // 默认顺序：CloudBase（国内直连）在前，GitHub Pages 作回退；地址列表归一不受传参形状影响
+      assert.equal(update.MANIFEST_URLS.length, 2, '默认清单地址数量不对');
+      assert.ok(update.MANIFEST_URLS[0].includes('tcloudbaseapp.com'), `主源不是 CloudBase：${update.MANIFEST_URLS[0]}`);
+      assert.ok(update.MANIFEST_URLS[1].includes('github.io'), `回退源不是 GitHub Pages：${update.MANIFEST_URLS[1]}`);
+      assert.deepEqual(update.manifestUrls(), update.MANIFEST_URLS.slice(), '不传地址时没有用默认列表');
+      assert.deepEqual(update.manifestUrls(' https://x.example/v.json '), ['https://x.example/v.json'], '单个地址字符串没有归一');
+
+      // (a) 第一个地址失败 → 自动试第二个并成功
+      const seen = [];
+      const fallback = await update.checkForUpdate({
+        bridge,
+        urls,
+        manifestTimeoutMs: 200,
+        fetchImpl: async (url) => {
+          seen.push(url);
+          if (url === urls[0]) throw new Error('断网');
+          return good;
+        },
+      });
+      assert.equal(fallback.status, 'new', `第一个地址失败后没有采用第二个地址的清单：${JSON.stringify(fallback)}`);
+      assert.deepEqual(seen, urls, '第一个地址失败后应继续试第二个地址');
+      assert.equal(fallback.remote && fallback.remote.versionCode, 5, '回退后没有用上第二个地址的清单内容');
+      assert.equal(fallback.attempts, 2, '成功结果没有记下试过几个地址');
+
+      // (b) 第一个地址成功就不再试第二个（spy 断言只请求了 1 次）
+      const spy = [];
+      const primary = await update.checkForUpdate({
+        bridge,
+        urls,
+        manifestTimeoutMs: 200,
+        fetchImpl: async (url) => { spy.push(url); return good; },
+      });
+      assert.equal(primary.status, 'new', '第一个地址成功却被判成失败');
+      assert.equal(spy.length, 1, '第一个地址已经成功，不应再请求第二个地址');
+      assert.deepEqual(spy, [urls[0]], '请求顺序不是「先主源」');
+
+      // (c) 全部失败 → 错误态，且错误信息里能看出试过几个地址
+      const offline = await update.checkForUpdate({
+        bridge,
+        urls,
+        manifestTimeoutMs: 200,
+        fetchImpl: async () => { throw new Error('断网'); },
+      });
+      assert.equal(offline.status, 'error', `全部地址失败时 status 不是错误态：${JSON.stringify(offline)}`);
+      assert.equal(offline.kind, 'network', '全部地址连不上时没有标成网络问题');
+      assert.ok(String(offline.error).includes('已试 2 个地址'), `错误信息没有说清试过几个地址：${offline.error}`);
+      assert.ok(String(offline.error).includes('网络不通'), `网络失败没有说「网络不通」：${offline.error}`);
+
+      // (d) 清单内容不解析（坏 JSON / 缺 versionCode）与「网络不通」可区分
+      const brokenJson = await update.checkForUpdate({
+        bridge,
+        urls,
+        manifestTimeoutMs: 200,
+        fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <'); } }),
+      });
+      const noCode = await update.checkForUpdate({
+        bridge,
+        urls,
+        manifestTimeoutMs: 200,
+        fetchImpl: async () => body({ versionName: '1.4.0' }),
+      });
+      assert.equal(brokenJson.status, 'error', '坏 JSON 没有落成错误态');
+      assert.equal(brokenJson.kind, 'manifest', '坏 JSON 没有被识别成清单内容问题');
+      assert.equal(noCode.status, 'error', '缺 versionCode 的清单被当成了可用清单');
+      assert.equal(noCode.kind, 'manifest', '缺 versionCode 没有被识别成清单内容问题');
+      assert.ok(String(brokenJson.error).includes('版本清单内容不对'), `清单内容问题没有说清是清单：${brokenJson.error}`);
+      assert.notEqual(brokenJson.error, offline.error, '「清单坏了」与「网络不通」给出同一句话，用户分不出该做什么');
+      assert.equal(String(offline.error).includes('清单'), false, '网络失败被说成了清单问题');
+
+      // (e) 已是最新：status=latest，能拿到本地版本号（设置页据此显示「当前 x.y.z」）
+      const same = await update.checkForUpdate({
+        bridge,
+        urls,
+        manifestTimeoutMs: 200,
+        fetchImpl: async () => body({ versionCode: 4, versionName: '1.3.0' }),
+      });
+      assert.equal(same.status, 'latest', `清单版本等于本地版本时没有判成最新：${JSON.stringify(same)}`);
+      assert.equal(same.local && same.local.versionName, '1.3.0', '最新结果里丢了本地版本号');
+
+      // (f) 超时：注入永不 resolve 的 fetch，短超时内必须返回，不能挂死
+      const startedAt = Date.now();
+      const stuck = await update.checkForUpdate({
+        bridge,
+        urls,
+        manifestTimeoutMs: 20,
+        fetchImpl: () => new Promise(() => {}),
+      });
+      const waited = Date.now() - startedAt;
+      assert.equal(stuck.status, 'timeout', `永不 resolve 的请求没有走超时路径：${JSON.stringify(stuck)}`);
+      assert.ok(waited < 2000, `超时路径挂了 ${waited}ms 才返回`);
+      assert.ok(String(stuck.error).includes('已试 2 个地址'), `超时信息没有说清试过几个地址：${stuck.error}`);
+    });
+
+    await checkAsync('设置页「检查更新」：失败文案分清「网络不通（已试 N 个地址）」与「清单内容不对」，已是最新绝不报检查失败', async () => {
+      const win = globalThis.window;
+      try {
+        // 原生桥报网络不通：设置页要把「试过几个地址」显示出来，而不是笼统「检查失败」
+        win.HmsBridge = fakeBridge({ ok: false, error: '网络不通，无法检查更新（已试 2 个地址）', kind: 'network', attempts: 2 }, []);
+        const root = await renderView('settings');
+        fireClick(findButton(root, '检查更新'));
+        await tick(80);
+        const action = byClass(root, 'update-check')[0];
+        assert.ok(action, '设置页没有渲染更新结果区');
+        assert.ok(action.textOf().includes('网络不通，无法检查更新（已试 2 个地址）'), `设置页没有把失败原因说具体：${action.textOf()}`);
+        assert.equal(action.textOf().includes('检查失败'), false, '网络不通被笼统地说成了「检查失败」');
+        assertNoLeak(nodeText(root), 'settings(网络不通)');
+
+        // 清单内容不对：同一位置说的是「清单」而不是「网络」，两类失败不能混成一句
+        win.HmsBridge = fakeBridge({ ok: false, error: '版本清单内容不对：缺少 versionCode（已试 2 个地址）', kind: 'manifest', attempts: 2 }, []);
+        const root2 = await renderView('settings');
+        fireClick(findButton(root2, '检查更新'));
+        await tick(80);
+        const action2 = byClass(root2, 'update-check')[0];
+        assert.ok(action2.textOf().includes('版本清单内容不对'), `清单问题没有说成清单问题：${action2.textOf()}`);
+        assert.equal(action2.textOf().includes('网络不通'), false, '清单问题被说成了网络问题');
+
+        // 已是最新：显示当前版本，且不得出现「检查失败」
+        win.HmsBridge = fakeBridge({ ok: true, latest: true, versionCode: 4, versionName: '1.3.0' }, []);
+        const root3 = await renderView('settings');
+        fireClick(findButton(root3, '检查更新'));
+        await tick(80);
+        const action3 = byClass(root3, 'update-check')[0];
+        assert.ok(action3.textOf().includes('已是最新版本（当前 1.3.0）'), `已是最新时没有给出当前版本：${action3.textOf()}`);
+        assert.equal(action3.textOf().includes('检查失败'), false, '已是最新却报了「检查失败」（用户看到的正是这个 bug）');
+
+        // 老壳子（把「已是最新」当 ok:false 回传）：也不能落成「检查失败」
+        win.HmsBridge = fakeBridge({ ok: false, error: '已是最新版本 1.3.0' }, []);
+        const root4 = await renderView('settings');
+        fireClick(findButton(root4, '检查更新'));
+        await tick(80);
+        const action4 = byClass(root4, 'update-check')[0];
+        assert.ok(action4.textOf().includes('已是最新版本'), `老壳子的「已是最新」被当成了失败：${action4.textOf()}`);
+        assert.equal(action4.textOf().includes('检查失败'), false, '老壳子的「已是最新」被报成了「检查失败」');
+      } finally {
+        dropBridge();
+      }
+    });
+
     // ---- 2. 手动添加整链：搜索 → 定克数 → 加入清单 → 落库 ----
     await checkAsync('food 手动添加链路', async () => {
       let root = roots.get('food');
@@ -1678,6 +1825,96 @@ export async function run() {
 
       fireClick(findButton(sheet, '×'));
       await tick(60);
+    });
+
+    // ---- 2.78 搜索 boost：最近添加过的食物排在前面（history first） ----
+    /** 当前最上层的手动添加层（本段用例在 3.x 的 topSheet 之前，直接按 body 取）。 */
+    const lastSheet = () => dom.body.childNodes.filter((n) => String(n.className).split(/\s+/).includes('sheet-backdrop')).pop() || null;
+    /** 搜索结果行的食物名（renderPickRow 把名字放在 .strong 里）。 */
+    const pickRowName = (row) => {
+      const strong = byClass(row, 'strong')[0];
+      return strong ? strong.textOf() : '';
+    };
+    const pickItemNames = (sheet) => byClass(sheet, 'pick-item').map(pickRowName);
+    const openPickSheetForTest = async () => {
+      const root = await renderView('food');
+      const btn = findButton(root, '手动添加');
+      assert.ok(btn, '找不到「手动添加」按钮');
+      fireClick(btn);
+      await tick(320);
+      const sheet = lastSheet();
+      assert.ok(sheet, '没有弹出手动添加层');
+      return sheet;
+    };
+    const typeSearch = async (sheet, keyword) => {
+      const input = sheet.walk().find((n) => n.tagName === 'input' && (n.type === 'search' || n.attributes.type === 'search'));
+      assert.ok(input, '手动添加层没有搜索框');
+      input.value = keyword;
+      fireInput(input);
+      await tick(320);
+    };
+
+    await checkAsync('food 手动添加层：搜索时最近吃过的食物排在前面（boost）', async () => {
+      const foodsMod = await import('../js/foods.js');
+      const foodView = await import('../views/food.js');
+      const recentName = '豆腐皮';
+      const baseline = foodView.orderFoodsForPick(foodsMod.searchFoods('豆腐', 20)).map((f) => f.name);
+      assert.ok(baseline.includes('豆腐干') && baseline.includes(recentName), '前置条件不成立：豆腐搜索结果里没有豆腐干/豆腐皮');
+      assert.ok(baseline.indexOf('豆腐干') < baseline.indexOf(recentName), '前置条件不成立：豆腐皮本来就排在豆腐干前面：' + baseline.slice(0, 12).join('|'));
+
+      const mealId = await store.logMeal({ date: today, slot: 'snack', source: 'manual', items: [{ name: recentName, grams: 100, kcal: 300, carb: 10, protein: 20, fat: 15 }] });
+      try {
+        const sheet = await openPickSheetForTest();
+        const recent = (await store.recentFoodItems(8)).map((e) => e.name);
+        assert.ok(recent.includes(recentName), '最近吃过的名字里没有刚记的条目：' + recent.join('|'));
+
+        await typeSearch(sheet, '豆腐');
+        const names = pickItemNames(sheet);
+        const expected = foodView.orderFoodsForPick(foodsMod.searchFoods('豆腐', 20, { boost: recent })).map((f) => f.name);
+        assert.deepEqual(names, expected, '搜索结果没有按最近吃过的 boost 排序：' + names.slice(0, 12).join('|'));
+        assert.ok(names.indexOf(recentName) >= 0, '搜索结果里找不到最近吃过的「豆腐皮」');
+        assert.ok(names.indexOf(recentName) < names.indexOf('豆腐干'),
+          `最近吃过的「豆腐皮」没有排到「豆腐干」前面：${names.slice(0, 12).join('|')}`);
+
+        // 空搜索走既有逻辑：热门口径不因 boost 变化
+        await typeSearch(sheet, '');
+        assert.deepEqual(pickItemNames(sheet), foodView.orderFoodsForPick(foodsMod.searchFoods('', 20)).map((f) => f.name),
+          '空搜索被 boost 影响了（应完全走既有逻辑）');
+        fireClick(findButton(sheet, '×'));
+        await tick(80);
+      } finally {
+        await store.deleteMeal(mealId);
+      }
+    });
+
+    await checkAsync('food 手动添加层：recentFoodItems 抛错时搜索照常（降级为不 boost）', async () => {
+      const foodsMod = await import('../js/foods.js');
+      const foodView = await import('../views/food.js');
+      const root = await renderView('food');
+      await db.getAll('meals'); // 先确保连接指向当前库
+      const dbName = db.getDbName();
+      const openedDb = fakeIdb.opened.filter((d) => d.name === dbName).pop();
+      assert.ok(openedDb, '假 IDB 里没有当前库');
+      const mealsStore = openedDb.stores.get('meals');
+      assert.ok(mealsStore, '当前库没有 meals store');
+      // 把 meals 表摘掉：recentFoodItems() 会真的 reject（不是 mock 出来的异常）
+      openedDb.stores.delete('meals');
+      try {
+        fireClick(findButton(root, '手动添加'));
+        await tick(320);
+        const sheet = lastSheet();
+        assert.ok(sheet, '最近吃过读不到时手动添加层没打开');
+        assert.equal(nodeText(sheet).includes('最近吃过'), false, '最近吃过读不到时不该渲染折叠行');
+        await typeSearch(sheet, '豆腐');
+        const names = pickItemNames(sheet);
+        assert.ok(names.length > 0, '降级后搜索结果空了');
+        assert.deepEqual(names, foodView.orderFoodsForPick(foodsMod.searchFoods('豆腐', 20)).map((f) => f.name),
+          'recentFoodItems 抛错后搜索结果被影响（应降级为完全不加 boost）');
+        fireClick(findButton(sheet, '×'));
+        await tick(80);
+      } finally {
+        openedDb.stores.set('meals', mealsStore);
+      }
     });
 
     // ---- 2.77 今日餐次：默认折成一行（餐数 + 总热量），点开出现逐餐行 ----
@@ -3347,6 +3584,239 @@ await checkAsync('作息偏移：默认餐次按偏移整体后移，10:30 不�
       assert.equal(keep.meals[0].items[0].confidence, 'high', '保存参数把置信度弄丢了');
     });
 
+
+    // ---- 3.8.9 套餐改名：带 id 原地改那一条（不是派生第二个套餐） ----
+    /** 编辑层里的「套餐名」输入框（aria-label 固定，两类编辑层共用同一个控件形状）。 */
+    const nameInputOf = (sheet) => sheet.walk().find((n) => n.tagName === 'input' && n.getAttribute('aria-label') === '套餐名');
+    /** chip 上的套餐名文案（.tpl-chip__name）。 */
+    const chipNames = (root) => byClass(root, 'tpl-chip').map((n) => (byClass(n, 'tpl-chip__name')[0] || n).textOf());
+    const mealKindCount = async () => (await store.getMealTemplates()).filter((t) => t.kind !== 'day').length;
+    const openEditorFromChip = async (root, name, expectTitle) => {
+      const chip = byClass(root, 'tpl-chip').find((n) => n.textOf().includes(name));
+      assert.ok(chip, '套餐 chip 里找不到「' + name + '」');
+      fireClick(findButton(chip, '编辑'));
+      await tick(140);
+      const sheet = topSheet();
+      assert.ok(sheet && sheet.textOf().includes(expectTitle + name), '编辑层没打开：' + (sheet ? sheet.textOf().slice(0, 90) : '没有弹层'));
+      return sheet;
+    };
+
+    await checkAsync('food 套餐改名：单餐套餐改名后 id 不变、套餐数不变、chip 文案立即更新', async () => {
+      clearCaseOverlays();
+      const oldName = '改名前单餐';
+      const newName = '改名后单餐';
+      const otherName = '旁观的单餐';
+      for (const n of [oldName, newName, otherName]) await mealTemplateDrop(n);
+      const A = { name: '改名项A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const created = await store.saveMealTemplate({ name: oldName, slot: 'lunch', items: [A] });
+      const other = await store.saveMealTemplate({ name: otherName, slot: 'dinner', items: [A] });
+      try {
+        const root = await renderView('food');
+        const kindCountBefore = await mealKindCount();
+        const sheet = await openEditorFromChip(root, oldName, '编辑套餐 · ');
+        const input = nameInputOf(sheet);
+        assert.ok(input, '编辑层没有套餐名输入框（aria-label=套餐名）');
+        assert.ok(sheet.textOf().includes('套餐名'), '编辑层没有「套餐名」标签：' + sheet.textOf().slice(0, 120));
+        assert.equal(input.value, oldName, '套餐名输入框的默认值不是当前名字：' + input.value);
+
+        input.value = newName;
+        fireClick(findButton(sheet, '保存到原套餐'));
+        await tick(120);
+        const dialog = topDialog();
+        assert.ok(dialog, '改名保存前没有二次确认');
+        assert.ok(dialog.textOf().includes('更新原套餐'), '确认框没有说清是更新原套餐：' + dialog.textOf());
+        assert.ok(dialog.textOf().includes(newName), '确认框没有带上新名字：' + dialog.textOf());
+        fireClick(findButton(dialog, '更新'));
+        const saved = await waitFor(async () => (await store.getMealTemplates()).find((t) => t.name === newName));
+        assert.ok(saved, '改名没有落库');
+        assert.equal(saved.id, created.id, '改名后套餐 id 变了（不是原地改，而是派生了一份）');
+        assert.ok(!(await store.getMealTemplates()).some((t) => t.name === oldName), '旧名字的套餐还在（改名等于派生了一份）');
+        assert.equal(await mealKindCount(), kindCountBefore, '改名后套餐数变了');
+        const otherAfter = (await store.getMealTemplates()).find((t) => t.name === otherName);
+        assert.ok(otherAfter, '旁观的套餐被改名弄丢了');
+        assert.equal(otherAfter.id, other.id, '改名把另一个套餐的 id 也改了');
+        assert.deepEqual(otherAfter.items.map((i) => i.name), [A.name], '改名动了另一个套餐的条目');
+
+        // 同一个 root 上等 reload 画完：chip 文案必须自己更新（不经任何手工重渲染）
+        const chips = await waitFor(async () => {
+          const now = chipNames(root);
+          return now.includes(newName) ? now : null;
+        });
+        assert.ok(chips, '保存后 chip 文案没有立即更新（reload 路径没跑）：' + chipNames(root).join('|'));
+        assert.ok(!chips.includes(oldName), '保存后旧名字的 chip 还在：' + chips.join('|'));
+      } finally {
+        for (const n of [oldName, newName, otherName]) await mealTemplateDrop(n);
+      }
+    });
+
+    await checkAsync('food 套餐改名：空名/纯空白被拒（中文原因、不写库、弹层不关）', async () => {
+      clearCaseOverlays();
+      const name = '拒空名单餐';
+      await mealTemplateDrop(name);
+      await store.saveMealTemplate({ name, slot: 'lunch', items: [{ name: '拒空项', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 }] });
+      try {
+        const root = await renderView('food');
+        const sheet = await openEditorFromChip(root, name, '编辑套餐 · ');
+        const input = nameInputOf(sheet);
+        assert.ok(input, '编辑层没有套餐名输入框');
+        const before = await store.getMealTemplates();
+        let toastSeen = 0;
+        for (const bad of ['', '   ', '\u3000\u3000']) {
+          input.value = bad;
+          fireClick(findButton(sheet, '保存到原套餐'));
+          await tick(120);
+          assert.ok(!topDialog(), `名字填「${bad}」时不该走到二次确认`);
+          const toasts = caseToasts();
+          assert.ok(toasts.length > toastSeen, `名字填「${bad}」时没有任何提示`);
+          const last = toasts[toasts.length - 1];
+          assert.ok(last.includes('套餐名') && last.includes('不能为空'), `空名的提示不是中文原因：${last}`);
+          toastSeen = toasts.length;
+          assert.ok(topSheet() && findButton(topSheet(), '保存到原套餐'), `名字填「${bad}」被拒后编辑层不该关掉`);
+        }
+        assert.deepEqual(await store.getMealTemplates(), before, '空名被拒后还是写库了');
+        assert.ok((await store.getMealTemplates()).some((t) => t.name === name), '原套餐被空名覆盖掉了');
+        fireClick(findButton(topSheet(), '取消'));
+        await tick(80);
+        assert.ok(!topSheet(), '取消后编辑层没有关闭');
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 套餐改名：改名 + 改条目一起保存，两者都生效', async () => {
+      clearCaseOverlays();
+      const oldName = '改名兼改项';
+      const newName = '改名兼改项后';
+      for (const n of [oldName, newName]) await mealTemplateDrop(n);
+      const A = { name: '兼改A', grams: 100, kcal: 100, carb: 10, protein: 5, fat: 3 };
+      const B = { name: '兼改B', grams: 50, kcal: 60, carb: 6, protein: 3, fat: 2 };
+      const created = await store.saveMealTemplate({ name: oldName, slot: 'lunch', items: [A, B] });
+      try {
+        const root = await renderView('food');
+        const sheet = await openEditorFromChip(root, oldName, '编辑套餐 · ');
+        const rowB = byClass(sheet, 'list__item').find((n) => n.textOf().includes(B.name));
+        assert.ok(rowB, '编辑层里没有条目 B');
+        fireClick(findButton(rowB, '删'));
+        await tick(80);
+        const input = nameInputOf(sheet);
+        assert.ok(input, '编辑层没有套餐名输入框');
+        input.value = newName;
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        fireClick(findButton(topDialog(), '更新'));
+        const saved = await waitFor(async () => (await store.getMealTemplates()).find((t) => t.name === newName));
+        assert.ok(saved, '改名 + 改条目一起保存后没有落库');
+        assert.equal(saved.id, created.id, '改名 + 改条目后套餐 id 变了');
+        assert.deepEqual(saved.items.map((i) => i.name), [A.name], '改条目没生效（或顺序不对）');
+        assert.ok(!(await store.getMealTemplates()).some((t) => t.name === oldName), '旧名字的套餐还在');
+      } finally {
+        for (const n of [oldName, newName]) await mealTemplateDrop(n);
+      }
+    });
+
+    await checkAsync('food 整日套餐改名：id 不变、套餐数不变、chip 文案立即更新', async () => {
+      clearCaseOverlays();
+      const oldName = '改名前整日';
+      const newName = '改名后整日';
+      for (const n of [oldName, newName]) await mealTemplateDrop(n);
+      const created = await store.saveDayTemplate({ name: oldName, meals: [
+        { slot: 'breakfast', items: [{ name: '早改项', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '午改项', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] });
+      try {
+        const root = await renderView('food');
+        const before = await store.getMealTemplates();
+        const sheet = await openEditorFromChip(root, oldName, '编辑整日套餐 · ');
+        const input = nameInputOf(sheet);
+        assert.ok(input, '整日套餐编辑层没有套餐名输入框');
+        assert.equal(input.value, oldName, '整日套餐名输入框的默认值不是当前名字：' + input.value);
+        input.value = newName;
+        fireClick(findButton(sheet, '保存到原套餐'));
+        await tick(120);
+        const dialog = topDialog();
+        assert.ok(dialog, '整日套餐改名保存前没有二次确认');
+        assert.ok(dialog.textOf().includes(newName), '确认框没有带上新名字：' + dialog.textOf());
+        fireClick(findButton(dialog, '更新'));
+        const saved = await waitFor(async () => (await store.getMealTemplates()).find((t) => t.name === newName));
+        assert.ok(saved, '整日套餐改名没有落库');
+        assert.equal(saved.id, created.id, '整日套餐改名后 id 变了（不是原地改）');
+        assert.equal((await store.getMealTemplates()).length, before.length, '整日套餐改名后套餐总数变了');
+        assert.deepEqual(saved.meals.map((m) => m.slot), ['breakfast', 'lunch'], '改名把餐次弄丢了');
+        assert.ok(!(await store.getMealTemplates()).some((t) => t.name === oldName), '旧名字的整日套餐还在');
+        const chips = await waitFor(async () => {
+          const now = chipNames(root);
+          return now.includes(newName) ? now : null;
+        });
+        assert.ok(chips, '整日套餐保存后 chip 文案没有立即更新：' + chipNames(root).join('|'));
+        assert.ok(!chips.includes(oldName), '整日套餐保存后旧名字的 chip 还在：' + chips.join('|'));
+      } finally {
+        for (const n of [oldName, newName]) await mealTemplateDrop(n);
+      }
+    });
+
+    await checkAsync('food 整日套餐改名：空名/纯空白被拒（中文原因、不写库、弹层不关）', async () => {
+      clearCaseOverlays();
+      const name = '拒空名整日';
+      await mealTemplateDrop(name);
+      await store.saveDayTemplate({ name, meals: [
+        { slot: 'breakfast', items: [{ name: '拒早', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '拒午', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+      ] });
+      try {
+        const root = await renderView('food');
+        const sheet = await openEditorFromChip(root, name, '编辑整日套餐 · ');
+        const input = nameInputOf(sheet);
+        assert.ok(input, '整日套餐编辑层没有套餐名输入框');
+        const before = await store.getMealTemplates();
+        input.value = ' \u3000 ';
+        fireClick(findButton(sheet, '保存到原套餐'));
+        await tick(120);
+        assert.ok(!topDialog(), '整日套餐空名不该走到二次确认');
+        const toasts = caseToasts();
+        const last = toasts[toasts.length - 1] || '';
+        assert.ok(last.includes('套餐名') && last.includes('不能为空'), '整日套餐空名的提示不是中文原因：' + last);
+        assert.deepEqual(await store.getMealTemplates(), before, '整日套餐空名被拒后还是写库了');
+        assert.ok(topSheet() && findButton(topSheet(), '保存到原套餐'), '整日套餐空名被拒后编辑层不该关掉');
+        fireClick(findButton(topSheet(), '取消'));
+        await tick(80);
+      } finally {
+        await mealTemplateDrop(name);
+      }
+    });
+
+    await checkAsync('food 整日套餐改名：改名 + 删一餐一起保存，两者都生效', async () => {
+      clearCaseOverlays();
+      const oldName = '改名兼删餐';
+      const newName = '改名兼删餐后';
+      for (const n of [oldName, newName]) await mealTemplateDrop(n);
+      const created = await store.saveDayTemplate({ name: oldName, meals: [
+        { slot: 'breakfast', items: [{ name: '兼早', grams: 50, kcal: 78, carb: 1, protein: 6, fat: 5 }] },
+        { slot: 'lunch', items: [{ name: '兼午', grams: 200, kcal: 260, carb: 58, protein: 5, fat: 1 }] },
+        { slot: 'dinner', items: [{ name: '兼晚', grams: 120, kcal: 160, carb: 2, protein: 24, fat: 4 }] },
+      ] });
+      try {
+        const root = await renderView('food');
+        const sheet = await openEditorFromChip(root, oldName, '编辑整日套餐 · ');
+        fireClick(findButton(dayMealBlock(sheet, '晚餐'), '删整餐'));
+        await tick(80);
+        fireClick(findButton(topDialog(), '删除'));
+        await tick(100);
+        assert.equal(dayMealBlock(topSheet(), '晚餐'), null, '删整餐没有生效（前置条件不成立）');
+        const input = nameInputOf(topSheet());
+        assert.ok(input, '整日套餐编辑层没有套餐名输入框');
+        input.value = newName;
+        fireClick(findButton(topSheet(), '保存到原套餐'));
+        await tick(120);
+        fireClick(findButton(topDialog(), '更新'));
+        const saved = await waitFor(async () => (await store.getMealTemplates()).find((t) => t.name === newName));
+        assert.ok(saved, '整日套餐改名 + 删餐后没有落库');
+        assert.equal(saved.id, created.id, '整日套餐改名 + 删餐后 id 变了');
+        assert.deepEqual(saved.meals.map((m) => m.slot), ['breakfast', 'lunch'], '删掉的那一餐还在，或顺序不对');
+        assert.deepEqual(saved.meals.map((m) => m.items.map((i) => i.name)), [['兼早'], ['兼午']], '其他餐的条目被连带改动');
+      } finally {
+        for (const n of [oldName, newName]) await mealTemplateDrop(n);
+      }
+    });
 
     // ---- 3.9 BMI 可视化：四档小人 / 指针百分比 / 边界提示 ----
     // 前面的用例拖过刻度尺、存过别的体重；这一段依赖种子状态（今天 68.4kg / 172cm），

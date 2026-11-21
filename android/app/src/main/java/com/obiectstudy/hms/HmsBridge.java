@@ -53,8 +53,21 @@ public final class HmsBridge {
     /** Name the page sees: {@code window.HmsBridge}. */
     static final String JS_NAME = "HmsBridge";
 
-    /** Fixed manifest URL; the page and the app must agree on it. */
-    private static final String MANIFEST_URL = "https://obiectstudy.github.io/hms/version.json";
+    /**
+     * Ordered manifest sources; the first usable document wins, later ones are fallbacks.
+     *
+     * CloudBase leads because GitHub Pages does not answer from mainland China (that is what
+     * made 检查更新 fail outright); Pages stays as the fallback for every other network.
+     * Keep this list in sync with MANIFEST_URLS in js/update.js.
+     */
+    private static final String[] MANIFEST_URLS = {
+            "https://hms-d4gnh63iw73f09792-1513758162.tcloudbaseapp.com/version.json",
+            "https://obiectstudy.github.io/hms/version.json",
+    };
+
+    /** Failure kinds handed to the page, so 网络不通 and 清单内容不对 can be told apart. */
+    private static final String KIND_NETWORK = "network";
+    private static final String KIND_MANIFEST = "manifest";
 
     private static final String CALLBACK_UPDATE = "__hmsUpdate";
     private static final String CALLBACK_PROGRESS = "__hmsUpdateProgress";
@@ -114,13 +127,15 @@ public final class HmsBridge {
                 JSONObject manifest = fetchManifest();
                 int remoteCode = manifest.optInt("versionCode", 0);
                 if (remoteCode <= BuildConfig.VERSION_CODE) {
-                    updateFailed("已是最新版本 " + BuildConfig.VERSION_NAME);
+                    // The manifest was read: "no newer build" is an answer, not a failure.
+                    // Reporting ok:false here made every up-to-date device show 检查失败.
+                    updateLatest(manifest);
                     return;
                 }
                 String apkUrl = manifest.optString("apkUrl", "").trim();
                 String sha256 = manifest.optString("sha256", "").trim().toLowerCase(Locale.US);
                 if (apkUrl.isEmpty() || sha256.isEmpty()) {
-                    updateFailed("版本清单缺少 apkUrl 或 sha256");
+                    updateFailed(KIND_MANIFEST, 0, "版本清单缺少 apkUrl 或 sha256");
                     return;
                 }
                 JSONObject out = new JSONObject();
@@ -135,8 +150,11 @@ public final class HmsBridge {
                 // object as the string "[object Object]" (see parseInstallSpec).
                 advertised = out;
                 postCallback(CALLBACK_UPDATE, out.toString());
+            } catch (ManifestException e) {
+                // Every source was tried: say whether nothing answered or the answers were junk.
+                updateFailed(e.kind, e.attempts, e.getMessage());
             } catch (IOException | JSONException | RuntimeException e) {
-                // Network or malformed manifest: stay silent per contract.
+                // Anything else stays a plain failure with its own reason.
                 updateFailed(messageOf(e));
             }
         });
@@ -461,10 +479,57 @@ public final class HmsBridge {
 
     // ---------------------------------------------------------------- helpers
 
-    private JSONObject fetchManifest() throws IOException, JSONException {
+    /**
+     * Walks {@link #MANIFEST_URLS} in order and returns the first usable manifest: one that
+     * parses as JSON and carries a positive {@code versionCode}. A source that answers with
+     * something unusable does not end the search — it just costs one attempt.
+     *
+     * Total failure throws {@link ManifestException}, whose message separates "no source was
+     * reachable" from "a source answered but the document is wrong". The user reacts to those
+     * very differently, so they must not collapse into one 检查失败.
+     */
+    private JSONObject fetchManifest() throws ManifestException {
+        int attempts = 0;
+        String manifestReason = null;
+        for (String url : MANIFEST_URLS) {
+            if (isCancelled()) {
+                throw new ManifestException(KIND_NETWORK, attempts, "已取消");
+            }
+            attempts += 1;
+            try {
+                JSONObject manifest = readManifest(url);
+                if (manifest.optInt("versionCode", 0) <= 0) {
+                    manifestReason = "缺少 versionCode";
+                    continue;
+                }
+                return manifest;
+            } catch (JSONException e) {
+                // The source answered, the bytes are not JSON: a content problem, not a network one.
+                manifestReason = "不是合法 JSON";
+            } catch (IOException e) {
+                String reason = messageOf(e);
+                if (reason.startsWith("HTTP ")) {
+                    // The server answered with a non-200: reachable, just no document there.
+                    manifestReason = reason;
+                }
+                // Anything else (timeout / DNS / blocked) means this source is simply unreachable;
+                // the loop moves on to the next address.
+            }
+        }
+        if (manifestReason != null) {
+            throw new ManifestException(KIND_MANIFEST, attempts,
+                    "版本清单内容不对：" + manifestReason + "（已试 " + attempts + " 个地址）");
+        }
+        // Every attempt was unreachable (or cancelled): this is a network answer, not a bad file.
+        throw new ManifestException(KIND_NETWORK, attempts,
+                "网络不通，无法检查更新（已试 " + attempts + " 个地址）");
+    }
+
+    /** One GET + JSON parse against a single source; throws exactly like the old single-URL code. */
+    private JSONObject readManifest(String url) throws IOException, JSONException {
         HttpURLConnection conn = null;
         try {
-            conn = openConnection(MANIFEST_URL);
+            conn = openConnection(url);
             connection = conn;
             int code = conn.getResponseCode();
             if (code != HttpURLConnection.HTTP_OK) {
@@ -476,6 +541,18 @@ public final class HmsBridge {
                 conn.disconnect();
             }
             connection = null;
+        }
+    }
+
+    /** Carries why every manifest source failed, for a message the page can show verbatim. */
+    private static final class ManifestException extends IOException {
+        final String kind;
+        final int attempts;
+
+        ManifestException(String kind, int attempts, String message) {
+            super(message);
+            this.kind = kind;
+            this.attempts = attempts;
         }
     }
 
@@ -506,10 +583,42 @@ public final class HmsBridge {
     }
 
     private void updateFailed(String message) {
+        updateFailed("", 0, message);
+    }
+
+    /**
+     * Failure callback. {@code kind} / {@code attempts} are extra fields the page uses to say
+     * 网络不通 versus 版本清单内容不对; older pages simply read {@code error}, which already
+     * carries the attempt count in that case.
+     */
+    private void updateFailed(String kind, int attempts, String message) {
         JSONObject out = new JSONObject();
         try {
             out.put("ok", false);
             out.put("error", message);
+            if (!kind.isEmpty()) {
+                out.put("kind", kind);
+            }
+            if (attempts > 0) {
+                out.put("attempts", attempts);
+            }
+        } catch (JSONException ignored) {
+            // Not reachable for these value types.
+        }
+        postCallback(CALLBACK_UPDATE, out.toString());
+    }
+
+    /**
+     * "You are up to date" answer. Sent with ok:true on purpose: the manifest was fetched fine,
+     * so the page must show 已是最新版本 instead of 检查失败.
+     */
+    private void updateLatest(JSONObject manifest) {
+        JSONObject out = new JSONObject();
+        try {
+            out.put("ok", true);
+            out.put("latest", true);
+            out.put("versionCode", manifest.optInt("versionCode", BuildConfig.VERSION_CODE));
+            out.put("versionName", manifest.optString("versionName", BuildConfig.VERSION_NAME));
         } catch (JSONException ignored) {
             // Not reachable for these value types.
         }
